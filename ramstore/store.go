@@ -1,7 +1,6 @@
 package ramstore
 
 import (
-	"encoding/json"
 	"fmt"
 	"regexp"
 	"sort"
