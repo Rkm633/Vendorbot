@@ -1,0 +1,2960 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>Vendor WhatsApp Bot</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;1,9..40,400&family=JetBrains+Mono:wght@400;500&family=Plus+Jakarta+Sans:wght@600;700&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg-canvas: #F8FAFC;
+      --bg-surface: #FFFFFF;
+      --bg-subtle: #F8FAFC;
+      --bg-muted: #F1F5F9;
+
+      --border-hairline: rgba(15, 23, 42, 0.08);
+      --border-strong: rgba(15, 23, 42, 0.14);
+      --border-focus: #0F172A;
+
+      --ink-primary: #0F172A;
+      --ink-secondary: #475569;
+      --ink-muted: #64748B;
+      --ink-faint: #94A3B8;
+
+      --emerald: #059669;
+      --emerald-hover: #047857;
+      --emerald-soft: #ECFDF5;
+      --emerald-ink: #065F46;
+
+      --amber-ink: #B45309;
+      --rose-ink: #BE123C;
+      --rose-soft: #FFF1F2;
+
+      --shadow-card: 0 1px 2px rgba(15, 23, 42, 0.03), 0 10px 28px -14px rgba(15, 23, 42, 0.07);
+      --shadow-float: 0 16px 40px -12px rgba(15, 23, 42, 0.16);
+
+      --font-display: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+      --font-body: 'DM Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+      --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
+
+      --r-sm: 8px;
+      --r-md: 14px;
+      --r-lg: 18px;
+      --ease: cubic-bezier(0.16, 1, 0.3, 1);
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html, body {
+      min-height: 100%;
+      overflow-x: clip;
+      background-color: var(--bg-canvas);
+      background-image: radial-gradient(ellipse 75% 42% at 55% -12%, rgba(5, 150, 105, 0.05), transparent 72%);
+      background-attachment: fixed;
+      color: var(--ink-primary);
+      font-family: var(--font-body);
+      font-size: 14px;
+      line-height: 1.55;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+
+    .tabular { font-variant-numeric: tabular-nums; }
+    .mono { font-family: var(--font-mono); }
+
+    button:focus-visible,
+    input:focus-visible,
+    select:focus-visible,
+    textarea:focus-visible {
+      outline: 2px solid var(--border-focus);
+      outline-offset: 2px;
+    }
+
+    /* App Shell */
+    .shell {
+      display: grid;
+      grid-template-columns: 248px minmax(0, 1fr);
+      min-height: 100vh;
+    }
+
+    /* Sidebar */
+    .sidebar {
+      background: var(--bg-surface);
+      border-right: 1px solid var(--border-hairline);
+      display: flex;
+      flex-direction: column;
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      padding: 24px 16px 20px;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 11px;
+      padding: 2px 10px 28px;
+    }
+
+    .brand-mark {
+      width: 32px;
+      height: 32px;
+      border-radius: 9px;
+      background: var(--ink-primary);
+      color: #FFFFFF;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+
+    .brand-mark svg {
+      width: 16px;
+      height: 16px;
+    }
+
+    .brand-name {
+      font-family: var(--font-display);
+      font-size: 15.5px;
+      font-weight: 700;
+      letter-spacing: -0.03em;
+      color: var(--ink-primary);
+      white-space: nowrap;
+    }
+
+    .nav {
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+      flex: 1;
+    }
+
+    .nav-btn {
+      width: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 12px;
+      border: none;
+      border-radius: var(--r-sm);
+      background: transparent;
+      color: var(--ink-secondary);
+      font-family: var(--font-body);
+      font-size: 14px;
+      font-weight: 500;
+      cursor: pointer;
+      text-align: left;
+      white-space: nowrap;
+      transition: background 150ms var(--ease), color 150ms var(--ease);
+    }
+
+    .nav-btn:hover {
+      background: var(--bg-muted);
+      color: var(--ink-primary);
+    }
+
+    .nav-btn.active {
+      background: var(--bg-muted);
+      color: var(--ink-primary);
+      font-weight: 600;
+    }
+
+    .nav-left {
+      display: flex;
+      align-items: center;
+      gap: 11px;
+    }
+
+    .nav-btn svg {
+      width: 17px;
+      height: 17px;
+      stroke-width: 1.8;
+      color: var(--ink-muted);
+      flex-shrink: 0;
+      transition: color 150ms var(--ease);
+    }
+
+    .nav-btn.active svg {
+      color: var(--emerald);
+    }
+
+    .nav-count {
+      font-size: 12px;
+      color: var(--ink-muted);
+      font-variant-numeric: tabular-nums;
+    }
+
+    .sidebar-summary {
+      padding: 16px 12px 2px;
+      border-top: 1px solid var(--border-hairline);
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      font-size: 12.5px;
+    }
+
+    .summary-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+      color: var(--ink-muted);
+    }
+
+    .summary-val {
+      font-weight: 500;
+      color: var(--ink-secondary);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    /* Main Column */
+    .main {
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+    }
+
+    /* Frosted Topbar */
+    .topbar {
+      height: 64px;
+      background: rgba(255, 255, 255, 0.84);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--border-hairline);
+      padding: 0 40px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 24px;
+      position: sticky;
+      top: 0;
+      z-index: 20;
+    }
+
+    .crumb {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+    }
+
+    .crumb-page {
+      font-family: var(--font-display);
+      font-size: 15px;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      color: var(--ink-primary);
+      white-space: nowrap;
+    }
+
+    .crumb-div {
+      color: #CBD5E1;
+    }
+
+    .crumb-store {
+      font-size: 13.5px;
+      color: var(--ink-muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    /* Buttons */
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 7px;
+      font-family: var(--font-body);
+      font-size: 13.5px;
+      font-weight: 500;
+      padding: 9px 16px;
+      min-height: 38px;
+      border-radius: var(--r-sm);
+      border: 1px solid var(--border-strong);
+      background: var(--bg-surface);
+      color: var(--ink-primary);
+      cursor: pointer;
+      white-space: nowrap;
+      flex-shrink: 0;
+      transition: background 150ms var(--ease), border-color 150ms var(--ease), transform 120ms var(--ease);
+    }
+
+    .btn:hover {
+      background: var(--bg-subtle);
+      border-color: rgba(15, 23, 42, 0.25);
+    }
+
+    .btn:active { transform: translateY(1px); }
+
+    .btn-ink {
+      background: var(--ink-primary);
+      border-color: var(--ink-primary);
+      color: #FFFFFF;
+    }
+
+    .btn-ink:hover {
+      background: #1E293B;
+      border-color: #1E293B;
+    }
+
+    .btn-emerald {
+      background: var(--emerald);
+      border-color: var(--emerald);
+      color: #FFFFFF;
+    }
+
+    .btn-emerald:hover {
+      background: var(--emerald-hover);
+      border-color: var(--emerald-hover);
+    }
+
+    .btn-danger {
+      background: var(--bg-surface);
+      border-color: rgba(190, 18, 60, 0.24);
+      color: var(--rose-ink);
+    }
+
+    .btn-danger:hover {
+      background: var(--rose-soft);
+      border-color: rgba(190, 18, 60, 0.4);
+    }
+
+    .btn-sm {
+      font-size: 12.5px;
+      padding: 6px 12px;
+      min-height: 32px;
+    }
+
+    /* Main Content Container */
+    .content {
+      width: 100%;
+      max-width: 1160px;
+      margin: 0 auto;
+      padding: 36px 40px 64px;
+    }
+
+    .view { display: none; }
+    .view.active { display: block; }
+
+    /* Page Intro */
+    .page-intro {
+      margin-bottom: 28px;
+    }
+
+    .page-intro h2 {
+      font-family: var(--font-display);
+      font-size: 24px;
+      font-weight: 700;
+      letter-spacing: -0.03em;
+      color: var(--ink-primary);
+      line-height: 1.25;
+      text-wrap: balance;
+    }
+
+    .page-intro p {
+      font-size: 14px;
+      color: var(--ink-secondary);
+      margin-top: 6px;
+    }
+
+    /* 2-Step Connection Rail */
+    .rail-card {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-hairline);
+      border-radius: var(--r-md);
+      box-shadow: var(--shadow-card);
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      margin-bottom: 24px;
+      overflow: hidden;
+    }
+
+    .rail-step {
+      padding: 22px 26px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 18px;
+      border-right: 1px solid var(--border-hairline);
+    }
+
+    .rail-step:last-child { border-right: none; }
+
+    .step-index {
+      font-family: var(--font-mono);
+      font-size: 11.5px;
+      color: var(--ink-muted);
+      margin-bottom: 4px;
+    }
+
+    .step-title {
+      font-family: var(--font-display);
+      font-size: 15px;
+      font-weight: 700;
+      letter-spacing: -0.015em;
+      color: var(--ink-primary);
+    }
+
+    .step-desc {
+      font-size: 13px;
+      color: var(--ink-secondary);
+      margin-top: 3px;
+    }
+
+    /* Unified 4-Column Metric Strip */
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      background: var(--bg-surface);
+      border: 1px solid var(--border-hairline);
+      border-radius: var(--r-md);
+      box-shadow: var(--shadow-card);
+      margin-bottom: 28px;
+      overflow: hidden;
+    }
+
+    .metric {
+      padding: 22px 26px;
+      border-right: 1px solid var(--border-hairline);
+    }
+
+    .metric:last-child { border-right: none; }
+
+    .metric-label {
+      font-size: 12.5px;
+      font-weight: 500;
+      color: var(--ink-muted);
+      margin-bottom: 10px;
+    }
+
+    .metric-val {
+      font-family: var(--font-display);
+      font-size: 30px;
+      font-weight: 700;
+      letter-spacing: -0.035em;
+      line-height: 1.05;
+      color: var(--ink-primary);
+    }
+
+    .metric-sub {
+      font-size: 12.5px;
+      color: var(--ink-faint);
+      margin-top: 8px;
+    }
+
+    /* Grid Helpers */
+    .grid-2 {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 24px;
+      align-items: start;
+    }
+
+    .grid-7-5 {
+      display: grid;
+      grid-template-columns: minmax(0, 7fr) minmax(0, 5fr);
+      gap: 24px;
+      align-items: start;
+    }
+
+    /* Surface Card */
+    .card {
+      background: var(--bg-surface);
+      border: 1px solid var(--border-hairline);
+      border-radius: var(--r-md);
+      box-shadow: var(--shadow-card);
+      overflow: hidden;
+    }
+
+    .card-head {
+      padding: 22px 26px;
+      border-bottom: 1px solid var(--border-hairline);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+    }
+
+    .card-title {
+      font-family: var(--font-display);
+      font-size: 15px;
+      font-weight: 700;
+      letter-spacing: -0.015em;
+      color: var(--ink-primary);
+    }
+
+    .card-sub {
+      font-size: 13px;
+      color: var(--ink-muted);
+      margin-top: 2px;
+    }
+
+    .card-body {
+      padding: 26px;
+    }
+
+    /* Form Controls */
+    .form-2 {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 16px;
+    }
+
+    .field {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      margin-bottom: 16px;
+    }
+
+    .field:last-child { margin-bottom: 0; }
+
+    .field label {
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--ink-secondary);
+    }
+
+    .input, .select, .textarea {
+      width: 100%;
+      background: var(--bg-surface);
+      border: 1px solid var(--border-strong);
+      border-radius: var(--r-sm);
+      color: var(--ink-primary);
+      font-family: var(--font-body);
+      font-size: 14px;
+      padding: 10px 13px;
+      min-height: 41px;
+      transition: border-color 150ms var(--ease), box-shadow 150ms var(--ease);
+    }
+
+    .input::placeholder, .textarea::placeholder {
+      color: var(--ink-faint);
+    }
+
+    .input:hover, .select:hover, .textarea:hover {
+      border-color: rgba(15, 23, 42, 0.28);
+    }
+
+    .input:focus, .select:focus, .textarea:focus {
+      outline: none;
+      border-color: var(--ink-primary);
+      box-shadow: 0 0 0 3px rgba(15, 23, 42, 0.08);
+    }
+
+    .textarea {
+      min-height: 88px;
+      resize: vertical;
+      line-height: 1.55;
+    }
+
+    .textarea.mono-input {
+      font-family: var(--font-mono);
+      font-size: 12.5px;
+    }
+
+    /* Toggle Switches */
+    .switch-list {
+      display: flex;
+      flex-direction: column;
+      margin-bottom: 22px;
+    }
+
+    .switch-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 14px 0;
+      border-bottom: 1px solid var(--border-hairline);
+    }
+
+    .switch-row:first-child { padding-top: 0; }
+    .switch-row:last-child { border-bottom: none; padding-bottom: 0; }
+
+    .switch-title {
+      font-size: 14px;
+      font-weight: 500;
+      color: var(--ink-primary);
+    }
+
+    .switch-desc {
+      font-size: 12.5px;
+      color: var(--ink-muted);
+      margin-top: 2px;
+    }
+
+    .switch {
+      position: relative;
+      display: inline-block;
+      width: 42px;
+      height: 24px;
+      flex-shrink: 0;
+    }
+
+    .switch input { opacity: 0; width: 0; height: 0; }
+
+    .slider {
+      position: absolute;
+      inset: 0;
+      background: #CBD5E1;
+      border-radius: 99px;
+      cursor: pointer;
+      transition: background 180ms var(--ease);
+    }
+
+    .slider::before {
+      content: '';
+      position: absolute;
+      width: 18px;
+      height: 18px;
+      left: 3px;
+      top: 3px;
+      background: #FFFFFF;
+      border-radius: 50%;
+      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.2);
+      transition: transform 180ms var(--ease);
+    }
+
+    .switch input:checked + .slider { background: var(--emerald); }
+    .switch input:checked + .slider::before { transform: translateX(18px); }
+
+    /* Key-Value Readout */
+    .kv-list {
+      display: flex;
+      flex-direction: column;
+      margin-top: 22px;
+      border-top: 1px solid var(--border-hairline);
+      padding-top: 8px;
+    }
+
+    .kv-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+      padding: 11px 0;
+      border-bottom: 1px solid var(--border-hairline);
+      font-size: 13px;
+    }
+
+    .kv-row:last-child { border-bottom: none; padding-bottom: 0; }
+    .kv-key { color: var(--ink-muted); }
+    .kv-val {
+      color: var(--ink-primary);
+      font-weight: 500;
+      text-align: right;
+      word-break: break-word;
+    }
+
+    /* Unboxed Semantic Text States */
+    .text-ok { color: var(--emerald-ink); font-weight: 600; }
+    .text-warn { color: var(--amber-ink); font-weight: 600; }
+    .text-err { color: var(--rose-ink); font-weight: 600; }
+
+    .section-gap { margin-top: 24px; }
+    .kv-list.kv-flush { margin-top: 0; border-top: none; padding-top: 0; }
+
+    .ext-link {
+      color: var(--emerald-ink);
+      text-decoration: none;
+      word-break: break-all;
+    }
+    .ext-link:hover { text-decoration: underline; }
+
+    .img-url-line {
+      font-family: var(--font-mono);
+      font-size: 11.5px;
+      color: var(--ink-muted);
+      margin-top: 4px;
+      max-width: 340px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .price-strike {
+      font-size: 11.5px;
+      color: var(--ink-faint);
+      text-decoration: line-through;
+      margin-top: 2px;
+    }
+
+    /* WhatsApp QR Pedestal */
+    .qr-stage {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      text-align: center;
+    }
+
+    .qr-pedestal {
+      width: min(244px, 100%);
+      aspect-ratio: 1 / 1;
+      height: auto;
+      border-radius: var(--r-md);
+      border: 1px solid var(--border-hairline);
+      background: #FFFFFF;
+      padding: 18px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin-bottom: 22px;
+      position: relative;
+    }
+
+    .qr-pedestal img {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+    }
+
+    .qr-placeholder {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 10px;
+      color: var(--ink-muted);
+      font-size: 13px;
+      padding: 10px;
+    }
+
+    .qr-placeholder svg {
+      width: 34px;
+      height: 34px;
+      color: var(--ink-faint);
+      stroke-width: 1.5;
+    }
+
+    .steps {
+      list-style: none;
+      width: 100%;
+      max-width: 340px;
+      text-align: left;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      font-size: 13.5px;
+      color: var(--ink-secondary);
+      margin-bottom: 22px;
+    }
+
+    .pair-reveal {
+      margin-top: 16px;
+      padding: 16px 20px;
+      border-radius: var(--r-sm);
+      background: var(--emerald-soft);
+      border: 1px solid rgba(5, 150, 105, 0.25);
+      font-family: var(--font-mono);
+      font-size: 26px;
+      font-weight: 600;
+      letter-spacing: 0.18em;
+      color: var(--emerald-ink);
+      text-align: center;
+    }
+
+    /* Tables & Segmented Filter */
+    .table-bar {
+      padding: 16px 26px;
+      border-bottom: 1px solid var(--border-hairline);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+
+    .segmented {
+      display: inline-flex;
+      align-items: center;
+      gap: 2px;
+      background: var(--bg-muted);
+      border-radius: var(--r-sm);
+      padding: 3px;
+    }
+
+    .seg-btn {
+      border: none;
+      background: transparent;
+      color: var(--ink-secondary);
+      font-family: var(--font-body);
+      font-size: 13px;
+      font-weight: 500;
+      padding: 7px 14px;
+      border-radius: 6px;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: background 150ms var(--ease), color 150ms var(--ease);
+    }
+
+    .seg-btn:hover { color: var(--ink-primary); }
+    .seg-btn.active {
+      background: var(--bg-surface);
+      color: var(--ink-primary);
+      font-weight: 600;
+      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.08);
+    }
+
+    .search-box {
+      width: 240px;
+      min-height: 36px;
+      padding: 7px 12px;
+      font-size: 13px;
+    }
+
+    .table-wrap { overflow-x: auto; }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      text-align: left;
+      font-size: 13.5px;
+    }
+
+    th {
+      padding: 12px 26px;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--ink-muted);
+      background: var(--bg-subtle);
+      border-bottom: 1px solid var(--border-hairline);
+      white-space: nowrap;
+    }
+
+    td {
+      padding: 16px 26px;
+      border-bottom: 1px solid var(--border-hairline);
+      vertical-align: top;
+      color: var(--ink-primary);
+    }
+
+    tr:last-child td { border-bottom: none; }
+    tbody tr:hover td { background: var(--bg-subtle); }
+
+    .th-r, .td-r { text-align: right; }
+
+    .sub-line {
+      font-size: 12.5px;
+      color: var(--ink-muted);
+      margin-top: 3px;
+    }
+
+    .prod-cell {
+      display: flex;
+      align-items: center;
+      gap: 13px;
+    }
+
+    .prod-thumb {
+      width: 40px;
+      height: 40px;
+      border-radius: 9px;
+      background: var(--bg-muted);
+      border: 1px solid var(--border-hairline);
+      overflow: hidden;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-family: var(--font-display);
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--ink-secondary);
+      flex-shrink: 0;
+    }
+
+    .prod-thumb img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+
+    /* Minimal Empty States */
+    .empty-box {
+      padding: 64px 28px;
+      text-align: center;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .empty-icon {
+      width: 44px;
+      height: 44px;
+      border-radius: 12px;
+      background: var(--bg-muted);
+      color: var(--ink-muted);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin-bottom: 4px;
+    }
+
+    .empty-icon svg {
+      width: 20px;
+      height: 20px;
+      stroke-width: 1.7;
+    }
+
+    .empty-title {
+      font-family: var(--font-display);
+      font-size: 15px;
+      font-weight: 600;
+      color: var(--ink-primary);
+    }
+
+    .empty-desc {
+      font-size: 13.5px;
+      color: var(--ink-muted);
+      max-width: 380px;
+    }
+
+    /* Real-Time Inbox Split View */
+    .inbox-grid {
+      display: grid;
+      grid-template-columns: 320px minmax(0, 1fr);
+      background: var(--bg-surface);
+      border: 1px solid var(--border-hairline);
+      border-radius: var(--r-md);
+      box-shadow: var(--shadow-card);
+      min-height: 580px;
+      overflow: hidden;
+    }
+
+    .inbox-list-col {
+      border-right: 1px solid var(--border-hairline);
+      display: flex;
+      flex-direction: column;
+    }
+
+    .inbox-head {
+      padding: 16px 18px;
+      border-bottom: 1px solid var(--border-hairline);
+    }
+
+    .conv-list {
+      flex: 1;
+      overflow-y: auto;
+    }
+
+    .conv-item {
+      width: 100%;
+      padding: 14px 18px;
+      border: none;
+      border-bottom: 1px solid var(--border-hairline);
+      background: transparent;
+      text-align: left;
+      cursor: pointer;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      transition: background 150ms var(--ease);
+    }
+
+    .conv-item:hover { background: var(--bg-subtle); }
+    .conv-item.active { background: var(--bg-muted); }
+
+    .conv-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      gap: 10px;
+    }
+
+    .conv-name {
+      font-weight: 600;
+      font-size: 13.5px;
+      color: var(--ink-primary);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .conv-time {
+      font-size: 11.5px;
+      color: var(--ink-faint);
+      font-variant-numeric: tabular-nums;
+      flex-shrink: 0;
+    }
+
+    .conv-preview {
+      font-size: 12.5px;
+      color: var(--ink-muted);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .inbox-thread-col {
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+    }
+
+    .thread-head {
+      padding: 16px 24px;
+      border-bottom: 1px solid var(--border-hairline);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      min-height: 62px;
+    }
+
+    .thread-body {
+      flex: 1;
+      padding: 24px;
+      background: var(--bg-canvas);
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .bubble {
+      max-width: 78%;
+      padding: 11px 15px;
+      border-radius: 12px;
+      font-size: 13.5px;
+      line-height: 1.55;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .bubble.in {
+      align-self: flex-start;
+      background: #FFFFFF;
+      border: 1px solid var(--border-hairline);
+      color: var(--ink-primary);
+    }
+
+    .bubble.out {
+      align-self: flex-end;
+      background: var(--emerald-soft);
+      border: 1px solid rgba(5, 150, 105, 0.22);
+      color: #064E3B;
+    }
+
+    .bubble-meta {
+      font-size: 11px;
+      color: var(--ink-muted);
+      margin-bottom: 4px;
+    }
+
+    .thread-composer {
+      padding: 14px 20px;
+      border-top: 1px solid var(--border-hairline);
+      background: var(--bg-surface);
+      display: flex;
+      gap: 10px;
+    }
+
+    /* Code Box */
+    .code-box {
+      background: var(--bg-subtle);
+      border: 1px solid var(--border-hairline);
+      border-radius: var(--r-sm);
+      padding: 16px 18px;
+      font-family: var(--font-mono);
+      font-size: 12.5px;
+      line-height: 1.65;
+      color: var(--ink-primary);
+      overflow-x: auto;
+      white-space: pre-wrap;
+    }
+
+    /* Toast */
+    #toast-root {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      z-index: 999;
+    }
+
+    .toast {
+      background: var(--ink-primary);
+      color: #FFFFFF;
+      padding: 12px 18px;
+      border-radius: var(--r-sm);
+      font-size: 13.5px;
+      font-weight: 500;
+      box-shadow: var(--shadow-float);
+      max-width: 380px;
+      animation: toast-rise 180ms var(--ease);
+    }
+
+    .toast.error { background: #9F1239; }
+    .toast.warn { background: #92400E; }
+
+    @keyframes toast-rise {
+      from { opacity: 0; transform: translateY(8px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    .pair-row {
+      display: flex;
+      gap: 10px;
+    }
+
+    .table-tools {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+    }
+
+    .mobile-brand-mark {
+      display: none;
+      width: 28px;
+      height: 28px;
+      border-radius: 7px;
+      background: var(--ink-primary);
+      color: #FFFFFF;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+
+    .mobile-brand-mark svg {
+      width: 15px;
+      height: 15px;
+    }
+
+    .mobile-back-btn {
+      display: none;
+      align-items: center;
+      justify-content: center;
+      width: 40px;
+      height: 40px;
+      border: 1px solid var(--border-hairline);
+      border-radius: var(--r-sm);
+      background: var(--bg-surface);
+      color: var(--ink-primary);
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+
+    .mobile-back-btn svg {
+      width: 18px;
+      height: 18px;
+    }
+
+    .thread-head-left {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+    }
+
+    /* Mobile Fixed Bottom Tab Bar (Hidden on Desktop & Tablet) */
+    .mobile-nav {
+      display: none;
+      position: fixed;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      z-index: 40;
+      background: rgba(255, 255, 255, 0.92);
+      backdrop-filter: blur(14px);
+      -webkit-backdrop-filter: blur(14px);
+      border-top: 1px solid var(--border-hairline);
+      padding: 4px 6px calc(6px + env(safe-area-inset-bottom));
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 2px;
+    }
+
+    .mnav-btn {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 3px;
+      min-height: 48px;
+      padding: 4px 2px;
+      border: none;
+      background: transparent;
+      border-radius: var(--r-sm);
+      color: var(--ink-muted);
+      font-family: var(--font-body);
+      font-size: 10.5px;
+      font-weight: 500;
+      letter-spacing: -0.01em;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: color 150ms var(--ease), background 150ms var(--ease);
+    }
+
+    .mnav-btn svg {
+      width: 20px;
+      height: 20px;
+      stroke-width: 1.85;
+    }
+
+    .mnav-btn.active {
+      color: var(--emerald-ink);
+      font-weight: 600;
+    }
+
+    .mnav-btn.active svg {
+      color: var(--emerald);
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; }
+    }
+
+    /* Large Laptop Refinement (1025px – 1260px) */
+    @media (max-width: 1260px) and (min-width: 1025px) {
+      .shell { grid-template-columns: 224px minmax(0, 1fr); }
+      .topbar { padding: 0 28px; }
+      .content { padding: 28px 28px 56px; }
+    }
+
+    /* Tablet Breakpoint (769px – 1024px) */
+    @media (max-width: 1024px) {
+      .shell { grid-template-columns: 1fr; }
+      .sidebar {
+        position: static;
+        height: auto;
+        border-right: none;
+        border-bottom: 1px solid var(--border-hairline);
+        padding: 12px 24px;
+        flex-direction: row;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+      }
+      .brand { padding: 0; }
+      .nav {
+        flex-direction: row;
+        overflow-x: auto;
+        scrollbar-width: none;
+        gap: 4px;
+        flex: initial;
+      }
+      .nav::-webkit-scrollbar { display: none; }
+      .nav-btn { width: auto; padding: 8px 12px; gap: 8px; }
+      .sidebar-summary { display: none; }
+      .topbar { padding: 0 24px; height: 58px; }
+      .content { padding: 28px 24px 52px; }
+      .grid-7-5, .grid-2 { grid-template-columns: 1fr; }
+      .rail-card { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .metrics { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+      .inbox-grid { grid-template-columns: 260px minmax(0, 1fr); min-height: 520px; }
+    }
+
+    /* Mobile Breakpoint (<= 768px) — Native Touch App Experience */
+    @media (max-width: 768px) {
+      .sidebar { display: none; }
+      .mobile-brand-mark { display: flex; }
+      .mobile-nav { display: grid; }
+
+      .topbar {
+        height: 54px;
+        padding: 0 16px;
+        gap: 12px;
+      }
+      .crumb { gap: 8px; }
+      .crumb-div, .crumb-store { display: none; }
+      .crumb-page { font-size: 16px; }
+      .topbar .btn {
+        min-height: 36px;
+        padding: 6px 13px;
+        font-size: 13px;
+      }
+
+      .content {
+        padding: 20px 16px calc(92px + env(safe-area-inset-bottom));
+      }
+
+      .page-intro { margin-bottom: 20px; }
+      .page-intro h2 { font-size: 21px; }
+      .page-intro p { font-size: 13.5px; }
+
+      /* Cards & Surfaces */
+      .card { border-radius: 16px; }
+      .card-head {
+        padding: 18px 18px;
+        flex-wrap: wrap;
+        gap: 10px;
+      }
+      .card-body { padding: 18px; }
+
+      /* 2-Step Rail Stacks Cleanly */
+      .rail-card {
+        grid-template-columns: 1fr;
+        border-radius: 16px;
+        margin-bottom: 18px;
+      }
+      .rail-step {
+        padding: 18px;
+        border-right: none;
+        border-bottom: 1px solid var(--border-hairline);
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 14px;
+      }
+      .rail-step:last-child { border-bottom: none; }
+      .rail-step .btn { width: 100%; min-height: 44px; }
+
+      /* 2x2 Metrics Grid */
+      .metrics {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        border-radius: 16px;
+        margin-bottom: 20px;
+      }
+      .metric { padding: 16px 18px; }
+      .metric-val { font-size: 25px; }
+      .metric:nth-child(2) { border-right: none; }
+      .metric:nth-child(1), .metric:nth-child(2) { border-bottom: 1px solid var(--border-hairline); }
+
+      /* Forms & Touch Targets (>= 44px, 16px font prevents iOS zoom) */
+      .form-2 { grid-template-columns: 1fr; gap: 0; }
+      .input, .select, .textarea {
+        min-height: 44px;
+        font-size: 16px;
+        padding: 10px 13px;
+      }
+      .btn { min-height: 44px; }
+      .btn-sm { min-height: 40px; }
+      .pair-row { flex-direction: column; }
+      .pair-row .btn { width: 100%; }
+
+      /* Table Toolbar & Segmented Controls */
+      .table-bar {
+        padding: 14px 16px;
+        flex-direction: column;
+        align-items: stretch;
+        gap: 12px;
+      }
+      .segmented {
+        display: flex;
+        width: 100%;
+        overflow-x: auto;
+        scrollbar-width: none;
+      }
+      .segmented::-webkit-scrollbar { display: none; }
+      .seg-btn {
+        flex: 1 0 auto;
+        min-height: 38px;
+        text-align: center;
+      }
+      .table-tools { width: 100%; }
+      .search-box { flex: 1; width: auto; min-height: 42px; font-size: 15px; }
+
+      /* Responsive Table-to-Card Layout (Zero Sideways Scroll!) */
+      .table-wrap { overflow-x: visible; }
+      table, tbody { display: block; width: 100%; }
+      thead { display: none; }
+      tbody tr {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        padding: 16px 18px;
+        border-bottom: 1px solid var(--border-hairline);
+      }
+      tbody tr:last-child { border-bottom: none; }
+      tbody tr.empty-row { padding: 0; border-bottom: none; }
+      tbody td {
+        display: flex;
+        justify-content: space-between;
+        align-items: flex-start;
+        gap: 14px;
+        padding: 0;
+        border: none;
+        text-align: right;
+      }
+      tbody td[data-label]::before {
+        content: attr(data-label);
+        font-size: 12px;
+        font-weight: 500;
+        color: var(--ink-muted);
+        text-align: left;
+        flex-shrink: 0;
+        padding-top: 2px;
+      }
+      tbody td.td-primary {
+        display: block;
+        text-align: left;
+      }
+      tbody td.td-primary::before { display: none; }
+      tbody tr.empty-row td { display: block; text-align: center; }
+      .td-r { text-align: right; }
+
+      /* Mobile Master-Detail Live Chats Inbox */
+      .inbox-grid {
+        grid-template-columns: 1fr;
+        min-height: calc(100dvh - 230px);
+        border-radius: 16px;
+      }
+      .inbox-list-col { border-right: none; }
+      .inbox-grid:not(.mobile-thread-open) .inbox-thread-col { display: none; }
+      .inbox-grid.mobile-thread-open .inbox-list-col { display: none; }
+      .inbox-grid.mobile-thread-open .inbox-thread-col { display: flex; min-height: calc(100dvh - 230px); }
+      .mobile-back-btn { display: inline-flex; }
+      .thread-head { padding: 12px 16px; }
+      .thread-body { padding: 16px; }
+      .bubble { max-width: 88%; }
+      .thread-composer { padding: 12px 14px; }
+
+      /* Mobile Toast Placement Above Bottom Bar */
+      #toast-root {
+        left: 16px;
+        right: 16px;
+        bottom: calc(74px + env(safe-area-inset-bottom));
+        align-items: center;
+      }
+      .toast { width: 100%; max-width: 100%; text-align: center; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <!-- Sidebar -->
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/>
+          </svg>
+        </div>
+        <span class="brand-name">Vendor Bot</span>
+      </div>
+
+      <nav class="nav" aria-label="Primary Navigation">
+        <button class="nav-btn active" data-view="overview" onclick="switchView('overview')">
+          <span class="nav-left">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg>
+            Overview
+          </span>
+        </button>
+
+        <button class="nav-btn" data-view="whatsapp" onclick="switchView('whatsapp')">
+          <span class="nav-left">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="2" width="14" height="20" rx="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></svg>
+            WhatsApp
+          </span>
+          <span class="nav-count" id="nav-wa-state">—</span>
+        </button>
+
+        <button class="nav-btn" data-view="store" onclick="switchView('store')">
+          <span class="nav-left">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M6 2 3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4z"/><line x1="3" y1="6" x2="21" y2="6"/><path d="M16 10a4 4 0 0 1-8 0"/></svg>
+            Catalog & Orders
+          </span>
+          <span class="nav-count" id="nav-store-count">0</span>
+        </button>
+
+        <button class="nav-btn" data-view="chats" onclick="switchView('chats')">
+          <span class="nav-left">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+            Live Chats
+          </span>
+          <span class="nav-count" id="nav-chat-count">0</span>
+        </button>
+
+        <button class="nav-btn" data-view="settings" onclick="switchView('settings')">
+          <span class="nav-left">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+            Settings
+          </span>
+        </button>
+      </nav>
+
+      <div class="sidebar-summary">
+        <div class="summary-row">
+          <span>WhatsApp</span>
+          <span class="summary-val" id="foot-wa">Not linked</span>
+        </div>
+        <div class="summary-row">
+          <span>Central Brain</span>
+          <span class="summary-val" id="foot-central">Not connected</span>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Main Column -->
+    <div class="main">
+      <header class="topbar">
+        <div class="crumb">
+          <span class="mobile-brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/>
+            </svg>
+          </span>
+          <h1 class="crumb-page" id="topbar-title">Overview</h1>
+          <span class="crumb-div" aria-hidden="true">/</span>
+          <span class="crumb-store" id="topbar-store">Not connected</span>
+        </div>
+
+        <button class="btn btn-ink" onclick="triggerResync()">Sync Now</button>
+      </header>
+
+      <main class="content">
+        <!-- ============================================================ -->
+        <!-- 1. OVERVIEW                                                  -->
+        <!-- ============================================================ -->
+        <section id="view-overview" class="view active">
+          <div class="page-intro">
+            <h2 id="intro-heading">Connect your store</h2>
+            <p id="intro-sub">Link your Central Brain Node and WhatsApp number to start automated store conversations.</p>
+          </div>
+
+          <!-- 2-Step Live Status Rail -->
+          <div class="rail-card">
+            <div class="rail-step">
+              <div>
+                <div class="step-index">01 · Central Brain</div>
+                <div class="step-title" id="rail-central-title">Not connected</div>
+                <div class="step-desc" id="rail-central-desc">Enter your Central Node URL and Vendor API Key below.</div>
+              </div>
+              <button class="btn btn-sm" onclick="document.getElementById('cfg-central-url').focus()">Configure</button>
+            </div>
+
+            <div class="rail-step">
+              <div>
+                <div class="step-index">02 · WhatsApp Device</div>
+                <div class="step-title" id="rail-wa-title">Not linked</div>
+                <div class="step-desc" id="rail-wa-desc">Sign in with QR scan or an 8-digit phone code on this dashboard.</div>
+              </div>
+              <button class="btn btn-sm btn-emerald" id="rail-wa-btn" onclick="switchView('whatsapp')">Link WhatsApp</button>
+            </div>
+          </div>
+
+          <!-- Unified 4-Column Real Metrics -->
+          <div class="metrics">
+            <div class="metric">
+              <div class="metric-label">Products</div>
+              <div class="metric-val tabular" id="kpi-products">0</div>
+              <div class="metric-sub" id="kpi-products-sub">In active memory</div>
+            </div>
+            <div class="metric">
+              <div class="metric-label">Active Carts</div>
+              <div class="metric-val tabular" id="kpi-carts">0</div>
+              <div class="metric-sub">WhatsApp & website</div>
+            </div>
+            <div class="metric">
+              <div class="metric-label">Orders</div>
+              <div class="metric-val tabular" id="kpi-orders">0</div>
+              <div class="metric-sub">Synced from Central</div>
+            </div>
+            <div class="metric">
+              <div class="metric-label">Customers</div>
+              <div class="metric-val tabular" id="kpi-customers">0</div>
+              <div class="metric-sub">Hydrated profiles</div>
+            </div>
+          </div>
+
+          <!-- 2-Column Workspace -->
+          <div class="grid-7-5">
+            <!-- Store Operations -->
+            <div class="card">
+              <div class="card-head">
+                <div>
+                  <div class="card-title">Store Availability</div>
+                  <div class="card-sub">Live status synced with Central Brain Node</div>
+                </div>
+                <span class="text-ok" id="gov-status-label" style="font-size:13px;">Open</span>
+              </div>
+              <div class="card-body">
+                <div class="switch-list">
+                  <div class="switch-row">
+                    <div>
+                      <div class="switch-title">Store Open</div>
+                      <div class="switch-desc">Customers receive reopen hours automatically when turned off</div>
+                    </div>
+                    <label class="switch">
+                      <input type="checkbox" id="gov-is-open" onchange="saveGovernance()" />
+                      <span class="slider"></span>
+                    </label>
+                  </div>
+
+                  <div class="switch-row">
+                    <div>
+                      <div class="switch-title">Holiday Mode</div>
+                      <div class="switch-desc">Temporarily pause live order intake</div>
+                    </div>
+                    <label class="switch">
+                      <input type="checkbox" id="gov-holiday" onchange="saveGovernance()" />
+                      <span class="slider"></span>
+                    </label>
+                  </div>
+
+                  <div class="switch-row">
+                    <div>
+                      <div class="switch-title">AI Auto-Reply</div>
+                      <div class="switch-desc">Respond automatically to incoming WhatsApp messages</div>
+                    </div>
+                    <label class="switch">
+                      <input type="checkbox" id="gov-admin-ai" onchange="saveGovernance()" />
+                      <span class="slider"></span>
+                    </label>
+                  </div>
+                </div>
+
+                <div class="form-2">
+                  <div class="field">
+                    <label for="gov-hours">Operating Hours</label>
+                    <input class="input" id="gov-hours" placeholder="Synced from Central Brain" />
+                  </div>
+                  <div class="field">
+                    <label for="gov-next-open">Reopens At</label>
+                    <input class="input" id="gov-next-open" placeholder="Optional reopen schedule" />
+                  </div>
+                  <div class="field">
+                    <label for="gov-min-order">Minimum Order (₹)</label>
+                    <input class="input tabular" id="gov-min-order" type="number" min="0" placeholder="0" />
+                  </div>
+                  <div class="field">
+                    <label for="gov-eta">Delivery Estimate</label>
+                    <input class="input" id="gov-eta" placeholder="Synced from Central Brain" />
+                  </div>
+                </div>
+
+                <div style="margin-top: 22px; display: flex; justify-content: flex-end;">
+                  <button class="btn btn-ink" onclick="saveGovernance()">Save Changes</button>
+                </div>
+              </div>
+            </div>
+
+            <!-- Central Brain Link -->
+            <div class="card">
+              <div class="card-head">
+                <div>
+                  <div class="card-title">Central Brain Node</div>
+                  <div class="card-sub">Hydrate catalog, AI settings, and saved WhatsApp session</div>
+                </div>
+              </div>
+              <div class="card-body">
+                <div class="field">
+                  <label for="cfg-central-url">Central Node URL</label>
+                  <input class="input mono" id="cfg-central-url" placeholder="https://api.your-domain.com" />
+                </div>
+                <div class="field">
+                  <label for="cfg-vendor-key">Vendor API Key</label>
+                  <input class="input mono" id="cfg-vendor-key" type="password" placeholder="Enter vendor API key" />
+                </div>
+                <button class="btn btn-ink" style="width:100%;" onclick="connectCentralNode()">Connect & Sync</button>
+
+                <div class="kv-list">
+                  <div class="kv-row">
+                    <span class="kv-key">Public URL</span>
+                    <span class="kv-val mono" id="tel-public-url" style="font-size:12px;">—</span>
+                  </div>
+                  <div class="kv-row">
+                    <span class="kv-key">Order & Payment Control</span>
+                    <span class="kv-val">Central Brain</span>
+                  </div>
+                  <div class="kv-row">
+                    <span class="kv-key">AI Keys Active</span>
+                    <span class="kv-val tabular" id="tel-ai-keys">0</span>
+                  </div>
+                  <div class="kv-row">
+                    <span class="kv-key">Last Sync</span>
+                    <span class="kv-val tabular" id="tel-last-sync">Never</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Business Profile, Delivery Logistics, Payment System & AI Responder Summary -->
+          <div class="grid-2 section-gap">
+            <div class="card">
+              <div class="card-head">
+                <div>
+                  <div class="card-title">Business Profile & Logistics</div>
+                  <div class="card-sub">Synced vendor identity, storefronts & delivery rules</div>
+                </div>
+              </div>
+              <div class="card-body">
+                <div class="kv-list kv-flush">
+                  <div class="kv-row">
+                    <span class="kv-key">Business Name</span>
+                    <span class="kv-val" id="biz-name">—</span>
+                  </div>
+                  <div class="kv-row">
+                    <span class="kv-key">Vendor ID / Handle</span>
+                    <span class="kv-val mono" id="biz-id" style="font-size:12px;">—</span>
+                  </div>
+                  <div class="kv-row">
+                    <span class="kv-key">Business Type</span>
+                    <span class="kv-val" id="biz-type">—</span>
+                  </div>
+                  <div class="kv-row">
+                    <span class="kv-key">Language</span>
+                    <span class="kv-val" id="biz-lang">—</span>
+                  </div>
+                  <div class="kv-row">
+                    <span class="kv-key">Storefront URL</span>
+                    <span class="kv-val mono" id="biz-store-url" style="font-size:12px;">—</span>
+                  </div>
+                  <div class="kv-row">
+                    <span class="kv-key">Mall URL</span>
+                    <span class="kv-val mono" id="biz-mall-url" style="font-size:12px;">—</span>
+                  </div>
+                  <div class="kv-row">
+                    <span class="kv-key">Owner Alert Phone</span>
+                    <span class="kv-val mono" id="biz-phone">—</span>
+                  </div>
+                  <div class="kv-row">
+                    <span class="kv-key">Delivery Radius</span>
+                    <span class="kv-val tabular" id="biz-radius">—</span>
+                  </div>
+                  <div class="kv-row">
+                    <span class="kv-key">Delivery Charge</span>
+                    <span class="kv-val tabular" id="biz-del-charge">—</span>
+                  </div>
+                  <div class="kv-row">
+                    <span class="kv-key">Cash on Delivery (COD)</span>
+                    <span class="kv-val" id="biz-cod">—</span>
+                  </div>
+                  <div class="kv-row">
+                    <span class="kv-key">Customer GPS Required</span>
+                    <span class="kv-val" id="biz-req-loc">—</span>
+                  </div>
+                  <div class="kv-row">
+                    <span class="kv-key">Store Coordinates</span>
+                    <span class="kv-val mono" id="biz-coords" style="font-size:12px;">—</span>
+                  </div>
+                  <div class="kv-row">
+                    <span class="kv-key">Subscription</span>
+                    <span class="kv-val" id="biz-sub">—</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <div>
+                  <div class="card-title">Payment System & AI Responder</div>
+                  <div class="card-sub">Central checkout settings & active LLM responder state</div>
+                </div>
+              </div>
+              <div class="card-body">
+                <div class="kv-list kv-flush">
+                  <div class="kv-row">
+                    <span class="kv-key">Online Payment</span>
+                    <span class="kv-val" id="pay-enabled">Not configured</span>
+                  </div>
+                  <div class="kv-row">
+                    <span class="kv-key">Payment Gateway</span>
+                    <span class="kv-val" id="pay-gateway">—</span>
+                  </div>
+                  <div class="kv-row">
+                    <span class="kv-key">Merchant UPI VPA</span>
+                    <span class="kv-val mono" id="pay-vpa" style="font-size:12px;">—</span>
+                  </div>
+                  <div class="kv-row">
+                    <span class="kv-key">Paytm MID</span>
+                    <span class="kv-val mono" id="pay-mid" style="font-size:12px;">—</span>
+                  </div>
+                  <div class="kv-row">
+                    <span class="kv-key">Payee Name</span>
+                    <span class="kv-val" id="pay-payee">—</span>
+                  </div>
+                  <div class="kv-row">
+                    <span class="kv-key">Merchant Phone</span>
+                    <span class="kv-val mono" id="pay-phone">—</span>
+                  </div>
+                  <div class="kv-row">
+                    <span class="kv-key">AI Provider & Model</span>
+                    <span class="kv-val mono" id="ov-ai-engine" style="font-size:12px;">—</span>
+                  </div>
+                  <div class="kv-row">
+                    <span class="kv-key">AI Auto-Reply</span>
+                    <span class="kv-val" id="ov-ai-autoreply">—</span>
+                  </div>
+                  <div class="kv-row">
+                    <span class="kv-key">Catalog Context in AI</span>
+                    <span class="kv-val" id="ov-ai-catalog">—</span>
+                  </div>
+                  <div class="kv-row">
+                    <span class="kv-key">API Keys Pool</span>
+                    <span class="kv-val mono" id="ov-ai-keys" style="font-size:12px;">0 keys</span>
+                  </div>
+                  <div class="kv-row">
+                    <span class="kv-key">Temperature</span>
+                    <span class="kv-val tabular" id="ov-ai-temp">—</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ============================================================ -->
+        <!-- 2. WHATSAPP LOGIN                                            -->
+        <!-- ============================================================ -->
+        <section id="view-whatsapp" class="view">
+          <div class="page-intro">
+            <h2>WhatsApp Login</h2>
+            <p>Link your business phone directly on this dashboard. Once connected, your session persists automatically in Central Brain.</p>
+          </div>
+
+          <div class="grid-2" style="max-width: 960px;">
+            <!-- QR Login -->
+            <div class="card">
+              <div class="card-head">
+                <div>
+                  <div class="card-title">Scan QR Code</div>
+                  <div class="card-sub">Direct device pairing via WhatsMeow</div>
+                </div>
+                <span class="text-warn" id="wa-status-label" style="font-size:13px;">Not linked</span>
+              </div>
+              <div class="card-body qr-stage">
+                <div class="qr-pedestal" id="wa-qr-container">
+                  <div class="qr-placeholder">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><path d="M14 14h3v3h-3z"/><path d="M20 14v3h-3"/><path d="M14 20h6"/></svg>
+                    <span>Checking session...</span>
+                  </div>
+                </div>
+
+                <ol class="steps">
+                  <li>1. Open WhatsApp on your store phone.</li>
+                  <li>2. Tap <strong>Linked Devices</strong> → <strong>Link a Device</strong>.</li>
+                  <li>3. Scan the live QR code shown above.</li>
+                </ol>
+
+                <div style="display:flex; gap:10px; flex-wrap:wrap; justify-content:center;">
+                  <button class="btn" onclick="refreshWAStatus()">Refresh Status</button>
+                  <button class="btn btn-danger" onclick="unlinkWhatsApp()">Disconnect</button>
+                </div>
+              </div>
+            </div>
+
+            <!-- Phone Number Pairing -->
+            <div class="card">
+              <div class="card-head">
+                <div>
+                  <div class="card-title">Link with Phone Number</div>
+                  <div class="card-sub">Request an 8-digit pairing code instead of scanning</div>
+                </div>
+              </div>
+              <div class="card-body">
+                <div class="field">
+                  <label for="pair-phone-input">Phone Number (with country code)</label>
+                  <div class="pair-row">
+                    <input class="input mono" id="pair-phone-input" inputmode="tel" placeholder="e.g. 91XXXXXXXXXX" />
+                    <button class="btn btn-ink" onclick="requestPairCode()">Get Code</button>
+                  </div>
+                </div>
+                <div id="pair-code-display" class="pair-reveal" style="display:none;"></div>
+
+                <div class="kv-list">
+                  <div class="kv-row">
+                    <span class="kv-key">Central Session Backup</span>
+                    <span class="kv-val" id="wa-meta-has-session">None</span>
+                  </div>
+                  <div class="kv-row">
+                    <span class="kv-key">Connected Number</span>
+                    <span class="kv-val mono" id="wa-meta-phone">—</span>
+                  </div>
+                  <div class="kv-row">
+                    <span class="kv-key">Device ID</span>
+                    <span class="kv-val mono" id="wa-meta-jid" style="font-size:12px;">—</span>
+                  </div>
+                  <div class="kv-row">
+                    <span class="kv-key">Restart Behavior</span>
+                    <span class="kv-val text-ok">Auto-reconnects silently</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ============================================================ -->
+        <!-- 3. CATALOG & ORDERS                                          -->
+        <!-- ============================================================ -->
+        <section id="view-store" class="view">
+          <div class="page-intro">
+            <h2>Catalog & Orders</h2>
+            <p>Live store inventory, customer carts, and Central Brain orders held in memory.</p>
+          </div>
+
+          <div class="card">
+            <div class="table-bar">
+              <div class="segmented" role="tablist">
+                <button class="seg-btn active" data-tab="products" onclick="switchStoreTab('products')">Products</button>
+                <button class="seg-btn" data-tab="orders" onclick="switchStoreTab('orders')">Orders</button>
+                <button class="seg-btn" data-tab="carts" onclick="switchStoreTab('carts')">Carts</button>
+                <button class="seg-btn" data-tab="customers" onclick="switchStoreTab('customers')">Customers</button>
+              </div>
+
+              <div class="table-tools">
+                <input class="input search-box" id="store-search" placeholder="Search..." oninput="renderActiveStoreTab()" />
+                <button class="btn btn-sm" onclick="refreshStoreTables()">Refresh</button>
+              </div>
+            </div>
+
+            <div id="tab-products" class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Product</th>
+                    <th>Variants & Stock</th>
+                    <th class="th-r">Price</th>
+                    <th>Status</th>
+                  </tr>
+                </thead>
+                <tbody id="tbl-products"></tbody>
+              </table>
+            </div>
+
+            <div id="tab-orders" class="table-wrap" style="display:none;">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Order ID</th>
+                    <th>Customer</th>
+                    <th>Payment</th>
+                    <th class="th-r">Amount</th>
+                    <th>Fulfillment & Rider</th>
+                  </tr>
+                </thead>
+                <tbody id="tbl-orders"></tbody>
+              </table>
+            </div>
+
+            <div id="tab-carts" class="table-wrap" style="display:none;">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Customer Phone</th>
+                    <th>Cart Items</th>
+                    <th class="th-r">Total</th>
+                    <th>Channel</th>
+                  </tr>
+                </thead>
+                <tbody id="tbl-carts"></tbody>
+              </table>
+            </div>
+
+            <div id="tab-customers" class="table-wrap" style="display:none;">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Customer</th>
+                    <th>Delivery Address</th>
+                    <th>Recent Activity</th>
+                    <th>Origin</th>
+                  </tr>
+                </thead>
+                <tbody id="tbl-customers"></tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+
+        <!-- ============================================================ -->
+        <!-- 4. LIVE CHATS (REAL CONVERSATIONS ONLY)                      -->
+        <!-- ============================================================ -->
+        <section id="view-chats" class="view">
+          <div class="page-intro">
+            <h2>Live Chats</h2>
+            <p>Real-time WhatsApp customer threads and direct store owner replies.</p>
+          </div>
+
+          <div class="inbox-grid" id="inbox-grid">
+            <!-- Left Conversation List -->
+            <div class="inbox-list-col">
+              <div class="inbox-head">
+                <input class="input search-box" style="width:100%;" id="chat-search" placeholder="Search conversations..." oninput="renderConversationList()" />
+              </div>
+              <div class="conv-list" id="conv-list"></div>
+            </div>
+
+            <!-- Right Active Thread -->
+            <div class="inbox-thread-col">
+              <div class="thread-head">
+                <div class="thread-head-left">
+                  <button class="mobile-back-btn" aria-label="Back to conversations" onclick="closeMobileThread()">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
+                  </button>
+                  <div style="min-width:0;">
+                    <div class="card-title" id="active-chat-name" style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">Select a conversation</div>
+                    <div class="card-sub mono" id="active-chat-phone" style="font-size:12px;"></div>
+                  </div>
+                </div>
+                <button class="btn btn-sm" onclick="refreshChats()">Refresh</button>
+              </div>
+
+              <div class="thread-body" id="thread-messages"></div>
+
+              <div class="thread-composer">
+                <input class="input" id="manual-reply-input" placeholder="Select a conversation to reply..." disabled onkeydown="if(event.key==='Enter') sendManualReply()" />
+                <button class="btn btn-ink" id="manual-reply-btn" disabled onclick="sendManualReply()">Send</button>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ============================================================ -->
+        <!-- 5. SETTINGS                                                  -->
+        <!-- ============================================================ -->
+        <section id="view-settings" class="view">
+          <div class="page-intro">
+            <h2>Settings</h2>
+            <p>AI responder configuration and cloud deployment variables synced with Central Brain.</p>
+          </div>
+
+          <div class="grid-2" style="margin-bottom: 24px;">
+            <div class="card">
+              <div class="card-head">
+                <div>
+                  <div class="card-title">AI Provider & Key Rotation</div>
+                  <div class="card-sub">Automatic failover across backup keys on rate limits</div>
+                </div>
+              </div>
+              <div class="card-body">
+                <div class="form-2">
+                  <div class="field">
+                    <label for="ai-provider">Provider</label>
+                    <select class="select" id="ai-provider">
+                      <option value="">Select provider</option>
+                      <option value="groq">Groq</option>
+                      <option value="gemini">Google Gemini</option>
+                      <option value="openai">OpenAI</option>
+                      <option value="deepseek">DeepSeek</option>
+                      <option value="openrouter">OpenRouter</option>
+                    </select>
+                  </div>
+                  <div class="field">
+                    <label for="ai-model">Model</label>
+                    <input class="input mono" id="ai-model" placeholder="Synced from Central Brain" />
+                  </div>
+                </div>
+
+                <div class="field">
+                  <label for="ai-primary-key">Primary API Key</label>
+                  <input class="input mono" id="ai-primary-key" type="password" placeholder="Leave blank to keep synced key" />
+                  <div class="sub-line mono" id="ai-key-summary">No API key synced yet</div>
+                </div>
+
+                <div class="field">
+                  <label for="ai-backup-keys">Backup API Keys (one per line)</label>
+                  <textarea class="textarea mono-input" id="ai-backup-keys" placeholder="Optional backup API keys"></textarea>
+                </div>
+
+                <div class="switch-list" style="margin-top: 16px; margin-bottom: 18px;">
+                  <div class="switch-row">
+                    <div>
+                      <div class="switch-title">AI Auto-Reply</div>
+                      <div class="switch-desc">Allow responder to reply automatically on WhatsApp</div>
+                    </div>
+                    <label class="switch">
+                      <input type="checkbox" id="ai-auto-reply" />
+                      <span class="slider"></span>
+                    </label>
+                  </div>
+                  <div class="switch-row">
+                    <div>
+                      <div class="switch-title">Include Catalog in AI Context</div>
+                      <div class="switch-desc">Inject synced in-stock products & variants into prompts</div>
+                    </div>
+                    <label class="switch">
+                      <input type="checkbox" id="ai-import-catalog" />
+                      <span class="slider"></span>
+                    </label>
+                  </div>
+                </div>
+
+                <button class="btn btn-ink" onclick="saveAISettings()">Save AI Settings</button>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <div>
+                  <div class="card-title">Business Profile, Prompt & Policies</div>
+                  <div class="card-sub">Hydrated automatically from Mall Business Portal</div>
+                </div>
+              </div>
+              <div class="card-body">
+                <div class="form-2">
+                  <div class="field">
+                    <label for="set-biz-name">Business Name</label>
+                    <input class="input" id="set-biz-name" placeholder="Synced from Central Brain" />
+                  </div>
+                  <div class="field">
+                    <label for="set-biz-type">Business Type</label>
+                    <input class="input" id="set-biz-type" placeholder="Synced from Central Brain" />
+                  </div>
+                </div>
+
+                <div class="form-2">
+                  <div class="field">
+                    <label for="ai-language">Language</label>
+                    <input class="input" id="ai-language" placeholder="Synced from Central Brain" />
+                  </div>
+                  <div class="field">
+                    <label for="ai-temperature">Temperature</label>
+                    <input class="input tabular" id="ai-temperature" type="number" step="0.1" min="0" max="1" placeholder="0.7" />
+                  </div>
+                </div>
+
+                <div class="field">
+                  <label for="set-biz-phone">Owner Alert Phone</label>
+                  <input class="input mono" id="set-biz-phone" placeholder="Synced from Central Brain" />
+                </div>
+
+                <div class="switch-list" style="margin-bottom: 16px;">
+                  <div class="switch-row">
+                    <div>
+                      <div class="switch-title">Allow Cash on Delivery (COD)</div>
+                      <div class="switch-desc">Permit COD checkout alongside Central Brain online payments</div>
+                    </div>
+                    <label class="switch">
+                      <input type="checkbox" id="set-allow-cod" />
+                      <span class="slider"></span>
+                    </label>
+                  </div>
+                </div>
+
+                <div class="field">
+                  <label for="ai-system-prompt">System Prompt</label>
+                  <textarea class="textarea" id="ai-system-prompt" placeholder="No custom prompt configured"></textarea>
+                </div>
+
+                <div class="field">
+                  <label for="ai-store-policies">Store Policies</label>
+                  <textarea class="textarea" id="ai-store-policies" placeholder="No store policies configured"></textarea>
+                </div>
+
+                <button class="btn btn-ink" onclick="saveStorePromptSettings()">Save Store Profile</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-head">
+              <div>
+                <div class="card-title">Deployment Environment Variables</div>
+                <div class="card-sub">Set only these two variables on Render, Railway, or Koyeb — public URL is auto-detected</div>
+              </div>
+              <button class="btn btn-sm" onclick="copyEnvSnippet()">Copy</button>
+            </div>
+            <div class="card-body">
+              <pre class="code-box" id="env-snippet">CENTRAL_NODE_URL=
+VENDOR_API_KEY=</pre>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <!-- Mobile Bottom Tab Bar -->
+  <nav class="mobile-nav" aria-label="Mobile Navigation">
+    <button class="mnav-btn active" data-view="overview" onclick="switchView('overview')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg>
+      <span>Overview</span>
+    </button>
+    <button class="mnav-btn" data-view="whatsapp" onclick="switchView('whatsapp')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="2" width="14" height="20" rx="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></svg>
+      <span>WhatsApp</span>
+    </button>
+    <button class="mnav-btn" data-view="store" onclick="switchView('store')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M6 2 3 6v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V6l-3-4z"/><line x1="3" y1="6" x2="21" y2="6"/><path d="M16 10a4 4 0 0 1-8 0"/></svg>
+      <span>Store</span>
+    </button>
+    <button class="mnav-btn" data-view="chats" onclick="switchView('chats')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+      <span>Chats</span>
+    </button>
+    <button class="mnav-btn" data-view="settings" onclick="switchView('settings')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+      <span>Settings</span>
+    </button>
+  </nav>
+
+  <div id="toast-root" aria-live="polite"></div>
+
+  <script>
+    const VIEW_TITLES = {
+      overview: 'Overview',
+      whatsapp: 'WhatsApp Login',
+      store: 'Catalog & Orders',
+      chats: 'Live Chats',
+      settings: 'Settings',
+    };
+
+    let currentStoreTab = 'products';
+    let storeCache = { products: [], orders: [], carts: {}, customers: [] };
+    let conversationsCache = [];
+    let selectedChatPhone = '';
+
+    function toast(message, type = 'ok') {
+      const root = document.getElementById('toast-root');
+      const el = document.createElement('div');
+      el.className = 'toast' + (type === 'error' ? ' error' : type === 'warn' ? ' warn' : '');
+      el.textContent = message;
+      root.appendChild(el);
+      setTimeout(() => el.remove(), 3800);
+    }
+
+    function esc(str) {
+      return String(str ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+    }
+
+    function initials(name) {
+      const parts = String(name || '').trim().split(/\s+/).filter(Boolean);
+      if (!parts.length) return 'P';
+      return ((parts[0][0] || '') + (parts[1]?.[0] || '')).toUpperCase();
+    }
+
+    function switchView(name) {
+      document.querySelectorAll('.view').forEach((v) => v.classList.remove('active'));
+      document.querySelectorAll('.nav-btn, .mnav-btn').forEach((b) => b.classList.remove('active'));
+      document.getElementById('view-' + name)?.classList.add('active');
+      document.querySelectorAll(`.nav-btn[data-view="${name}"], .mnav-btn[data-view="${name}"]`).forEach((b) => b.classList.add('active'));
+      document.getElementById('topbar-title').textContent = VIEW_TITLES[name] || 'Overview';
+      window.scrollTo({ top: 0, behavior: 'instant' });
+
+      if (name === 'whatsapp') refreshWAStatus();
+      if (name === 'store') refreshStoreTables();
+      if (name === 'chats') refreshChats();
+    }
+
+    function switchStoreTab(tab) {
+      currentStoreTab = tab;
+      document.querySelectorAll('.seg-btn').forEach((b) => b.classList.remove('active'));
+      document.querySelector(`.seg-btn[data-tab="${tab}"]`)?.classList.add('active');
+      ['products', 'orders', 'carts', 'customers'].forEach((k) => {
+        document.getElementById('tab-' + k).style.display = k === tab ? 'block' : 'none';
+      });
+      renderActiveStoreTab();
+    }
+
+    function safeLinkHtml(url) {
+      const clean = String(url || '').trim();
+      if (!clean) return '—';
+      if (!/^https?:\/\//i.test(clean)) return esc(clean);
+      return `<a class="ext-link" href="${esc(clean)}" target="_blank" rel="noopener noreferrer">${esc(clean.replace(/^https?:\/\//i, ''))}</a>`;
+    }
+
+    function formatShortTime(raw) {
+      if (!raw) return '';
+      const d = new Date(raw);
+      if (Number.isNaN(d.getTime())) return String(raw);
+      return d.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+    }
+
+    async function fetchOverview() {
+      try {
+        const res = await fetch('/api/bot/overview');
+        const data = await res.json();
+
+        const v = data.vendor || {};
+        const sync = data.sync || {};
+        const gov = data.governance || {};
+        const wa = data.whatsapp || {};
+        const ai = data.ai || {};
+        const pay = data.payment || {};
+        const st = data.stats || {};
+
+        const storeName = v.business_name || '';
+        document.getElementById('topbar-store').textContent = storeName || (sync.connected ? 'Synced Store' : 'Not connected');
+
+        // Intro Header
+        document.getElementById('intro-heading').textContent = storeName || 'Connect your store';
+        const parts = [];
+        parts.push(sync.connected ? 'Central Brain synced' : 'Central Brain not connected');
+        parts.push(wa.status === 'Connected' ? `WhatsApp active (+${wa.phone})` : 'WhatsApp not linked');
+        document.getElementById('intro-sub').textContent = parts.join(' · ');
+
+        // Sidebar indicators
+        const waConnected = wa.status === 'Connected';
+        document.getElementById('foot-wa').textContent = waConnected ? `+${wa.phone}` : 'Not linked';
+        document.getElementById('foot-wa').className = 'summary-val ' + (waConnected ? 'text-ok' : '');
+        document.getElementById('nav-wa-state').textContent = waConnected ? 'Live' : '—';
+
+        document.getElementById('foot-central').textContent = sync.connected ? 'Connected' : sync.configured ? 'Retrying' : 'Not connected';
+        document.getElementById('foot-central').className = 'summary-val ' + (sync.connected ? 'text-ok' : '');
+        document.getElementById('nav-store-count').textContent = String((st.products || 0) + (st.orders || 0));
+        document.getElementById('nav-chat-count').textContent = String(st.conversations || 0);
+
+        // 2-Step Rail
+        document.getElementById('rail-central-title').textContent = sync.connected ? 'Connected' : sync.configured ? 'Reconnecting' : 'Not connected';
+        document.getElementById('rail-central-title').className = 'step-title ' + (sync.connected ? 'text-ok' : '');
+        document.getElementById('rail-central-desc').textContent = sync.connected
+          ? `Last synced ${sync.last_sync_at ? new Date(sync.last_sync_at).toLocaleTimeString() : 'just now'}`
+          : 'Enter your Central Node URL and Vendor API Key below.';
+
+        document.getElementById('rail-wa-title').textContent = waConnected ? `Connected (+${wa.phone})` : 'Not linked';
+        document.getElementById('rail-wa-title').className = 'step-title ' + (waConnected ? 'text-ok' : '');
+        document.getElementById('rail-wa-desc').textContent = waConnected
+          ? 'Session backed up automatically in Central Brain.'
+          : 'Sign in with QR scan or an 8-digit phone code on this dashboard.';
+        const railBtn = document.getElementById('rail-wa-btn');
+        railBtn.textContent = waConnected ? 'Manage' : 'Link WhatsApp';
+        railBtn.className = waConnected ? 'btn btn-sm' : 'btn btn-sm btn-emerald';
+
+        // Real KPIs
+        document.getElementById('kpi-products').textContent = st.products ?? 0;
+        document.getElementById('kpi-products-sub').textContent =
+          data.media_cache_entries > 0 ? `${data.media_cache_entries} cached thumbnails` : 'In active memory';
+        document.getElementById('kpi-carts').textContent = st.active_carts ?? 0;
+        document.getElementById('kpi-orders').textContent = st.orders ?? 0;
+        document.getElementById('kpi-customers').textContent = st.customers ?? 0;
+
+        // Governance
+        const govLabel = document.getElementById('gov-status-label');
+        if (!gov.can_auto_reply) {
+          govLabel.textContent = 'Auto-Reply Paused';
+          govLabel.className = 'text-err';
+        } else if (!gov.store_open) {
+          govLabel.textContent = gov.holiday_mode ? 'Holiday Mode' : 'Closed';
+          govLabel.className = 'text-warn';
+        } else {
+          govLabel.textContent = 'Open';
+          govLabel.className = 'text-ok';
+        }
+
+        document.getElementById('gov-is-open').checked = v.is_open !== false;
+        document.getElementById('gov-holiday').checked = Boolean(v.holiday_mode);
+        document.getElementById('gov-admin-ai').checked = gov.admin_ai_allowed !== false;
+
+        if (document.activeElement?.id !== 'gov-hours') document.getElementById('gov-hours').value = v.operating_hours || '';
+        if (document.activeElement?.id !== 'gov-next-open') document.getElementById('gov-next-open').value = v.next_open_time || '';
+        if (document.activeElement?.id !== 'gov-min-order') document.getElementById('gov-min-order').value = v.min_order_amount ? String(v.min_order_amount) : '';
+        if (document.activeElement?.id !== 'gov-eta') document.getElementById('gov-eta').value = v.estimated_delivery_time || '';
+
+        // Business Profile & Delivery Logistics Card (Real Synced Data Only)
+        const hasVendor = Boolean(v.business_name || v.vendor_id || v.username || sync.connected);
+        document.getElementById('biz-name').textContent = v.business_name || '—';
+        const idParts = [v.vendor_id, v.username ? '@' + v.username : ''].filter(Boolean);
+        document.getElementById('biz-id').textContent = idParts.length ? idParts.join(' · ') : '—';
+        document.getElementById('biz-type').textContent = v.business_type || '—';
+        document.getElementById('biz-lang').textContent = v.language || '—';
+        document.getElementById('biz-store-url').innerHTML = safeLinkHtml(v.store_url);
+        document.getElementById('biz-mall-url').innerHTML = safeLinkHtml(v.mall_url);
+        document.getElementById('biz-phone').textContent = v.notification_phone ? `+${String(v.notification_phone).replace(/^\+/, '')}` : '—';
+
+        const radParts = [];
+        if (v.free_delivery_radius_km > 0) radParts.push(`Free ${v.free_delivery_radius_km} km`);
+        if (v.max_delivery_radius_km > 0) radParts.push(`Max ${v.max_delivery_radius_km} km`);
+        document.getElementById('biz-radius').textContent = radParts.length ? radParts.join(' · ') : '—';
+        document.getElementById('biz-del-charge').textContent =
+          v.delivery_charge_amount > 0 ? `₹${Number(v.delivery_charge_amount).toFixed(2)}` : hasVendor ? '₹0' : '—';
+        document.getElementById('biz-cod').textContent = hasVendor ? (v.allow_cod !== false ? 'Allowed' : 'Disabled') : '—';
+        document.getElementById('biz-req-loc').textContent = hasVendor ? (v.require_customer_location ? 'Required' : 'Optional') : '—';
+        document.getElementById('biz-coords').textContent =
+          v.latitude || v.longitude ? `${Number(v.latitude).toFixed(4)}, ${Number(v.longitude).toFixed(4)}` : '—';
+
+        const subEl = document.getElementById('biz-sub');
+        if (!hasVendor) {
+          subEl.textContent = '—';
+          subEl.className = 'kv-val';
+        } else if (gov.subscription_valid === false) {
+          subEl.textContent = gov.subscription_reason || 'Inactive';
+          subEl.className = 'kv-val text-err';
+        } else {
+          subEl.textContent = gov.subscription_valid_until ? `Active until ${String(gov.subscription_valid_until).slice(0, 10)}` : 'Active';
+          subEl.className = 'kv-val text-ok';
+        }
+
+        // Payment System & AI Responder Card (Real Synced Data Only)
+        const payEnabledEl = document.getElementById('pay-enabled');
+        payEnabledEl.textContent = pay.enabled ? 'Enabled' : 'Not configured';
+        payEnabledEl.className = 'kv-val ' + (pay.enabled ? 'text-ok' : '');
+        document.getElementById('pay-gateway').textContent = pay.gateway || '—';
+        document.getElementById('pay-vpa').textContent = pay.merchant_vpa || '—';
+        document.getElementById('pay-mid').textContent = pay.paytm_mid || '—';
+        document.getElementById('pay-payee').textContent = pay.payee_name || '—';
+        document.getElementById('pay-phone').textContent = pay.merchant_phone ? `+${String(pay.merchant_phone).replace(/^\+/, '')}` : '—';
+
+        const engineParts = [ai.provider, ai.model].filter(Boolean);
+        document.getElementById('ov-ai-engine').textContent = engineParts.length ? engineParts.join(' / ') : '—';
+        const aiAutoEl = document.getElementById('ov-ai-autoreply');
+        aiAutoEl.textContent = hasVendor || ai.provider ? (ai.auto_reply ? 'Enabled' : 'Paused') : '—';
+        aiAutoEl.className = 'kv-val ' + (hasVendor || ai.provider ? (ai.auto_reply ? 'text-ok' : 'text-warn') : '');
+        document.getElementById('ov-ai-catalog').textContent = hasVendor || ai.provider ? (ai.import_catalog ? 'Enabled' : 'Disabled') : '—';
+
+        const totalKeys = Number(ai.api_key_count || 0);
+        const backupKeys = Number(ai.backup_api_key_count || 0);
+        const keyDesc =
+          totalKeys > 0
+            ? `${totalKeys} active${backupKeys > 0 ? ` (${backupKeys} backup)` : ''}${ai.api_key_masked ? ` · ${ai.api_key_masked}` : ''}`
+            : '0 keys';
+        document.getElementById('ov-ai-keys').textContent = keyDesc;
+        document.getElementById('ov-ai-temp').textContent = ai.temperature !== undefined && ai.temperature !== null ? String(ai.temperature) : '—';
+
+        // Settings Form Hydration (dynamically support any synced AI provider)
+        const providerSelect = document.getElementById('ai-provider');
+        if (ai.provider) {
+          const exists = Array.from(providerSelect.options).some((opt) => opt.value.toLowerCase() === String(ai.provider).toLowerCase());
+          if (!exists) {
+            const opt = document.createElement('option');
+            opt.value = ai.provider;
+            opt.textContent = ai.provider;
+            providerSelect.appendChild(opt);
+          }
+        }
+        if (document.activeElement?.id !== 'ai-provider') providerSelect.value = ai.provider || '';
+        if (document.activeElement?.id !== 'ai-model') document.getElementById('ai-model').value = ai.model || '';
+        document.getElementById('ai-key-summary').textContent =
+          totalKeys > 0
+            ? `Synced keys: ${totalKeys} active${backupKeys > 0 ? ` (${backupKeys} backup)` : ''}${ai.api_key_masked ? ` · Primary ${ai.api_key_masked}` : ''}`
+            : 'No API key synced yet';
+        document.getElementById('ai-auto-reply').checked = ai.auto_reply !== false;
+        document.getElementById('ai-import-catalog').checked = ai.import_catalog !== false;
+
+        if (document.activeElement?.id !== 'set-biz-name') document.getElementById('set-biz-name').value = v.business_name || '';
+        if (document.activeElement?.id !== 'set-biz-type') document.getElementById('set-biz-type').value = v.business_type || '';
+        if (document.activeElement?.id !== 'set-biz-phone') document.getElementById('set-biz-phone').value = v.notification_phone || '';
+        document.getElementById('set-allow-cod').checked = v.allow_cod !== false;
+        if (document.activeElement?.id !== 'ai-language') document.getElementById('ai-language').value = v.language || '';
+        if (document.activeElement?.id !== 'ai-temperature') document.getElementById('ai-temperature').value = ai.temperature ?? '';
+        if (document.activeElement?.id !== 'ai-system-prompt') document.getElementById('ai-system-prompt').value = ai.system_prompt || '';
+        if (document.activeElement?.id !== 'ai-store-policies') document.getElementById('ai-store-policies').value = v.store_policies || '';
+
+        // Telemetry (strictly real)
+        const pubUrl = sync.bot_public_url || '';
+        document.getElementById('tel-public-url').textContent = pubUrl ? pubUrl.replace(/^https?:\/\//, '') : window.location.host;
+        document.getElementById('tel-ai-keys').textContent = String(totalKeys);
+        document.getElementById('tel-last-sync').textContent = sync.last_sync_at ? new Date(sync.last_sync_at).toLocaleTimeString() : 'Never';
+
+        if (sync.central_url && !document.getElementById('cfg-central-url').value) {
+          document.getElementById('cfg-central-url').value = sync.central_url;
+        }
+        document.getElementById('env-snippet').textContent = `CENTRAL_NODE_URL=${sync.central_url || ''}\nVENDOR_API_KEY=`;
+      } catch (e) {
+        console.error(e);
+      }
+    }
+
+    async function saveGovernance() {
+      const payload = {
+        is_open: document.getElementById('gov-is-open').checked,
+        holiday_mode: document.getElementById('gov-holiday').checked,
+        admin_ai_auto_reply_allowed: document.getElementById('gov-admin-ai').checked,
+        operating_hours: document.getElementById('gov-hours').value.trim(),
+        next_open_time: document.getElementById('gov-next-open').value.trim(),
+        min_order_amount: Number(document.getElementById('gov-min-order').value || 0),
+        estimated_delivery_time: document.getElementById('gov-eta').value.trim(),
+      };
+      const res = await fetch('/api/bot/governance', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (res.ok) {
+        toast('Store availability saved');
+        fetchOverview();
+      } else {
+        toast('Unable to save changes', 'error');
+      }
+    }
+
+    async function connectCentralNode() {
+      const central_node_url = document.getElementById('cfg-central-url').value.trim();
+      const vendor_api_key = document.getElementById('cfg-vendor-key').value.trim();
+      if (!central_node_url || !vendor_api_key) {
+        toast('Enter both Central Node URL and Vendor API Key', 'error');
+        return;
+      }
+      const res = await fetch('/api/bot/connect-central', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ central_node_url, vendor_api_key }),
+      });
+      const data = await res.json();
+      toast(data.message || (res.ok ? 'Connected to Central Brain' : 'Connection failed'), res.ok ? 'ok' : 'error');
+      await Promise.all([fetchOverview(), refreshStoreTables(), refreshWAStatus()]);
+    }
+
+    async function triggerResync() {
+      const res = await fetch('/api/bot/resync', { method: 'POST' });
+      const data = await res.json();
+      toast(data.message || (res.ok ? 'Synced with Central Brain' : 'Central Brain not configured yet'), res.ok ? 'ok' : 'warn');
+      await Promise.all([fetchOverview(), refreshStoreTables(), refreshWAStatus()]);
+    }
+
+    // WhatsApp Login (Strict real state — zero fake QR or fake pair codes)
+    async function refreshWAStatus() {
+      const res = await fetch('/api/whatsapp/status');
+      const data = await res.json();
+
+      const label = document.getElementById('wa-status-label');
+      if (data.connected) {
+        label.textContent = 'Connected';
+        label.className = 'text-ok';
+      } else if (data.qr_data_url) {
+        label.textContent = 'Ready to scan';
+        label.className = 'text-warn';
+      } else {
+        label.textContent = 'Not linked';
+        label.className = 'text-warn';
+      }
+
+      const hasSession = document.getElementById('wa-meta-has-session');
+      hasSession.textContent = data.has_session ? 'Saved in Central Brain' : 'None';
+      hasSession.className = 'kv-val ' + (data.has_session ? 'text-ok' : '');
+
+      document.getElementById('wa-meta-phone').textContent = data.phone ? '+' + data.phone : '—';
+      document.getElementById('wa-meta-jid').textContent = data.device_jid || '—';
+
+      const box = document.getElementById('wa-qr-container');
+      if (data.connected) {
+        box.innerHTML = `<div style="text-align:center;"><div class="text-ok" style="font-size:15px;">Connected</div><div class="mono" style="font-size:13px; color:var(--ink-secondary); margin-top:6px;">+${esc(data.phone)}</div></div>`;
+      } else if (data.qr_data_url) {
+        box.innerHTML = `<img src="${data.qr_data_url}" alt="Live WhatsApp QR code" />`;
+      } else {
+        box.innerHTML = `<div class="qr-placeholder">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><path d="M14 14h3v3h-3z"/><path d="M20 14v3h-3"/><path d="M14 20h6"/></svg>
+          <span>${data.whatsmeow_active === false ? 'Live QR available when Go WhatsMeow binary is deployed' : 'No active QR code yet. Click Refresh Status.'}</span>
+        </div>`;
+      }
+    }
+
+    async function requestPairCode() {
+      const phone = document.getElementById('pair-phone-input').value.trim();
+      if (!phone) return toast('Enter phone number with country code', 'error');
+      const res = await fetch('/api/whatsapp/pair', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ phone }),
+      });
+      const data = await res.json();
+      if (res.ok && data.code) {
+        const box = document.getElementById('pair-code-display');
+        box.style.display = 'block';
+        box.textContent = data.code;
+        toast('Pairing code generated');
+      } else {
+        toast(data.message || 'Could not generate pairing code', 'error');
+      }
+    }
+
+    async function unlinkWhatsApp() {
+      const res = await fetch('/api/whatsapp/unlink', { method: 'POST' });
+      const data = await res.json();
+      toast(data.message || 'Disconnected', res.ok ? 'warn' : 'error');
+      document.getElementById('pair-code-display').style.display = 'none';
+      refreshWAStatus();
+      fetchOverview();
+    }
+
+    // Store Data Tables (Real Synced Data Only)
+    async function refreshStoreTables() {
+      const [pRes, oRes, cRes, custRes] = await Promise.all([
+        fetch('/api/ram/products'),
+        fetch('/api/ram/orders'),
+        fetch('/api/ram/carts'),
+        fetch('/api/ram/customers'),
+      ]);
+      const pData = await pRes.json();
+      const oData = await oRes.json();
+      const cData = await cRes.json();
+      const custData = await custRes.json();
+
+      storeCache = {
+        products: pData.products || [],
+        orders: oData.orders || [],
+        carts: cData.carts || {},
+        customers: custData.customers || [],
+      };
+      renderActiveStoreTab();
+    }
+
+    function emptyTableRow(cols, title, desc) {
+      return `<tr class="empty-row"><td colspan="${cols}"><div class="empty-box">
+        <div class="empty-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 8v4"/><path d="M12 16h.01"/></svg></div>
+        <div class="empty-title">${esc(title)}</div>
+        <div class="empty-desc">${esc(desc)}</div>
+      </div></td></tr>`;
+    }
+
+    function renderActiveStoreTab() {
+      const q = (document.getElementById('store-search')?.value || '').trim().toLowerCase();
+
+      // Products (with image URLs, gallery count, variants, SKU, MRP & stock)
+      const prods = storeCache.products.filter(
+        (p) => !q || `${p.id} ${p.name} ${p.category} ${p.description} ${p.image_url}`.toLowerCase().includes(q)
+      );
+      document.getElementById('tbl-products').innerHTML = prods.length
+        ? prods
+            .map((p) => {
+              const vars =
+                p.variants && p.variants.length
+                  ? p.variants
+                      .map((v) => {
+                        const oos = v.in_stock === false || (v.stock_qty !== null && v.stock_qty !== undefined && v.stock_qty <= 0);
+                        const vName = v.name || v.weight || v.size || 'Variant';
+                        return `<div class="tabular" style="font-size:12.5px; color:${oos ? 'var(--rose-ink)' : 'var(--ink-secondary)'};">
+                          ${esc(vName)}${v.sku ? ` (${esc(v.sku)})` : ''} · ₹${v.sale_price || v.price || p.price} · ${oos ? 'Out of stock' : `${v.stock_qty ?? 'In stock'}`}
+                        </div>`;
+                      })
+                      .join('')
+                  : `<span style="font-size:12.5px; color:var(--ink-muted);">${p.stock_qty != null ? `${p.stock_qty} ${esc(p.unit_type || 'units')}` : `Standard (${esc(p.unit_type || 'pcs')})`}</span>`;
+
+              const imgList = [];
+              if (p.image_url) imgList.push(p.image_url);
+              if (Array.isArray(p.images)) {
+                p.images.forEach((u) => {
+                  if (u && !imgList.includes(u)) imgList.push(u);
+                });
+              }
+              if (!imgList.length && p.thumb_url) imgList.push(p.thumb_url);
+              const primaryImg = imgList[0] || '';
+
+              const thumbHtml = primaryImg
+                ? `<img src="${esc(primaryImg)}" alt="${esc(p.name)}" referrerpolicy="no-referrer" onerror="this.remove();" />`
+                : esc(initials(p.name));
+
+              const imgUrlLine = primaryImg
+                ? `<div class="img-url-line" title="${esc(primaryImg)}">IMG: ${safeLinkHtml(primaryImg)}${imgList.length > 1 ? ` <span style="color:var(--ink-faint);">+${imgList.length - 1} more</span>` : ''}</div>`
+                : '';
+
+              const activePrice = Number(p.sale_price || p.price || 0);
+              const mrpVal = Number(p.mrp || 0);
+              const mrpHtml = mrpVal > activePrice ? `<div class="price-strike">MRP ₹${mrpVal}</div>` : '';
+
+              return `<tr>
+                <td class="td-primary">
+                  <div class="prod-cell">
+                    <div class="prod-thumb">${thumbHtml}</div>
+                    <div style="min-width:0;">
+                      <div style="font-weight:600;">${esc(p.name)} <span class="mono" style="font-size:11.5px; color:var(--ink-faint); font-weight:400;">#${esc(p.id)}</span></div>
+                      <div class="sub-line">${esc(p.category || 'Catalog')}${p.description ? ' · ' + esc(p.description.slice(0, 72)) + (p.description.length > 72 ? '…' : '') : ''}</div>
+                      ${imgUrlLine}
+                    </div>
+                  </div>
+                </td>
+                <td data-label="Variants & Stock"><div>${vars}</div></td>
+                <td data-label="Price" class="td-r mono tabular">
+                  <div>₹${activePrice}</div>
+                  ${mrpHtml}
+                </td>
+                <td data-label="Status"><span class="${p.in_stock ? 'text-ok' : 'text-err'}">${p.in_stock ? 'In Stock' : 'Out of Stock'}</span></td>
+              </tr>`;
+            })
+            .join('')
+        : emptyTableRow(4, 'No products synced', 'Connect your Central Brain Node on Overview to sync your real store catalog into memory.');
+
+      // Orders (with items breakdown, payment link, delivery address & rider details)
+      const orders = storeCache.orders.filter(
+        (o) => !q || `${o.order_id} ${o.customer_name} ${o.customer_phone} ${o.order_status} ${o.delivery_address}`.toLowerCase().includes(q)
+      );
+      document.getElementById('tbl-orders').innerHTML = orders.length
+        ? orders
+            .map((o) => {
+              const itemsText = Array.isArray(o.items) && o.items.length
+                ? o.items.map((it) => `${esc(it.product_name || '#' + it.product_id)}${it.selected_variant ? ` (${esc(it.selected_variant)})` : ''} × ${it.qty}`).join(', ')
+                : '';
+              const payLinkHtml = o.payment_link ? `<div class="sub-line">${safeLinkHtml(o.payment_link)}</div>` : '';
+              const feeLine = Number(o.delivery_fee || 0) > 0
+                ? `<div class="sub-line tabular">Sub ₹${Number(o.subtotal || 0).toFixed(0)} + Fee ₹${Number(o.delivery_fee).toFixed(0)}</div>`
+                : '';
+              return `<tr>
+                <td class="td-primary">
+                  <div class="mono" style="font-weight:600;">#${esc(o.order_id)}</div>
+                  <div class="sub-line">${esc(o.source || 'whatsapp')}${o.created_at ? ' · ' + esc(formatShortTime(o.created_at)) : ''}</div>
+                  ${itemsText ? `<div class="sub-line" style="color:var(--ink-secondary);">${itemsText}</div>` : ''}
+                </td>
+                <td data-label="Customer">
+                  <div>
+                    <div style="font-weight:500;">${esc(o.customer_name || 'Customer')}</div>
+                    <div class="sub-line mono">+${esc(o.customer_phone)}</div>
+                    ${o.delivery_address ? `<div class="sub-line">${esc(o.delivery_address.slice(0, 72))}${o.delivery_address.length > 72 ? '…' : ''}</div>` : ''}
+                  </div>
+                </td>
+                <td data-label="Payment">
+                  <div>
+                    <div>${esc(o.payment_mode || '—')}</div>
+                    <div class="sub-line">${esc(o.payment_status || 'PENDING')}${o.txn_id ? ` · <span class="mono">${esc(o.txn_id)}</span>` : ''}</div>
+                    ${payLinkHtml}
+                  </div>
+                </td>
+                <td data-label="Amount" class="td-r mono tabular">
+                  <div>₹${Number(o.total_amount || 0).toFixed(2)}</div>
+                  ${feeLine}
+                </td>
+                <td data-label="Status">
+                  <div>
+                    <div class="${o.order_status === 'DELIVERED' || o.order_status === 'CONFIRMED' ? 'text-ok' : o.order_status === 'CANCELLED' ? 'text-err' : 'text-warn'}">${esc(o.order_status || 'PENDING')}</div>
+                    ${o.delivery_partner_name ? `<div class="sub-line">Rider: ${esc(o.delivery_partner_name)}${o.delivery_partner_phone ? ` (+${esc(o.delivery_partner_phone)})` : ''}${o.delivery_otp ? ` · OTP <span class="mono">${esc(o.delivery_otp)}</span>` : ''}</div>` : ''}
+                    ${o.estimated_delivery ? `<div class="sub-line">ETA: ${esc(o.estimated_delivery)}</div>` : ''}
+                  </div>
+                </td>
+              </tr>`;
+            })
+            .join('')
+        : emptyTableRow(5, 'No orders yet', 'Orders submitted from WhatsApp or synced from your store website will appear here.');
+
+      // Carts (with customer name resolution & unit prices)
+      const custNameByPhone = new Map(storeCache.customers.map((c) => [c.wa_number, c.full_name]));
+      const cartPhones = Object.keys(storeCache.carts).filter((ph) => {
+        if (!q) return true;
+        const cname = custNameByPhone.get(ph) || '';
+        return `${ph} ${cname}`.toLowerCase().includes(q);
+      });
+      document.getElementById('tbl-carts').innerHTML = cartPhones.length
+        ? cartPhones
+            .map((ph) => {
+              const items = storeCache.carts[ph] || [];
+              const total = items.reduce((s, it) => s + Number(it.line_total || Number(it.unit_price || 0) * Number(it.qty || 1)), 0);
+              const cname = custNameByPhone.get(ph) || '';
+              return `<tr>
+                <td class="td-primary">
+                  ${cname ? `<div style="font-weight:600;">${esc(cname)}</div><div class="sub-line mono">+${esc(ph)}</div>` : `<div class="mono" style="font-weight:600;">+${esc(ph)}</div>`}
+                </td>
+                <td data-label="Cart Items"><div>${items.map((it) => `<div>${esc(it.product_name || '#' + it.product_id)}${it.selected_variant ? ` (${esc(it.selected_variant)})` : ''} × ${it.qty} <span class="mono" style="font-size:12px; color:var(--ink-muted);">(₹${Number(it.line_total || Number(it.unit_price || 0) * Number(it.qty || 1)).toFixed(0)})</span></div>`).join('')}</div></td>
+                <td data-label="Total" class="td-r mono tabular">₹${total.toFixed(2)}</td>
+                <td data-label="Channel" style="color:var(--ink-secondary);">${esc(items[0]?.source || 'whatsapp')}</td>
+              </tr>`;
+            })
+            .join('')
+        : emptyTableRow(4, 'No active carts', 'Customer carts created on WhatsApp or your store website sync here automatically.');
+
+      // Customers (with contact phone, GPS coords, state & payment status)
+      const customers = storeCache.customers.filter(
+        (c) => !q || `${c.full_name} ${c.wa_number} ${c.contact_phone} ${c.delivery_address} ${c.current_state}`.toLowerCase().includes(q)
+      );
+      document.getElementById('tbl-customers').innerHTML = customers.length
+        ? customers
+            .map((c) => {
+              const altPhone = c.contact_phone && c.contact_phone !== c.wa_number
+                ? `<div class="sub-line mono">Contact: +${esc(c.contact_phone)}</div>`
+                : '';
+              const gpsLine = c.latitude || c.longitude
+                ? `<div class="sub-line mono">GPS: ${Number(c.latitude).toFixed(4)}, ${Number(c.longitude).toFixed(4)}</div>`
+                : '';
+              const stateBits = [c.current_state, c.payment_status].filter(Boolean).join(' · ');
+              return `<tr>
+                <td class="td-primary">
+                  <div style="font-weight:600;">${esc(c.full_name || 'Guest')}</div>
+                  <div class="sub-line mono">+${esc(c.wa_number)}</div>
+                  ${altPhone}
+                </td>
+                <td data-label="Address">
+                  <div>
+                    <div>${esc(c.delivery_address || '—')}</div>
+                    ${gpsLine}
+                  </div>
+                </td>
+                <td data-label="Activity" style="color:var(--ink-secondary);">
+                  <div>
+                    <div>${esc(c.last_order_details || stateBits || '—')}</div>
+                    ${c.last_order_details && stateBits ? `<div class="sub-line">${esc(stateBits)}</div>` : ''}
+                  </div>
+                </td>
+                <td data-label="Origin" style="color:var(--ink-secondary);">${esc(c.source || 'whatsapp')}</td>
+              </tr>`;
+            })
+            .join('')
+        : emptyTableRow(4, 'No customers hydrated', 'Customer profiles from Central Brain and WhatsApp conversations appear here.');
+    }
+
+    // Live Chats (Real Conversations Only)
+    async function refreshChats() {
+      try {
+        const res = await fetch('/api/chats');
+        const data = await res.json();
+        conversationsCache = data.conversations || [];
+        renderConversationList();
+        if (selectedChatPhone) {
+          await loadThread(selectedChatPhone);
+        } else {
+          renderEmptyThread();
+        }
+      } catch (e) {
+        console.error(e);
+      }
+    }
+
+    function renderConversationList() {
+      const q = (document.getElementById('chat-search')?.value || '').trim().toLowerCase();
+      const list = conversationsCache.filter((c) => !q || `${c.customer_name} ${c.customer_phone} ${c.last_message}`.toLowerCase().includes(q));
+      const root = document.getElementById('conv-list');
+
+      if (!list.length) {
+        root.innerHTML = `<div class="empty-box" style="padding:48px 20px;">
+          <div class="empty-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></div>
+          <div class="empty-title">No conversations yet</div>
+          <div class="empty-desc">Real WhatsApp messages from your customers will appear here.</div>
+        </div>`;
+        return;
+      }
+
+      root.innerHTML = list
+        .map(
+          (c) => `<button class="conv-item ${c.customer_phone === selectedChatPhone ? 'active' : ''}" onclick="loadThread('${esc(c.customer_phone)}')">
+            <div class="conv-top">
+              <span class="conv-name">${esc(c.customer_name || '+' + c.customer_phone)}</span>
+              <span class="conv-time">${esc(c.last_time || '')}</span>
+            </div>
+            <div class="conv-preview">${esc(c.last_message || '')}</div>
+          </button>`
+        )
+        .join('');
+    }
+
+    function renderEmptyThread() {
+      document.getElementById('active-chat-name').textContent = 'No conversation selected';
+      document.getElementById('active-chat-phone').textContent = '';
+      document.getElementById('manual-reply-input').disabled = true;
+      document.getElementById('manual-reply-input').placeholder = 'Select a conversation to reply...';
+      document.getElementById('manual-reply-btn').disabled = true;
+      document.getElementById('thread-messages').innerHTML = `<div class="empty-box" style="margin:auto;">
+        <div class="empty-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.38 8.38 0 0 1-.9 3.8 8.5 8.5 0 0 1-7.6 4.7 8.38 8.38 0 0 1-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 0 1-.9-3.8 8.5 8.5 0 0 1 4.7-7.6 8.38 8.38 0 0 1 3.8-.9h.5a8.48 8.48 0 0 1 8 8v.5z"/></svg></div>
+        <div class="empty-title">Live WhatsApp Inbox</div>
+        <div class="empty-desc">Choose a customer thread from the left to view messages and send direct store replies.</div>
+      </div>`;
+    }
+
+    function closeMobileThread() {
+      document.getElementById('inbox-grid')?.classList.remove('mobile-thread-open');
+    }
+
+    async function loadThread(phone) {
+      selectedChatPhone = phone;
+      document.getElementById('inbox-grid')?.classList.add('mobile-thread-open');
+      renderConversationList();
+      const conv = conversationsCache.find((c) => c.customer_phone === phone);
+      document.getElementById('active-chat-name').textContent = conv?.customer_name || `+${phone}`;
+      document.getElementById('active-chat-phone').textContent = `+${phone}`;
+      document.getElementById('manual-reply-input').disabled = false;
+      document.getElementById('manual-reply-input').placeholder = `Reply to +${phone}...`;
+      document.getElementById('manual-reply-btn').disabled = false;
+
+      const res = await fetch(`/api/chats/messages?phone=${encodeURIComponent(phone)}`);
+      const data = await res.json();
+      const msgs = data.messages || [];
+      const box = document.getElementById('thread-messages');
+      if (!msgs.length) {
+        box.innerHTML = `<div class="empty-box" style="margin:auto;"><div class="empty-desc">No messages in this thread yet.</div></div>`;
+        return;
+      }
+      box.innerHTML = msgs
+        .map((m) => {
+          const isIn = m.role === 'customer' || m.direction === 'incoming';
+          const who = isIn ? 'Customer' : m.direction === 'outgoing_manual' ? 'Store Owner' : 'Bot';
+          return `<div class="bubble ${isIn ? 'in' : 'out'}">
+            <div class="bubble-meta">${esc(who)}${m.time ? ' · ' + esc(m.time) : ''}</div>
+            ${esc(m.text)}
+          </div>`;
+        })
+        .join('');
+      box.scrollTop = box.scrollHeight;
+    }
+
+    async function sendManualReply() {
+      if (!selectedChatPhone) return;
+      const input = document.getElementById('manual-reply-input');
+      const message = input.value.trim();
+      if (!message) return;
+
+      const res = await fetch('/api/chats/send', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ phone: selectedChatPhone, message }),
+      });
+      if (res.ok) {
+        input.value = '';
+        await loadThread(selectedChatPhone);
+        toast('Reply sent');
+      } else {
+        toast('Could not send reply', 'error');
+      }
+    }
+
+    // Settings
+    async function saveAISettings() {
+      const backupRaw = document.getElementById('ai-backup-keys').value.trim();
+      const backup_api_keys = backupRaw ? backupRaw.split(/[\n,]+/).map((k) => k.trim()).filter(Boolean) : [];
+      const payload = {
+        ai_provider: document.getElementById('ai-provider').value,
+        ai_model: document.getElementById('ai-model').value.trim(),
+        api_key: document.getElementById('ai-primary-key').value.trim(),
+        auto_reply: document.getElementById('ai-auto-reply').checked,
+        import_catalog: document.getElementById('ai-import-catalog').checked,
+      };
+      if (backup_api_keys.length > 0) payload.backup_api_keys = backup_api_keys;
+
+      const res = await fetch('/api/ai/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+      toast(res.ok ? `AI settings saved (${data.api_key_count || 0} keys active)` : 'Could not save AI settings', res.ok ? 'ok' : 'error');
+      fetchOverview();
+    }
+
+    async function saveStorePromptSettings() {
+      const tempRaw = document.getElementById('ai-temperature').value;
+      const res = await fetch('/api/ai/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          business_name: document.getElementById('set-biz-name').value.trim(),
+          business_type: document.getElementById('set-biz-type').value.trim(),
+          notification_phone: document.getElementById('set-biz-phone').value.trim(),
+          allow_cod: document.getElementById('set-allow-cod').checked,
+          language: document.getElementById('ai-language').value.trim(),
+          ai_temperature: tempRaw !== '' ? Number(tempRaw) : 0.7,
+          system_prompt: document.getElementById('ai-system-prompt').value.trim(),
+          store_policies: document.getElementById('ai-store-policies').value.trim(),
+        }),
+      });
+      toast(res.ok ? 'Store profile updated' : 'Could not update profile', res.ok ? 'ok' : 'error');
+      fetchOverview();
+    }
+
+    function copyEnvSnippet() {
+      const text = document.getElementById('env-snippet').textContent;
+      navigator.clipboard?.writeText(text).then(() => toast('Environment variables copied'));
+    }
+
+    let sseSource = null;
+    function initSSE() {
+      if (sseSource) {
+        try { sseSource.close(); } catch {}
+      }
+      sseSource = new EventSource('/api/chat/stream');
+      sseSource.onmessage = (ev) => {
+        try {
+          const msg = JSON.parse(ev.data);
+          if (msg.type === 'connected') return;
+          if (msg.type === 'ram_synced' || msg.type === 'session_unlinked') {
+            fetchOverview();
+            refreshStoreTables();
+            refreshWAStatus();
+            return;
+          }
+          if (msg.type === 'incoming' || msg.type === 'outgoing_ai' || msg.type === 'outgoing_manual') {
+            refreshChats();
+            fetchOverview();
+            refreshStoreTables();
+          }
+        } catch {}
+      };
+      sseSource.onerror = () => {
+        try { sseSource.close(); } catch {}
+        setTimeout(initSSE, 3000);
+      };
+    }
+
+    fetchOverview();
+    refreshStoreTables();
+    refreshWAStatus();
+    initSSE();
+    setInterval(fetchOverview, 12000);
+  </script>
+</body>
+</html>

@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: vendor-whatsapp-bot
+    env: go
+    plan: free
+    region: singapore
+    buildCommand: "go mod tidy && CGO_ENABLED=0 go build -ldflags=\"-s -w\" -o main ."
+    startCommand: "./main"
+    envVars:
+      - key: PORT
+        value: "8080"
+      - key: GOGC
+        value: "20"
+      - key: CENTRAL_NODE_URL
+        sync: false
+      - key: VENDOR_API_KEY
+        sync: false
