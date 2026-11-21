@@ -431,8 +431,10 @@ func updateSlidingWindowRAM(_, customerPhone, role, text string) []ChatMessage {
 		}
 	}
 
-	if len(session.Messages) > 10 {
-		session.Messages = session.Messages[len(session.Messages)-10:]
+	if len(session.Messages) > ramstore.MaxChatsPerCustomer {
+		trimmed := make([]ChatMessage, ramstore.MaxChatsPerCustomer)
+		copy(trimmed, session.Messages[len(session.Messages)-ramstore.MaxChatsPerCustomer:])
+		session.Messages = trimmed
 	}
 	session.LastActivity = time.Now()
 

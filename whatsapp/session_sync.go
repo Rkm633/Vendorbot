@@ -27,10 +27,11 @@ import (
 const ephemeralSessionPath = "/tmp/vendor_wa_session.db"
 
 var (
-	sessionFileMu       sync.Mutex
-	ephemeralSQLDB      *sql.DB
-	sessionLoggedOut    atomic.Bool
-	initialPairUploaded atomic.Bool
+	sessionFileMu        sync.Mutex
+	ephemeralSQLDB       *sql.DB
+	sessionLoggedOut     atomic.Bool
+	initialPairUploaded  atomic.Bool
+	initialPairUploading atomic.Bool
 )
 
 // InitEphemeralSessionStore restores any saved whatsmeow session blob from Central Brain Node
@@ -45,8 +46,10 @@ func InitEphemeralSessionStore(centralSession *central.BootstrapWhatsAppSession)
 	}
 
 	_ = os.MkdirAll(filepath.Dir(ephemeralSessionPath), 0o755)
+	_ = os.Remove(ephemeralSessionPath + "-wal")
+	_ = os.Remove(ephemeralSessionPath + "-shm")
 	sessionLoggedOut.Store(false)
-	initialPairUploaded.Store(false)
+	initialPairUploading.Store(false)
 
 	restored := false
 	if centralSession != nil && centralSession.HasSession && strings.TrimSpace(centralSession.SessionBlobBase64) != "" {
@@ -60,6 +63,10 @@ func InitEphemeralSessionStore(centralSession *central.BootstrapWhatsAppSession)
 	} else {
 		_ = os.Remove(ephemeralSessionPath)
 	}
+
+	// If session was already restored from Central Brain Node, no need to re-upload immediately on boot
+	// (GracefulShutdownWhatsApp will still upload the latest ratchet snapshot on Render redeploy/restart).
+	initialPairUploaded.Store(restored)
 
 	dsn := fmt.Sprintf("file:%s?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_pragma=journal_mode(DELETE)", ephemeralSessionPath)
 	rawDB, err := sql.Open("sqlite", dsn)
@@ -86,8 +93,35 @@ func InitEphemeralSessionStore(centralSession *central.BootstrapWhatsAppSession)
 	return nil
 }
 
+func decodeBase64Flexible(rawInput string) ([]byte, error) {
+	s := strings.TrimSpace(rawInput)
+	if idx := strings.Index(s, ";base64,"); idx != -1 {
+		s = s[idx+len(";base64,"):]
+	}
+	// Strip whitespace/newlines that proxies or JSON serializers may wrap
+	s = strings.Map(func(r rune) rune {
+		if r == '\r' || r == '\n' || r == ' ' || r == '\t' {
+			return -1
+		}
+		return r
+	}, s)
+	if s == "" {
+		return nil, fmt.Errorf("empty base64 string")
+	}
+	if b, err := base64.StdEncoding.DecodeString(s); err == nil {
+		return b, nil
+	}
+	if b, err := base64.RawStdEncoding.DecodeString(strings.TrimRight(s, "=")); err == nil {
+		return b, nil
+	}
+	if b, err := base64.URLEncoding.DecodeString(s); err == nil {
+		return b, nil
+	}
+	return base64.RawURLEncoding.DecodeString(strings.TrimRight(s, "="))
+}
+
 func writeSessionBlobToDisk(blobBase64 string) error {
-	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(blobBase64))
+	raw, err := decodeBase64Flexible(blobBase64)
 	if err != nil {
 		return err
 	}
@@ -115,6 +149,9 @@ func writeSessionBlobToDisk(blobBase64 string) error {
 		return fmt.Errorf("invalid sqlite header in session blob")
 	}
 
+	_ = os.Remove(ephemeralSessionPath + "-wal")
+	_ = os.Remove(ephemeralSessionPath + "-shm")
+
 	tmpPath := ephemeralSessionPath + ".restore"
 	if err := os.WriteFile(tmpPath, sqliteBytes, 0o600); err != nil {
 		return err
@@ -122,18 +159,38 @@ func writeSessionBlobToDisk(blobBase64 string) error {
 	return os.Rename(tmpPath, ephemeralSessionPath)
 }
 
-// ExportSessionBlobBase64 snapshots the local ephemeral whatsmeow session file as gzip+base64
-// after verifying it is a valid, non-empty SQLite file.
+// ExportSessionBlobBase64 takes a consistent SQLite snapshot (via VACUUM INTO) of the local ephemeral
+// whatsmeow session file and encodes it as gzip+base64 after verifying it is a valid, non-empty SQLite file.
 func ExportSessionBlobBase64() (string, error) {
 	sessionFileMu.Lock()
 	defer sessionFileMu.Unlock()
 
-	data, err := os.ReadFile(ephemeralSessionPath)
+	var data []byte
+	var err error
+
+	if ephemeralSQLDB != nil {
+		snapPath := ephemeralSessionPath + ".snap"
+		_ = os.Remove(snapPath)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_, vacErr := ephemeralSQLDB.ExecContext(ctx, fmt.Sprintf("VACUUM INTO '%s'", snapPath))
+		cancel()
+		if vacErr == nil {
+			data, err = os.ReadFile(snapPath)
+			_ = os.Remove(snapPath)
+		} else {
+			_ = os.Remove(snapPath)
+			_, _ = ephemeralSQLDB.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+			data, err = os.ReadFile(ephemeralSessionPath)
+		}
+	} else {
+		data, err = os.ReadFile(ephemeralSessionPath)
+	}
+
 	if err != nil {
 		return "", err
 	}
 	if len(data) < 4096 || string(data[:15]) != "SQLite format 3" {
-		return "", fmt.Errorf("ephemeral session file is empty or incomplete")
+		return "", fmt.Errorf("ephemeral session file is empty or incomplete (%d bytes)", len(data))
 	}
 
 	var buf bytes.Buffer
@@ -152,21 +209,19 @@ func ExportSessionBlobBase64() (string, error) {
 	return base64.StdEncoding.EncodeToString(buf.Bytes()), nil
 }
 
-// SyncSessionToCentralNow validates that the session is paired and non-empty before uploading to Central Brain Node.
-// Never overwrites a valid Central session if the local session is empty or logged out.
-func SyncSessionToCentralNow(deviceJID, phone, pushName, status string) {
+func syncSessionToCentralWithResult(deviceJID, phone, pushName, status string) error {
 	if sessionLoggedOut.Load() {
 		log.Println("🛡️ [Session Sync Guard] Skipping upload because device is explicitly logged out.")
-		return
+		return fmt.Errorf("session logged out")
 	}
 	if strings.TrimSpace(deviceJID) == "" {
-		return
+		return fmt.Errorf("missing device_jid")
 	}
 	cleanPhone := FormatPhone(phone)
 	blob, err := ExportSessionBlobBase64()
 	if err != nil || strings.TrimSpace(blob) == "" {
 		log.Printf("⚠️ [Session Sync Guard] Skipping upload — session blob invalid/empty: %v", err)
-		return
+		return fmt.Errorf("invalid session blob: %w", err)
 	}
 
 	ramstore.Global.UpdateWhatsAppSession(func(ws *ramstore.WhatsAppSessionState) {
@@ -182,17 +237,51 @@ func SyncSessionToCentralNow(deviceJID, phone, pushName, status string) {
 		ws.SessionBlobBase64 = blob
 	})
 
+	if !central.Client.IsConfigured() {
+		return fmt.Errorf("central brain node not configured yet")
+	}
 	if err := central.Client.SaveWhatsAppSession(deviceJID, cleanPhone, pushName, status, blob); err != nil {
 		log.Printf("⚠️ [Session Sync] Central Brain Node upload failed: %v", err)
+		return err
 	}
+	return nil
 }
 
-// SyncSessionOnFirstLogin uploads the WhatsMeow session snapshot ONCE immediately after first-time QR or 8-digit pairing completes.
+// SyncSessionToCentralNow validates that the session is paired and non-empty before uploading to Central Brain Node.
+// Never overwrites a valid Central session if the local session is empty or logged out.
+func SyncSessionToCentralNow(deviceJID, phone, pushName, status string) {
+	_ = syncSessionToCentralWithResult(deviceJID, phone, pushName, status)
+}
+
+// SyncSessionOnFirstLogin uploads the WhatsMeow session snapshot ONCE after first-time QR or 8-digit pairing completes.
+// Waits briefly for whatsmeow to flush Signal keys to SQLite, retries transient failures, and only marks uploaded on success.
 func SyncSessionOnFirstLogin(deviceJID, phone, pushName, status string) {
-	if !initialPairUploaded.CompareAndSwap(false, true) {
+	if initialPairUploaded.Load() || sessionLoggedOut.Load() {
 		return
 	}
-	SyncSessionToCentralNow(deviceJID, phone, pushName, status)
+	if !initialPairUploading.CompareAndSwap(false, true) {
+		return
+	}
+	defer initialPairUploading.Store(false)
+
+	// Allow whatsmeow to finish flushing Signal identity, prekeys, and device store rows into SQLite
+	time.Sleep(1800 * time.Millisecond)
+
+	backoffs := []time.Duration{0, 3 * time.Second, 6 * time.Second, 12 * time.Second}
+	for idx, wait := range backoffs {
+		if sessionLoggedOut.Load() || initialPairUploaded.Load() {
+			return
+		}
+		if wait > 0 {
+			time.Sleep(wait)
+		}
+		if err := syncSessionToCentralWithResult(deviceJID, phone, pushName, status); err == nil {
+			initialPairUploaded.Store(true)
+			log.Printf("✅ [First-Login Session Backup] Saved WhatsApp session (+%s) to Central Brain Node on attempt %d.", FormatPhone(phone), idx+1)
+			return
+		}
+		log.Printf("⏳ [First-Login Session Backup] Attempt %d/%d deferred; retrying shortly...", idx+1, len(backoffs))
+	}
 }
 
 // GracefulShutdownWhatsApp performs zero-downtime redeploy shutdown on Render / Railway / Koyeb:

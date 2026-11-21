@@ -421,6 +421,15 @@
     .metric {
       padding: 22px 26px;
       border-right: 1px solid var(--border-hairline);
+      transition: background 150ms var(--ease);
+    }
+
+    .metric.clickable {
+      cursor: pointer;
+    }
+
+    .metric.clickable:hover {
+      background: var(--bg-subtle);
     }
 
     .metric:last-child { border-right: none; }
@@ -1160,11 +1169,12 @@
       left: 0;
       right: 0;
       bottom: 0;
-      z-index: 40;
-      background: rgba(255, 255, 255, 0.92);
+      z-index: 100;
+      background: rgba(255, 255, 255, 0.96);
       backdrop-filter: blur(14px);
       -webkit-backdrop-filter: blur(14px);
       border-top: 1px solid var(--border-hairline);
+      box-shadow: 0 -4px 18px rgba(15, 23, 42, 0.06);
       padding: 4px 6px calc(6px + env(safe-area-inset-bottom));
       grid-template-columns: repeat(5, minmax(0, 1fr));
       gap: 2px;
@@ -1528,24 +1538,24 @@
             </div>
           </div>
 
-          <!-- Unified 4-Column Real Metrics -->
+          <!-- Unified 4-Column Real Metrics (Click any metric to inspect Store tab) -->
           <div class="metrics">
-            <div class="metric">
+            <div class="metric clickable" role="button" tabindex="0" onclick="openStoreTab('products')" onkeydown="if(event.key==='Enter') openStoreTab('products')">
               <div class="metric-label">Products</div>
               <div class="metric-val tabular" id="kpi-products">0</div>
               <div class="metric-sub" id="kpi-products-sub">In active memory</div>
             </div>
-            <div class="metric">
+            <div class="metric clickable" role="button" tabindex="0" onclick="openStoreTab('carts')" onkeydown="if(event.key==='Enter') openStoreTab('carts')">
               <div class="metric-label">Active Carts</div>
               <div class="metric-val tabular" id="kpi-carts">0</div>
               <div class="metric-sub">WhatsApp & website</div>
             </div>
-            <div class="metric">
+            <div class="metric clickable" role="button" tabindex="0" onclick="openStoreTab('orders')" onkeydown="if(event.key==='Enter') openStoreTab('orders')">
               <div class="metric-label">Orders</div>
               <div class="metric-val tabular" id="kpi-orders">0</div>
               <div class="metric-sub">Synced from Central</div>
             </div>
-            <div class="metric">
+            <div class="metric clickable" role="button" tabindex="0" onclick="openStoreTab('customers')" onkeydown="if(event.key==='Enter') openStoreTab('customers')">
               <div class="metric-label">Customers</div>
               <div class="metric-val tabular" id="kpi-customers">0</div>
               <div class="metric-sub">Hydrated profiles</div>
@@ -1884,10 +1894,10 @@
           <div class="card">
             <div class="table-bar">
               <div class="segmented" role="tablist">
-                <button class="seg-btn active" data-tab="products" onclick="switchStoreTab('products')">Products</button>
-                <button class="seg-btn" data-tab="orders" onclick="switchStoreTab('orders')">Orders</button>
-                <button class="seg-btn" data-tab="carts" onclick="switchStoreTab('carts')">Carts</button>
-                <button class="seg-btn" data-tab="customers" onclick="switchStoreTab('customers')">Customers</button>
+                <button class="seg-btn active" data-tab="products" id="seg-products" onclick="switchStoreTab('products')">Products</button>
+                <button class="seg-btn" data-tab="orders" id="seg-orders" onclick="switchStoreTab('orders')">Orders</button>
+                <button class="seg-btn" data-tab="carts" id="seg-carts" onclick="switchStoreTab('carts')">Carts</button>
+                <button class="seg-btn" data-tab="customers" id="seg-customers" onclick="switchStoreTab('customers')">Customers</button>
               </div>
 
               <div class="table-tools">
@@ -1961,7 +1971,7 @@
         <section id="view-chats" class="view">
           <div class="page-intro">
             <h2>Live Chats</h2>
-            <p>Real-time WhatsApp customer threads and direct store owner replies.</p>
+            <p>Real-time WhatsApp customer threads held strictly in RAM — maximum last 10 messages per customer.</p>
           </div>
 
           <div class="inbox-grid" id="inbox-grid">
@@ -1970,7 +1980,12 @@
               <div class="inbox-head">
                 <input class="input search-box" style="width:100%;" id="chat-search" placeholder="Search conversations..." oninput="renderConversationList()" />
               </div>
-              <div class="conv-list" id="conv-list"></div>
+              <div class="conv-list" id="conv-list">
+                <div class="empty-box" style="padding:48px 20px;">
+                  <div class="empty-title">No conversations yet</div>
+                  <div class="empty-desc">Real WhatsApp messages from your customers will appear here (last 10 messages per customer in RAM).</div>
+                </div>
+              </div>
             </div>
 
             <!-- Right Active Thread -->
@@ -1982,7 +1997,7 @@
                   </button>
                   <div style="min-width:0;">
                     <div class="card-title" id="active-chat-name" style="overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">Select a conversation</div>
-                    <div class="card-sub mono" id="active-chat-phone" style="font-size:12px;"></div>
+                    <div class="card-sub mono" id="active-chat-phone" style="font-size:12px;">Last 10 messages / customer (RAM only)</div>
                   </div>
                 </div>
                 <button class="btn btn-sm" onclick="refreshChats()">Refresh</button>
@@ -2221,12 +2236,20 @@ VENDOR_API_KEY=</pre>
       document.querySelectorAll('.nav-btn, .mnav-btn').forEach((b) => b.classList.remove('active'));
       document.getElementById('view-' + name)?.classList.add('active');
       document.querySelectorAll(`.nav-btn[data-view="${name}"], .mnav-btn[data-view="${name}"]`).forEach((b) => b.classList.add('active'));
-      document.getElementById('topbar-title').textContent = VIEW_TITLES[name] || 'Overview';
-      window.scrollTo({ top: 0, behavior: 'instant' });
+      const titleEl = document.getElementById('topbar-title');
+      if (titleEl) titleEl.textContent = VIEW_TITLES[name] || 'Overview';
+      try {
+        window.scrollTo(0, 0);
+      } catch {}
 
       if (name === 'whatsapp') refreshWAStatus();
       if (name === 'store') refreshStoreTables();
       if (name === 'chats') refreshChats();
+    }
+
+    function openStoreTab(tab) {
+      switchView('store');
+      switchStoreTab(tab);
     }
 
     function switchStoreTab(tab) {
@@ -2234,7 +2257,8 @@ VENDOR_API_KEY=</pre>
       document.querySelectorAll('.seg-btn').forEach((b) => b.classList.remove('active'));
       document.querySelector(`.seg-btn[data-tab="${tab}"]`)?.classList.add('active');
       ['products', 'orders', 'carts', 'customers'].forEach((k) => {
-        document.getElementById('tab-' + k).style.display = k === tab ? 'block' : 'none';
+        const el = document.getElementById('tab-' + k);
+        if (el) el.style.display = k === tab ? 'block' : 'none';
       });
       renderActiveStoreTab();
     }
@@ -2278,30 +2302,39 @@ VENDOR_API_KEY=</pre>
 
         // Sidebar indicators
         const waConnected = wa.status === 'Connected';
-        document.getElementById('foot-wa').textContent = waConnected ? `+${wa.phone}` : 'Not linked';
-        document.getElementById('foot-wa').className = 'summary-val ' + (waConnected ? 'text-ok' : '');
-        document.getElementById('nav-wa-state').textContent = waConnected ? 'Live' : '—';
+        const waConnecting = wa.status === 'Connecting' || (wa.has_session && !waConnected);
+        document.getElementById('foot-wa').textContent = waConnected ? `+${wa.phone}` : waConnecting ? 'Restoring...' : 'Not linked';
+        document.getElementById('foot-wa').className = 'summary-val ' + (waConnected ? 'text-ok' : waConnecting ? 'text-warn' : '');
+        document.getElementById('nav-wa-state').textContent = waConnected ? 'Live' : waConnecting ? 'Sync' : '—';
 
-        document.getElementById('foot-central').textContent = sync.connected ? 'Connected' : sync.configured ? 'Retrying' : 'Not connected';
-        document.getElementById('foot-central').className = 'summary-val ' + (sync.connected ? 'text-ok' : '');
+        document.getElementById('foot-central').textContent = sync.connected ? 'Connected' : sync.configured ? 'Auto-retrying' : 'Not connected';
+        document.getElementById('foot-central').className = 'summary-val ' + (sync.connected ? 'text-ok' : sync.configured ? 'text-warn' : '');
         document.getElementById('nav-store-count').textContent = String((st.products || 0) + (st.orders || 0));
         document.getElementById('nav-chat-count').textContent = String(st.conversations || 0);
 
         // 2-Step Rail
-        document.getElementById('rail-central-title').textContent = sync.connected ? 'Connected' : sync.configured ? 'Reconnecting' : 'Not connected';
-        document.getElementById('rail-central-title').className = 'step-title ' + (sync.connected ? 'text-ok' : '');
+        document.getElementById('rail-central-title').textContent = sync.connected ? 'Connected' : sync.configured ? 'Auto-hydrating...' : 'Not connected';
+        document.getElementById('rail-central-title').className = 'step-title ' + (sync.connected ? 'text-ok' : sync.configured ? 'text-warn' : '');
         document.getElementById('rail-central-desc').textContent = sync.connected
           ? `Last synced ${sync.last_sync_at ? new Date(sync.last_sync_at).toLocaleTimeString() : 'just now'}`
-          : 'Enter your Central Node URL and Vendor API Key below.';
+          : sync.configured
+            ? 'Waiting for Central Node to respond — auto-hydrating store data & WhatsApp session...'
+            : 'Enter your Central Node URL and Vendor API Key below.';
 
-        document.getElementById('rail-wa-title').textContent = waConnected ? `Connected (+${wa.phone})` : 'Not linked';
-        document.getElementById('rail-wa-title').className = 'step-title ' + (waConnected ? 'text-ok' : '');
+        document.getElementById('rail-wa-title').textContent = waConnected
+          ? `Connected (+${wa.phone})`
+          : waConnecting
+            ? `Restoring session${wa.phone ? ` (+${wa.phone})` : ''}...`
+            : 'Not linked';
+        document.getElementById('rail-wa-title').className = 'step-title ' + (waConnected ? 'text-ok' : waConnecting ? 'text-warn' : '');
         document.getElementById('rail-wa-desc').textContent = waConnected
           ? 'Session backed up automatically in Central Brain.'
-          : 'Sign in with QR scan or an 8-digit phone code on this dashboard.';
+          : waConnecting
+            ? 'Re-establishing saved WhatsApp session from Central Brain automatically.'
+            : 'Sign in with QR scan or an 8-digit phone code on this dashboard.';
         const railBtn = document.getElementById('rail-wa-btn');
-        railBtn.textContent = waConnected ? 'Manage' : 'Link WhatsApp';
-        railBtn.className = waConnected ? 'btn btn-sm' : 'btn btn-sm btn-emerald';
+        railBtn.textContent = waConnected || waConnecting ? 'Manage' : 'Link WhatsApp';
+        railBtn.className = waConnected || waConnecting ? 'btn btn-sm' : 'btn btn-sm btn-emerald';
 
         // Real KPIs
         document.getElementById('kpi-products').textContent = st.products ?? 0;
@@ -2486,38 +2519,50 @@ VENDOR_API_KEY=</pre>
 
     // WhatsApp Login (Strict real state — zero fake QR or fake pair codes)
     async function refreshWAStatus() {
-      const res = await fetch('/api/whatsapp/status');
-      const data = await res.json();
+      try {
+        const res = await fetch('/api/whatsapp/status');
+        const data = await res.json();
 
-      const label = document.getElementById('wa-status-label');
-      if (data.connected) {
-        label.textContent = 'Connected';
-        label.className = 'text-ok';
-      } else if (data.qr_data_url) {
-        label.textContent = 'Ready to scan';
-        label.className = 'text-warn';
-      } else {
-        label.textContent = 'Not linked';
-        label.className = 'text-warn';
-      }
+        const label = document.getElementById('wa-status-label');
+        if (data.connected) {
+          label.textContent = 'Connected';
+          label.className = 'text-ok';
+        } else if (data.status === 'Connecting' || data.has_session) {
+          label.textContent = 'Restoring session...';
+          label.className = 'text-warn';
+        } else if (data.qr_data_url) {
+          label.textContent = 'Ready to scan';
+          label.className = 'text-warn';
+        } else {
+          label.textContent = 'Not linked';
+          label.className = 'text-warn';
+        }
 
-      const hasSession = document.getElementById('wa-meta-has-session');
-      hasSession.textContent = data.has_session ? 'Saved in Central Brain' : 'None';
-      hasSession.className = 'kv-val ' + (data.has_session ? 'text-ok' : '');
+        const hasSession = document.getElementById('wa-meta-has-session');
+        hasSession.textContent = data.has_session ? 'Saved in Central Brain' : 'None';
+        hasSession.className = 'kv-val ' + (data.has_session ? 'text-ok' : '');
 
-      document.getElementById('wa-meta-phone').textContent = data.phone ? '+' + data.phone : '—';
-      document.getElementById('wa-meta-jid').textContent = data.device_jid || '—';
+        document.getElementById('wa-meta-phone').textContent = data.phone ? '+' + data.phone : '—';
+        document.getElementById('wa-meta-jid').textContent = data.device_jid || '—';
 
-      const box = document.getElementById('wa-qr-container');
-      if (data.connected) {
-        box.innerHTML = `<div style="text-align:center;"><div class="text-ok" style="font-size:15px;">Connected</div><div class="mono" style="font-size:13px; color:var(--ink-secondary); margin-top:6px;">+${esc(data.phone)}</div></div>`;
-      } else if (data.qr_data_url) {
-        box.innerHTML = `<img src="${data.qr_data_url}" alt="Live WhatsApp QR code" />`;
-      } else {
-        box.innerHTML = `<div class="qr-placeholder">
-          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><path d="M14 14h3v3h-3z"/><path d="M20 14v3h-3"/><path d="M14 20h6"/></svg>
-          <span>${data.whatsmeow_active === false ? 'Live QR available when Go WhatsMeow binary is deployed' : 'No active QR code yet. Click Refresh Status.'}</span>
-        </div>`;
+        const box = document.getElementById('wa-qr-container');
+        if (data.connected) {
+          box.innerHTML = `<div style="text-align:center;"><div class="text-ok" style="font-size:15px;">Connected</div><div class="mono" style="font-size:13px; color:var(--ink-secondary); margin-top:6px;">+${esc(data.phone)}</div></div>`;
+        } else if (data.status === 'Connecting' || data.has_session) {
+          box.innerHTML = `<div class="qr-placeholder">
+            <div class="text-warn" style="font-size:14px;">Restoring Saved Session...</div>
+            <span>${data.phone ? '+' + esc(data.phone) + ' · ' : ''}Reconnecting automatically via WhatsMeow.</span>
+          </div>`;
+        } else if (data.qr_data_url) {
+          box.innerHTML = `<img src="${data.qr_data_url}" alt="Live WhatsApp QR code" />`;
+        } else {
+          box.innerHTML = `<div class="qr-placeholder">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><path d="M14 14h3v3h-3z"/><path d="M20 14v3h-3"/><path d="M14 20h6"/></svg>
+            <span>${data.whatsmeow_active === false ? 'Live QR available when Go WhatsMeow binary is deployed' : 'No active QR code yet. Click Refresh Status.'}</span>
+          </div>`;
+        }
+      } catch (e) {
+        console.error('refreshWAStatus failed:', e);
       }
     }
 
@@ -2551,23 +2596,38 @@ VENDOR_API_KEY=</pre>
 
     // Store Data Tables (Real Synced Data Only)
     async function refreshStoreTables() {
-      const [pRes, oRes, cRes, custRes] = await Promise.all([
-        fetch('/api/ram/products'),
-        fetch('/api/ram/orders'),
-        fetch('/api/ram/carts'),
-        fetch('/api/ram/customers'),
-      ]);
-      const pData = await pRes.json();
-      const oData = await oRes.json();
-      const cData = await cRes.json();
-      const custData = await custRes.json();
+      try {
+        const [pRes, oRes, cRes, custRes] = await Promise.all([
+          fetch('/api/ram/products'),
+          fetch('/api/ram/orders'),
+          fetch('/api/ram/carts'),
+          fetch('/api/ram/customers'),
+        ]);
+        const [pData, oData, cData, custData] = await Promise.all([
+          pRes.json().catch(() => ({})),
+          oRes.json().catch(() => ({})),
+          cRes.json().catch(() => ({})),
+          custRes.json().catch(() => ({})),
+        ]);
 
-      storeCache = {
-        products: pData.products || [],
-        orders: oData.orders || [],
-        carts: cData.carts || {},
-        customers: custData.customers || [],
-      };
+        storeCache = {
+          products: Array.isArray(pData?.products) ? pData.products : [],
+          orders: Array.isArray(oData?.orders) ? oData.orders : [],
+          carts: cData?.carts && typeof cData.carts === 'object' && !Array.isArray(cData.carts) ? cData.carts : {},
+          customers: Array.isArray(custData?.customers) ? custData.customers : [],
+        };
+
+        const setTabLabel = (id, label, count) => {
+          const el = document.getElementById(id);
+          if (el) el.textContent = count > 0 ? `${label} (${count})` : label;
+        };
+        setTabLabel('seg-products', 'Products', storeCache.products.length);
+        setTabLabel('seg-orders', 'Orders', storeCache.orders.length);
+        setTabLabel('seg-carts', 'Carts', Object.keys(storeCache.carts).length);
+        setTabLabel('seg-customers', 'Customers', storeCache.customers.length);
+      } catch (e) {
+        console.error('refreshStoreTables failed:', e);
+      }
       renderActiveStoreTab();
     }
 
@@ -2796,7 +2856,7 @@ VENDOR_API_KEY=</pre>
           (c) => `<button class="conv-item ${c.customer_phone === selectedChatPhone ? 'active' : ''}" onclick="loadThread('${esc(c.customer_phone)}')">
             <div class="conv-top">
               <span class="conv-name">${esc(c.customer_name || '+' + c.customer_phone)}</span>
-              <span class="conv-time">${esc(c.last_time || '')}</span>
+              <span class="conv-time">${esc(c.last_time || '')}${c.total_count ? ` · ${Math.min(Number(c.total_count), 10)}/10` : ''}</span>
             </div>
             <div class="conv-preview">${esc(c.last_message || '')}</div>
           </button>`
@@ -2934,6 +2994,7 @@ VENDOR_API_KEY=</pre>
           if (msg.type === 'ram_synced' || msg.type === 'session_unlinked') {
             fetchOverview();
             refreshStoreTables();
+            refreshChats();
             refreshWAStatus();
             return;
           }
@@ -2952,6 +3013,7 @@ VENDOR_API_KEY=</pre>
 
     fetchOverview();
     refreshStoreTables();
+    refreshChats();
     refreshWAStatus();
     initSSE();
     setInterval(fetchOverview, 12000);

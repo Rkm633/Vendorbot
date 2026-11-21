@@ -49,10 +49,15 @@ func StatusHandler(w http.ResponseWriter, r *http.Request) {
 			status = "Connecting"
 			go whatsapp.ConnectWithAutoRetry(client, vendor.Username)
 		}
-	} else if waSession.HasSession && waSession.Phone != "" {
+	} else if waSession.HasSession && (waSession.Phone != "" || waSession.SessionBlobBase64 != "") {
 		status = "Connecting"
 		jid = waSession.DeviceJID
 		phone = waSession.Phone
+		if waSession.SessionBlobBase64 != "" {
+			go func(ws ramstore.WhatsAppSessionState) {
+				_ = whatsapp.EnsureSessionRestoredFromRAM(ws)
+			}(waSession)
+		}
 	}
 
 	qrCode := ""

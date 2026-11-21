@@ -974,25 +974,25 @@ func DecodeWhatsAppSession(raw json.RawMessage) (*WhatsAppSessionState, error) {
 		return nil, fmt.Errorf("whatsapp_session section is not a JSON object: %w", err)
 	}
 	ws := &WhatsAppSessionState{}
-	if r, ok := firstRaw(m, "has_session"); ok {
+	if r, ok := firstRaw(m, "has_session", "connected", "is_linked"); ok {
 		ws.HasSession = ParseFlexBool(r, false)
 	}
-	if r, ok := firstRaw(m, "device_jid", "jid"); ok {
+	if r, ok := firstRaw(m, "device_jid", "jid", "wa_jid"); ok {
 		ws.DeviceJID = ParseFlexString(r)
 	}
-	if r, ok := firstRaw(m, "phone"); ok {
+	if r, ok := firstRaw(m, "phone", "wa_number", "number"); ok {
 		ws.Phone = ParseFlexString(r)
 	}
-	if r, ok := firstRaw(m, "push_name"); ok {
+	if r, ok := firstRaw(m, "push_name", "name"); ok {
 		ws.PushName = ParseFlexString(r)
 	}
-	if r, ok := firstRaw(m, "status"); ok {
+	if r, ok := firstRaw(m, "status", "state"); ok {
 		ws.Status = ParseFlexString(r)
 	}
-	if r, ok := firstRaw(m, "session_blob_base64", "session_blob"); ok {
-		ws.SessionBlobBase64 = ParseFlexString(r)
+	if r, ok := firstRaw(m, "session_blob_base64", "session_blob", "session_data", "whatsapp_session_blob", "blob", "data_base64"); ok {
+		ws.SessionBlobBase64 = strings.TrimSpace(ParseFlexString(r))
 	}
-	if !ws.HasSession && ws.SessionBlobBase64 != "" {
+	if ws.SessionBlobBase64 != "" {
 		ws.HasSession = true
 	}
 	ws.NeedsLogin = !ws.HasSession

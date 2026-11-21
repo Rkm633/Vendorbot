@@ -1553,7 +1553,9 @@ func (s *Store) ListOrders() []Order {
 	return out
 }
 
-// --- Chats (Sliding Window max 10 per customer) ---
+// --- Chats (Sliding Window strictly max 10 per customer in RAM, zero Central sync) ---
+
+const MaxChatsPerCustomer = 10
 
 func (s *Store) AppendChat(phone, role, direction, text string) ChatRecord {
 	cleanPhone := NormalizePhone(phone)
@@ -1564,8 +1566,18 @@ func (s *Store) AppendChat(phone, role, direction, text string) ChatRecord {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.chatSeq++
+
+	existing := s.chats[cleanPhone]
 	now := time.Now()
+	// Prevent back-to-back duplicate saves (e.g., immediate save + post-AI sync) from consuming 2 of the 10 RAM slots
+	if n := len(existing); n > 0 {
+		last := existing[n-1]
+		if last.Role == role && last.Text == cleanText && now.Sub(last.CreatedAt) < 10*time.Second {
+			return last
+		}
+	}
+
+	s.chatSeq++
 	rec := ChatRecord{
 		ID:            s.chatSeq,
 		CustomerPhone: cleanPhone,
@@ -1575,9 +1587,12 @@ func (s *Store) AppendChat(phone, role, direction, text string) ChatRecord {
 		Time:          now.Format("15:04"),
 		CreatedAt:     now,
 	}
-	list := append(s.chats[cleanPhone], rec)
-	if len(list) > 10 {
-		list = list[len(list)-10:]
+	list := append(existing, rec)
+	if len(list) > MaxChatsPerCustomer {
+		// Copy into a fresh 10-element slice so dropped older messages are immediately garbage-collected
+		trimmed := make([]ChatRecord, MaxChatsPerCustomer)
+		copy(trimmed, list[len(list)-MaxChatsPerCustomer:])
+		list = trimmed
 	}
 	s.chats[cleanPhone] = list
 	return rec

@@ -840,10 +840,20 @@ function pushLiveEvent(phone: string, text: string, type: string): void {
   }
 }
 
+const MAX_CHATS_PER_CUSTOMER = 10;
+
 function appendChatRAM(phone: string, role: 'customer' | 'assistant', direction: string, text: string): ChatRecord | null {
   const cleanPhone = normalizePhone(phone);
   const cleanText = String(text || '').trim();
   if (!cleanPhone || !cleanText) return null;
+
+  const list = ramStore.chats.get(cleanPhone) || [];
+  if (list.length > 0) {
+    const last = list[list.length - 1];
+    if (last.role === role && last.text === cleanText && Date.now() - Date.parse(last.created_at) < 10000) {
+      return last;
+    }
+  }
 
   ramStore.chatSeq += 1;
   const rec: ChatRecord = {
@@ -855,10 +865,9 @@ function appendChatRAM(phone: string, role: 'customer' | 'assistant', direction:
     time: nowTimeHM(),
     created_at: new Date().toISOString(),
   };
-  const list = ramStore.chats.get(cleanPhone) || [];
   list.push(rec);
   // Keep strictly the last 10 messages per customer in RAM (zero Central Node chat sync)
-  if (list.length > 10) list.splice(0, list.length - 10);
+  if (list.length > MAX_CHATS_PER_CUSTOMER) list.splice(0, list.length - MAX_CHATS_PER_CUSTOMER);
   ramStore.chats.set(cleanPhone, list);
   return rec;
 }
@@ -1314,16 +1323,18 @@ function hydrateRAM(payload: any): { warnings: string[] } {
   if (wsRaw !== undefined) {
     try {
       if (!isPlainObject(wsRaw)) throw new Error('whatsapp_session section is not a JSON object');
-      const blob = parseFlexString(firstDefined(wsRaw, 'session_blob_base64', 'session_blob'));
-      const hasSession = parseFlexBool(wsRaw.has_session, Boolean(blob));
-      const statusRaw = parseFlexString(wsRaw.status) as WhatsAppSessionState['status'];
+      const blob = parseFlexString(
+        firstDefined(wsRaw, 'session_blob_base64', 'session_blob', 'session_data', 'whatsapp_session_blob', 'blob', 'data_base64')
+      ).trim();
+      const hasSession = parseFlexBool(firstDefined(wsRaw, 'has_session', 'connected', 'is_linked'), Boolean(blob)) || Boolean(blob);
+      const statusRaw = parseFlexString(firstDefined(wsRaw, 'status', 'state')) as WhatsAppSessionState['status'];
       ramStore.whatsapp = {
         has_session: hasSession,
         needs_login: !hasSession,
         status: hasSession ? statusRaw || 'Connected' : 'Needs_Login',
-        device_jid: parseFlexString(firstDefined(wsRaw, 'device_jid', 'jid')),
-        phone: normalizePhone(parseFlexString(wsRaw.phone)),
-        push_name: parseFlexString(wsRaw.push_name),
+        device_jid: parseFlexString(firstDefined(wsRaw, 'device_jid', 'jid', 'wa_jid')),
+        phone: normalizePhone(parseFlexString(firstDefined(wsRaw, 'phone', 'wa_number', 'number'))),
+        push_name: parseFlexString(firstDefined(wsRaw, 'push_name', 'name')),
         qr_code: '',
         last_synced_at: parseFlexibleTimestamp(firstDefined(wsRaw, 'last_synced_at', 'updated_at')) || new Date().toISOString(),
       };
@@ -1371,7 +1382,7 @@ async function callCentralNode(method: string, endpoint: string, body?: unknown)
       'User-Agent': 'VendorWhatsAppBotNode/2.2',
     },
     body: body !== undefined ? JSON.stringify(body) : undefined,
-    signal: AbortSignal.timeout(15000),
+    signal: AbortSignal.timeout(35000),
   });
   const text = await res.text();
   if (!res.ok) {
@@ -2576,11 +2587,44 @@ app.use((req: Request, res: Response) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
+let startupRetryActive = false;
+function startStartupBootstrapRetry(): void {
+  if (startupRetryActive || ramStore.sync.bootstrapped || !centralNodeURL || !vendorApiKey) return;
+  startupRetryActive = true;
+  const delays = [5000, 10000, 15000, 20000, 30000, 45000, 60000];
+  let attempt = 0;
+  const scheduleNext = () => {
+    if (ramStore.sync.bootstrapped || !centralNodeURL || !vendorApiKey) {
+      startupRetryActive = false;
+      return;
+    }
+    const waitMs = delays[Math.min(attempt, delays.length - 1)];
+    attempt += 1;
+    setTimeout(async () => {
+      if (ramStore.sync.bootstrapped) {
+        startupRetryActive = false;
+        return;
+      }
+      const res = await bootstrapFromCentral();
+      if (res.ok || ramStore.sync.bootstrapped) {
+        startupRetryActive = false;
+        return;
+      }
+      scheduleNext();
+    }, waitMs);
+  };
+  scheduleNext();
+}
+
 // Boot Server + One-Time Startup Bootstrap (Zero Periodic Polling, Zero Recurring Heartbeat)
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Stateless Vendor WhatsApp Bot Node v2.3 running on http://0.0.0.0:${PORT}`);
   console.log(`🧠 Storage: 100% RAM-First | Chats: RAM-Only (Max 10) | Sync: Event-Driven (Zero Polling)`);
-  void bootstrapFromCentral();
+  void bootstrapFromCentral().then((res) => {
+    if (!res.ok && centralNodeURL && vendorApiKey) {
+      startStartupBootstrapRetry();
+    }
+  });
 });
 
 // Zero-Downtime Redeploy Graceful Shutdown

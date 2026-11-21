@@ -79,6 +79,22 @@ func main() {
 		log.Printf("⚠️ [WhatsApp Engine Boot Error] %v", err)
 	}
 
+	// 3b. If Central Node was cold-starting/unreachable at boot, keep retrying startup bootstrap ONLY until first hydration succeeds,
+	// then automatically restore WhatsApp session (if not already paired locally) and stop permanently (zero polling).
+	if err != nil && central.Client.IsConfigured() {
+		central.Client.StartStartupBootstrapRetry(func(waSession *central.BootstrapWhatsAppSession) {
+			if waSession != nil && waSession.HasSession {
+				client := whatsapp.GetVendorClient()
+				if client == nil || client.Store == nil || client.Store.ID == nil {
+					if bootErr := whatsapp.BootstrapWhatsAppEngine(waSession); bootErr != nil {
+						log.Printf("⚠️ [Delayed WhatsApp Restore Error] %v", bootErr)
+					}
+				}
+			}
+			whatsapp.PushToLiveChat(ramstore.Global.GetVendor().Username, "", "bootstrap", "ram_synced")
+		})
+	}
+
 	// 4. Start local WhatsApp WebSocket keep-alive monitor (zero Central Node polling/heartbeat)
 	whatsapp.StartKeepAliveMonitor()
 

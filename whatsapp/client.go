@@ -128,15 +128,67 @@ func GetRealPhoneFromLID(lid string) string {
 	return ""
 }
 
+var (
+	restoreGuardMu sync.Mutex
+	lastRestoreTry time.Time
+)
+
+// EnsureSessionRestoredFromRAM self-heals a delayed session restore if RAM holds a saved Central Node session
+// while the local whatsmeow client is still unpaired.
+func EnsureSessionRestoredFromRAM(ws ramstore.WhatsAppSessionState) error {
+	if !ws.HasSession || strings.TrimSpace(ws.SessionBlobBase64) == "" {
+		return nil
+	}
+	restoreGuardMu.Lock()
+	if time.Since(lastRestoreTry) < 8*time.Second {
+		restoreGuardMu.Unlock()
+		return nil
+	}
+	lastRestoreTry = time.Now()
+	restoreGuardMu.Unlock()
+
+	client := GetVendorClient()
+	if client != nil && client.Store != nil && client.Store.ID != nil {
+		return nil
+	}
+	return BootstrapWhatsAppEngine(&central.BootstrapWhatsAppSession{
+		HasSession:        ws.HasSession,
+		Status:            ws.Status,
+		DeviceJID:         ws.DeviceJID,
+		Phone:             ws.Phone,
+		PushName:          ws.PushName,
+		SessionBlobBase64: ws.SessionBlobBase64,
+	})
+}
+
 // BootstrapWhatsAppEngine initializes the ephemeral session container from Central Node's response.
-// If Central Node returned a saved session, auto-connects immediately.
+// If Central Node returned a saved session, resets any stale unpaired client singleton, restores SQLite, and auto-connects immediately.
 // Otherwise marks WhatsApp as Needs_Login so the vendor can scan QR or enter 8-digit pairing code from dashboard.
 func BootstrapWhatsAppEngine(centralSession *central.BootstrapWhatsAppSession) error {
+	hasCentralBlob := centralSession != nil && centralSession.HasSession && strings.TrimSpace(centralSession.SessionBlobBase64) != ""
+
+	// Protect an already-paired live WhatsApp client if Central returned no session (e.g. cold-start failure)
+	ClientsLock.Lock()
+	existingClient := vendorClient
+	existingPaired := existingClient != nil && existingClient.Store != nil && existingClient.Store.ID != nil
+	if !hasCentralBlob && existingPaired {
+		ClientsLock.Unlock()
+		log.Printf("📱 [WhatsApp Boot] Keeping active local paired session for +%s.", existingClient.Store.ID.User)
+		return nil
+	}
+	// Reset any stale/unpaired vendorClient BEFORE replacing StoreContainer so GetVendorClient() binds to the newly restored SQLite DB!
+	if existingClient != nil {
+		existingClient.Disconnect()
+		vendorClient = nil
+	}
+	currentQRCode = ""
+	ClientsLock.Unlock()
+
 	if err := InitEphemeralSessionStore(centralSession); err != nil {
 		return err
 	}
 
-	if centralSession != nil && centralSession.HasSession {
+	if hasCentralBlob {
 		client := GetVendorClient()
 		if client != nil && client.Store != nil && client.Store.ID != nil {
 			log.Printf("📱 [WhatsApp Boot] Restored paired session for +%s. Auto-connecting...", client.Store.ID.User)
@@ -146,10 +198,15 @@ func BootstrapWhatsAppEngine(centralSession *central.BootstrapWhatsAppSession) e
 				ws.Status = "Connecting"
 				ws.DeviceJID = client.Store.ID.String()
 				ws.Phone = FormatPhone(client.Store.ID.User)
+				if client.Store.PushName != "" {
+					ws.PushName = client.Store.PushName
+				}
+				ws.QRCode = ""
 			})
 			ConnectWithAutoRetry(client, ramstore.Global.GetVendor().Username)
 			return nil
 		}
+		log.Println("⚠️ [WhatsApp Boot] Session blob restored to SQLite but no paired device row found inside DB; entering Needs_Login.")
 	}
 
 	// No valid saved session -> inform dashboard that WhatsApp login is required
@@ -474,11 +531,14 @@ func SaveCustomerChatAndPrune(username, customerPhone, role, messageText string)
 		return
 	}
 
-	normalRole := strings.ToLower(role)
+	normalRole := strings.ToLower(strings.TrimSpace(role))
 	direction := "incoming"
 	if normalRole == "user" || normalRole == "client" || normalRole == "customer" || normalRole == "incoming" {
 		normalRole = "customer"
 		direction = "incoming"
+	} else if normalRole == "outgoing_manual" || normalRole == "manual" {
+		normalRole = "assistant"
+		direction = "outgoing_manual"
 	} else {
 		normalRole = "assistant"
 		direction = "outgoing_ai"
@@ -698,6 +758,18 @@ func handleWhatsAppEvents(username string, client *whatsmeow.Client, evt interfa
 		if client != nil {
 			_ = client.SendPresence(context.Background(), types.PresenceAvailable)
 			if client.Store != nil && client.Store.ID != nil {
+				ramstore.Global.UpdateWhatsAppSession(func(ws *ramstore.WhatsAppSessionState) {
+					ws.HasSession = true
+					ws.NeedsLogin = false
+					ws.Status = "Connected"
+					ws.DeviceJID = client.Store.ID.String()
+					ws.Phone = FormatPhone(client.Store.ID.User)
+					if client.Store.PushName != "" {
+						ws.PushName = client.Store.PushName
+					}
+					ws.QRCode = ""
+				})
+				PushToLiveChat(username, "", "whatsapp_paired", "ram_synced")
 				go SyncSessionOnFirstLogin(client.Store.ID.String(), client.Store.ID.User, client.Store.PushName, "Connected")
 			}
 		}
@@ -705,6 +777,24 @@ func handleWhatsAppEvents(username string, client *whatsmeow.Client, evt interfa
 	case *events.Connected:
 		if client != nil {
 			_ = client.SendPresence(context.Background(), types.PresenceAvailable)
+			if client.Store != nil && client.Store.ID != nil {
+				ramstore.Global.UpdateWhatsAppSession(func(ws *ramstore.WhatsAppSessionState) {
+					ws.HasSession = true
+					ws.NeedsLogin = false
+					ws.Status = "Connected"
+					ws.DeviceJID = client.Store.ID.String()
+					ws.Phone = FormatPhone(client.Store.ID.User)
+					if client.Store.PushName != "" {
+						ws.PushName = client.Store.PushName
+					}
+					ws.QRCode = ""
+				})
+				PushToLiveChat(username, "", "whatsapp_connected", "ram_synced")
+				// Ensure first-time pairing (QR or 8-digit phone code) is definitely uploaded once Signal keys are ready
+				if !initialPairUploaded.Load() {
+					go SyncSessionOnFirstLogin(client.Store.ID.String(), client.Store.ID.User, client.Store.PushName, "Connected")
+				}
+			}
 		}
 
 	case *events.HistorySync:
@@ -807,20 +897,21 @@ func handleWhatsAppEvents(username string, client *whatsmeow.Client, evt interfa
 // enqueueDebouncedCustomerMessage buffers rapid consecutive customer messages for 2.5 seconds
 // and combines them into a single coherent AI turn for anti-ban safety & natural replies.
 func enqueueDebouncedCustomerMessage(username string, client *whatsmeow.Client, msgID types.MessageID, chatJID, senderJID types.JID, rawMsg *waE2E.Message, phone, text string) {
+	// Persist incoming customer message immediately into RAM (last 10 msgs/customer) BEFORE SSE push
+	// so Live Chats always displays it right away even if AI is paused or errors.
+	SaveCustomerChatAndPrune(username, phone, "customer", text)
 	PushToLiveChat(username, phone, text, "incoming")
 	go ExtractAndPersistCustomerDetails(username, phone, text)
 
 	// Central Admin Feature Gating & Subscription Validity Check
 	if allowed, reason := ramstore.Global.CanAutoReply(); !allowed {
 		log.Printf("⏸️ [Auto-Reply Paused] +%s — %s", phone, reason)
-		go SaveCustomerChatAndPrune(username, phone, "customer", text)
 		return
 	}
 
 	// Store Open / Holiday Mode Check
 	vendor := ramstore.Global.GetVendor()
 	if isOpen, closedMsg := vendor.IsStoreOpenNow(); !isOpen {
-		go SaveCustomerChatAndPrune(username, phone, "customer", text)
 		closedNoticeMu.Lock()
 		lastSent, exists := closedNoticeSent[phone]
 		shouldSend := !exists || time.Since(lastSent) > 20*time.Minute
@@ -841,8 +932,8 @@ func enqueueDebouncedCustomerMessage(username string, client *whatsmeow.Client, 
 			reply := sb.String()
 			go func() {
 				_ = SendMessage(client, phone, reply)
-				PushToLiveChat(username, phone, reply, "outgoing_ai")
 				SaveCustomerChatAndPrune(username, phone, "assistant", reply)
+				PushToLiveChat(username, phone, reply, "outgoing_ai")
 			}()
 		}
 		return
@@ -935,8 +1026,8 @@ func processCombinedCustomerTurn(username string, client *whatsmeow.Client, msgI
 		if errSend := SendReplyMessage(client, phone, octResp.AIReplyText, msgID, senderJID, rawMsg); errSend != nil {
 			_ = SendMessage(client, phone, octResp.AIReplyText)
 		}
+		SaveCustomerChatAndPrune(username, phone, "assistant", octResp.AIReplyText)
 		PushToLiveChat(username, phone, octResp.AIReplyText, "outgoing_ai")
-		AsyncCentralSync(username, phone, combinedText, octResp.AIReplyText)
 	}
 }
 

@@ -70,15 +70,16 @@ type SyncClient struct {
 	queue        chan outboundJob
 	retryMu      sync.Mutex
 	retryBuffer  []outboundJob
-	workerOnce   sync.Once
-	inFlightWG   sync.WaitGroup
+	workerOnce       sync.Once
+	startupRetryOnce sync.Once
+	inFlightWG       sync.WaitGroup
 }
 
 const maxRetryBufferSize = 256
 
 // Client is the singleton Central Brain Node sync client.
 var Client = &SyncClient{
-	httpClient: &http.Client{Timeout: 20 * time.Second},
+	httpClient: &http.Client{Timeout: 35 * time.Second},
 	queue:      make(chan outboundJob, 512),
 }
 
@@ -529,6 +530,55 @@ func (c *SyncClient) Bootstrap() (*BootstrapWhatsAppSession, error) {
 		waSession != nil && waSession.HasSession, len(warnings))
 
 	return waSession, nil
+}
+
+// StartStartupBootstrapRetry runs a strictly startup-only background retry loop when initial boot hydration fails
+// (for example, when Central Brain Node is cold-starting on Render free tier). It exits permanently the moment
+// first bootstrap succeeds — preserving the zero-polling architecture once hydrated.
+func (c *SyncClient) StartStartupBootstrapRetry(onSuccess func(*BootstrapWhatsAppSession)) {
+	if !c.IsConfigured() {
+		return
+	}
+	c.startupRetryOnce.Do(func() {
+		go func() {
+			delays := []time.Duration{
+				5 * time.Second,
+				10 * time.Second,
+				15 * time.Second,
+				20 * time.Second,
+				30 * time.Second,
+				45 * time.Second,
+				60 * time.Second,
+			}
+			for attempt := 0; ; attempt++ {
+				if ramstore.Global.GetSyncStatus().Bootstrapped {
+					return
+				}
+				if !c.IsConfigured() {
+					time.Sleep(15 * time.Second)
+					continue
+				}
+				delay := delays[len(delays)-1]
+				if attempt < len(delays) {
+					delay = delays[attempt]
+				}
+				log.Printf("⏳ [Startup Auto-Hydrate] Retrying Central Brain Node bootstrap in %v...", delay)
+				time.Sleep(delay)
+
+				if ramstore.Global.GetSyncStatus().Bootstrapped {
+					return
+				}
+				waSession, err := c.Bootstrap()
+				if err == nil {
+					log.Println("✅ [Startup Auto-Hydrate] Central Brain Node data & WhatsApp session hydrated automatically. Stopping startup retry loop.")
+					if onSuccess != nil {
+						onSuccess(waSession)
+					}
+					return
+				}
+			}
+		}()
+	})
 }
 
 // SaveWhatsAppSession synchronously uploads a validated non-empty gzip+base64 whatsmeow session snapshot to Central Brain Node.

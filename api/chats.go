@@ -54,12 +54,12 @@ func ChatSendHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	vendorUser := ramstore.Global.GetVendor().Username
+	whatsapp.SaveCustomerChatAndPrune(vendorUser, cleanPhone, "outgoing_manual", cleanMsg)
 	whatsapp.PushToLiveChat(vendorUser, cleanPhone, cleanMsg, "outgoing_manual")
-	go whatsapp.SaveCustomerChatAndPrune(vendorUser, cleanPhone, "assistant", cleanMsg)
 
 	respondJSON(w, 200, map[string]interface{}{
 		"status":  "success",
-		"message": "Reply dispatched via WhatsApp and stored in local RAM (zero chat sync).",
+		"message": "Reply dispatched via WhatsApp and stored in local RAM (last 10 messages per customer, zero chat sync).",
 	})
 }
 
