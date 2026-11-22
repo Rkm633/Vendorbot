@@ -1,13 +1,14 @@
 package whatsapp
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -18,15 +19,29 @@ import (
 
 // PaymentPollParams configures a single non-blocking background 3-second payment verification loop.
 type PaymentPollParams struct {
-	OrderID         string
-	CustomerPhone   string
-	CustomerName    string
-	DeliveryAddress string
-	TotalAmount     float64
-	PaytmMID        string
-	VerifyEndpoint  string
-	PollInterval    time.Duration
-	PollTimeout     time.Duration
+	OrderID                string
+	CustomerPhone          string
+	CustomerName           string
+	DeliveryAddress        string
+	TotalAmount            float64
+	PaytmMID               string
+	PaytmStatusURL         string
+	PaymentConfirmEndpoint string
+	LocalPaytmVerify       bool
+	VerifyEndpoint         string
+	PollInterval           time.Duration
+	PollTimeout            time.Duration
+}
+
+// PaytmStatusResponse models Paytm's direct order status API response.
+type PaytmStatusResponse struct {
+	ORDERID   string `json:"ORDERID"`
+	MID       string `json:"MID"`
+	TXNID     string `json:"TXNID"`
+	TXNAMOUNT string `json:"TXNAMOUNT"`
+	STATUS    string `json:"STATUS"`
+	RESPCODE  string `json:"RESPCODE"`
+	RESPMSG   string `json:"RESPMSG"`
 }
 
 type activePollerEntry struct {
@@ -41,6 +56,8 @@ var (
 
 	notifiedPaidMu     sync.Mutex
 	notifiedPaidOrders = make(map[string]time.Time)
+
+	paytmHTTPClient = &http.Client{Timeout: 5 * time.Second}
 )
 
 // IsOrderPaidNotified returns true if a paid confirmation WhatsApp alert has already been sent for orderID.
@@ -56,7 +73,7 @@ func IsOrderPaidNotified(orderID string) bool {
 }
 
 // MarkOrderPaidNotifiedOnce atomically marks orderID as paid-notified and returns true ONLY on the first call.
-// This prevents duplicate WhatsApp confirmation messages between the 3s verification poller and /api/sync/order.
+// Prevents duplicate WhatsApp confirmation messages between the local 3s Paytm poller and /api/sync/order.
 func MarkOrderPaidNotifiedOnce(orderID string) bool {
 	id := strings.TrimSpace(orderID)
 	if id == "" {
@@ -66,7 +83,7 @@ func MarkOrderPaidNotifiedOnce(orderID string) bool {
 	notifiedPaidMu.Lock()
 	defer notifiedPaidMu.Unlock()
 
-	// Opportunistic cleanup of entries older than 24h so 512MB RAM stays bounded
+	// Opportunistic cleanup of entries older than 24h so 512MB RAM stays strictly bounded
 	if len(notifiedPaidOrders) > 500 {
 		for k, ts := range notifiedPaidOrders {
 			if now.Sub(ts) > 24*time.Hour {
@@ -99,88 +116,65 @@ func StopPaymentVerificationPoller(orderID string) {
 	}
 }
 
-// GenerateBrandedBannerQR calls WaMart's Branded Banner QR Worker to create a Cloudinary banner QR image URL.
-func GenerateBrandedBannerQR(qrGeneratorURL, upiID, payeeName, orderID string, totalAmount float64, cloudName string) (string, error) {
-	genURL := strings.TrimSpace(qrGeneratorURL)
-	if genURL == "" {
-		genURL = ramstore.DefaultQRGeneratorURL
+// CheckPaytmStatusDirect queries Paytm's order status API directly from Render with a 5-second timeout:
+// GET https://securegw.paytm.in/order/status?JsonData=<urlEncoded({"MID":"<paytm_mid>","ORDERID":"<order_id>"})>
+func CheckPaytmStatusDirect(statusURL, paytmMID, orderID string) (*PaytmStatusResponse, error) {
+	endpoint := strings.TrimSpace(statusURL)
+	if endpoint == "" {
+		endpoint = ramstore.DefaultPaytmStatusURL
 	}
-	vpa := strings.TrimSpace(upiID)
-	if vpa == "" {
-		return "", fmt.Errorf("missing upi_id / merchant_vpa for banner QR generation")
-	}
-	name := strings.TrimSpace(payeeName)
-	if name == "" {
-		name = strings.TrimSpace(ramstore.Global.GetVendor().BusinessName)
-		if name == "" {
-			name = "Store"
-		}
-	}
-	cloud := strings.TrimSpace(cloudName)
-	if cloud == "" {
-		cloud = ramstore.DefaultQRCloudName
+	mid := strings.TrimSpace(paytmMID)
+	ord := strings.TrimSpace(orderID)
+	if mid == "" || ord == "" {
+		return nil, fmt.Errorf("missing paytm_mid or order_id")
 	}
 
-	reqPayload := map[string]interface{}{
-		"vpa":       vpa,
-		"name":      name,
-		"orderId":   strings.TrimSpace(orderID),
-		"amount":    totalAmount,
-		"cloudName": cloud,
-	}
-	bodyBytes, err := json.Marshal(reqPayload)
+	payloadJSON, err := json.Marshal(map[string]string{
+		"MID":     mid,
+		"ORDERID": ord,
+	})
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 
-	req, err := http.NewRequest("POST", genURL, bytes.NewReader(bodyBytes))
-	if err != nil {
-		return "", err
+	sep := "?"
+	if strings.Contains(endpoint, "?") {
+		sep = "&"
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "VendorWhatsAppBotNode/2.4")
+	reqURL := endpoint + sep + "JsonData=" + url.QueryEscape(string(payloadJSON))
 
-	httpClient := &http.Client{Timeout: 15 * time.Second}
-	resp, err := httpClient.Do(req)
+	req, err := http.NewRequest("GET", reqURL, nil)
 	if err != nil {
-		return "", err
+		return nil, err
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "VendorWhatsAppBotNode/2.5")
+
+	resp, err := paytmHTTPClient.Do(req)
+	if err != nil {
+		return nil, err
 	}
 	defer resp.Body.Close()
 
-	respBytes, err := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
+	respBytes, err := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", fmt.Errorf("banner QR worker HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(respBytes)))
+		return nil, fmt.Errorf("paytm HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(respBytes)))
 	}
 
-	var parsed struct {
-		Success   bool   `json:"success"`
-		OrderID   string `json:"orderId"`
-		ImageURL  string `json:"imageUrl"`
-		ImageURL2 string `json:"image_url"`
-		URL       string `json:"url"`
-		Error     string `json:"error"`
-	}
+	var parsed PaytmStatusResponse
 	if err := json.Unmarshal(respBytes, &parsed); err != nil {
-		return "", fmt.Errorf("invalid banner QR worker JSON: %w", err)
+		return nil, fmt.Errorf("invalid paytm JSON: %w", err)
 	}
-	imgURL := strings.TrimSpace(parsed.ImageURL)
-	if imgURL == "" {
-		imgURL = strings.TrimSpace(parsed.ImageURL2)
-	}
-	if imgURL == "" {
-		imgURL = strings.TrimSpace(parsed.URL)
-	}
-	if imgURL == "" {
-		return "", fmt.Errorf("banner QR worker returned empty imageUrl (%s)", parsed.Error)
-	}
-	return imgURL, nil
+	return &parsed, nil
 }
 
 // StartPaymentVerificationPoller launches a single non-blocking 3-second polling goroutine for orderID.
-// Duplicate calls for the same order_id are safely ignored.
+// When paytm_mid is configured (and local_paytm_verify != false), polls Paytm directly on Render and
+// pushes ONE lightweight confirmation call to Central Brain upon TXN_SUCCESS.
+// Falls back to Central Brain's /api/payments/verify ONLY if paytm_mid is empty.
 func StartPaymentVerificationPoller(params PaymentPollParams) {
 	orderID := strings.TrimSpace(params.OrderID)
 	cleanPhone := FormatPhone(params.CustomerPhone)
@@ -208,6 +202,25 @@ func StartPaymentVerificationPoller(params PaymentPollParams) {
 			timeout = time.Duration(ramstore.DefaultVerifyPollTimeoutMS) * time.Millisecond
 		}
 	}
+
+	paytmMID := strings.TrimSpace(params.PaytmMID)
+	if paytmMID == "" {
+		paytmMID = strings.TrimSpace(payCfg.PaytmMID)
+	}
+	paytmStatusURL := strings.TrimSpace(params.PaytmStatusURL)
+	if paytmStatusURL == "" {
+		paytmStatusURL = strings.TrimSpace(payCfg.PaytmStatusURL)
+	}
+	if paytmStatusURL == "" {
+		paytmStatusURL = ramstore.DefaultPaytmStatusURL
+	}
+	confirmEndpoint := strings.TrimSpace(params.PaymentConfirmEndpoint)
+	if confirmEndpoint == "" {
+		confirmEndpoint = strings.TrimSpace(payCfg.PaymentConfirmEndpoint)
+	}
+	if confirmEndpoint == "" {
+		confirmEndpoint = ramstore.DefaultPaymentConfirmEndpoint
+	}
 	verifyEndpoint := strings.TrimSpace(params.VerifyEndpoint)
 	if verifyEndpoint == "" {
 		verifyEndpoint = payCfg.VerifyEndpoint
@@ -215,10 +228,8 @@ func StartPaymentVerificationPoller(params PaymentPollParams) {
 	if verifyEndpoint == "" {
 		verifyEndpoint = ramstore.DefaultVerifyEndpoint
 	}
-	paytmMID := strings.TrimSpace(params.PaytmMID)
-	if paytmMID == "" {
-		paytmMID = strings.TrimSpace(payCfg.PaytmMID)
-	}
+
+	useDirectPaytm := params.LocalPaytmVerify && paytmMID != ""
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 
@@ -233,7 +244,11 @@ func StartPaymentVerificationPoller(params PaymentPollParams) {
 	activePollers[orderID] = activePollerEntry{cancel: cancel, token: myToken}
 	activePollersMu.Unlock()
 
-	log.Printf("🔄 [Payment Poller] Started %v verification loop for Order #%s (timeout=%v, endpoint=%s)", interval, orderID, timeout, verifyEndpoint)
+	if useDirectPaytm {
+		log.Printf("🔄 [Payment Poller] Started %v DIRECT Paytm verification for Order #%s (timeout=%v, url=%s)", interval, orderID, timeout, paytmStatusURL)
+	} else {
+		log.Printf("🔄 [Payment Poller] Started %v fallback Central verification for Order #%s (timeout=%v, endpoint=%s)", interval, orderID, timeout, verifyEndpoint)
+	}
 
 	go func() {
 		ticker := time.NewTicker(interval)
@@ -250,7 +265,7 @@ func StartPaymentVerificationPoller(params PaymentPollParams) {
 		for {
 			select {
 			case <-ctx.Done():
-				// Send timeout notice ONLY if the timeout actually elapsed (not when cancelled by webhook or paid check)
+				// Send polite timeout notice ONLY when the 5-minute window actually expires
 				if ctx.Err() == context.DeadlineExceeded && !IsOrderPaidNotified(orderID) {
 					log.Printf("⏱️ [Payment Poller] Timeout elapsed for Order #%s after %v", orderID, timeout)
 					timeoutMsg := fmt.Sprintf("Payment verification window for Order #%s timed out. If you already paid, please wait or contact the store with your payment screenshot.", orderID)
@@ -268,36 +283,63 @@ func StartPaymentVerificationPoller(params PaymentPollParams) {
 					return
 				}
 				vendor := ramstore.Global.GetVendor()
-				verifyReq := central.VerifyPaymentRequest{
-					OrderID:  orderID,
-					ORDERID:  orderID,
-					Username: vendor.Username,
-					TenantID: vendor.Username,
-					PaytmMID: paytmMID,
-					Source:   "vendor_bot",
-				}
-				vResp, err := central.Client.VerifyPayment(verifyEndpoint, verifyReq)
-				if err != nil {
-					log.Printf("⚠️ [Payment Poller] Transient verify error for Order #%s (retrying): %v", orderID, err)
-					continue
-				}
-				if vResp == nil {
-					continue
+
+				isPaid := false
+				isCancelled := false
+				txnID := ""
+				paidAmount := params.TotalAmount
+
+				if useDirectPaytm {
+					pResp, err := CheckPaytmStatusDirect(paytmStatusURL, paytmMID, orderID)
+					if err != nil {
+						log.Printf("⚠️ [Paytm Direct Poll] Transient error for Order #%s (retrying): %v", orderID, err)
+						continue
+					}
+					if pResp != nil && strings.EqualFold(strings.TrimSpace(pResp.STATUS), "TXN_SUCCESS") {
+						isPaid = true
+						txnID = strings.TrimSpace(pResp.TXNID)
+						if parsedAmt, aErr := strconv.ParseFloat(strings.TrimSpace(pResp.TXNAMOUNT), 64); aErr == nil && parsedAmt > 0 {
+							paidAmount = parsedAmt
+						}
+					}
+				} else {
+					verifyReq := central.VerifyPaymentRequest{
+						OrderID:  orderID,
+						ORDERID:  orderID,
+						Username: vendor.Username,
+						TenantID: vendor.Username,
+						PaytmMID: paytmMID,
+						Source:   "vendor_bot",
+					}
+					vResp, err := central.Client.VerifyPayment(verifyEndpoint, verifyReq)
+					if err != nil {
+						log.Printf("⚠️ [Central Verify Fallback] Transient error for Order #%s (retrying): %v", orderID, err)
+						continue
+					}
+					if vResp == nil {
+						continue
+					}
+					if vResp.IsPaid || vResp.Verified || strings.EqualFold(strings.TrimSpace(vResp.PaymentStatus), "PAID") {
+						isPaid = true
+						txnID = strings.TrimSpace(vResp.TxnID)
+						if vResp.TotalAmount > 0 {
+							paidAmount = vResp.TotalAmount
+						}
+					} else if vResp.Cancelled ||
+						strings.EqualFold(strings.TrimSpace(vResp.PaymentStatus), "CANCELLED") ||
+						strings.EqualFold(strings.TrimSpace(vResp.OrderStatus), "CANCELLED") {
+						isCancelled = true
+					}
 				}
 
-				// 1. PAID / VERIFIED
-				if vResp.IsPaid || vResp.Verified || strings.EqualFold(strings.TrimSpace(vResp.PaymentStatus), "PAID") {
-					log.Printf("✅ [Payment Poller] Payment VERIFIED for Order #%s (txn_id=%s)", orderID, vResp.TxnID)
-					paidAmount := params.TotalAmount
-					if vResp.TotalAmount > 0 {
-						paidAmount = vResp.TotalAmount
-					}
+				if isPaid {
+					log.Printf("✅ [Payment Poller] Payment CONFIRMED for Order #%s (direct_paytm=%v, txn_id=%s, amount=₹%.2f)", orderID, useDirectPaytm, txnID, paidAmount)
 
 					// Update RAM order & customer state and clear active cart
 					if existing := ramstore.Global.GetOrder(orderID); existing != nil {
 						existing.PaymentStatus = "PAID"
 						existing.OrderStatus = "CONFIRMED"
-						existing.StatusUpdatedBy = "central"
+						existing.StatusUpdatedBy = "paytm_local"
 						if paidAmount > 0 {
 							existing.TotalAmount = paidAmount
 						}
@@ -309,15 +351,25 @@ func StartPaymentVerificationPoller(params PaymentPollParams) {
 					_ = SetCustomerCurrentOrderID(vendor.Username, cleanPhone, "")
 
 					if MarkOrderPaidNotifiedOnce(orderID) {
-						SendPaidOrderConfirmationWhatsApp(orderID, cleanPhone, params.CustomerName, params.DeliveryAddress, vResp.TxnID, paidAmount)
+						SendPaidOrderConfirmationWhatsApp(orderID, cleanPhone, params.CustomerName, params.DeliveryAddress, txnID, paidAmount)
+					}
+
+					// Send ONE single lightweight confirmation sync call to Central Brain (3 retries with exponential backoff)
+					if useDirectPaytm {
+						go func(ep string, evt central.PaymentConfirmedEvent) {
+							_ = central.Client.PushPaymentConfirmedWithRetry(ep, evt)
+						}(confirmEndpoint, central.PaymentConfirmedEvent{
+							OrderID:       orderID,
+							TxnID:         txnID,
+							Amount:        paidAmount,
+							PaytmStatus:   "TXN_SUCCESS",
+							CustomerPhone: cleanPhone,
+						})
 					}
 					return
 				}
 
-				// 2. CANCELLED
-				if vResp.Cancelled ||
-					strings.EqualFold(strings.TrimSpace(vResp.PaymentStatus), "CANCELLED") ||
-					strings.EqualFold(strings.TrimSpace(vResp.OrderStatus), "CANCELLED") {
+				if isCancelled {
 					log.Printf("❌ [Payment Poller] Order #%s cancelled — stopping verification loop", orderID)
 					if existing := ramstore.Global.GetOrder(orderID); existing != nil {
 						existing.PaymentStatus = "CANCELLED"

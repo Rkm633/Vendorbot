@@ -133,51 +133,91 @@ func (a AIConfig) AllAPIKeys() []string {
 }
 
 const (
-	DefaultQRWorkerBaseURL     = "https://wamart.rkmtech633.workers.dev"
-	DefaultQRGeneratorURL      = "https://wamart.rkmtech633.workers.dev/generate"
-	DefaultQRCloudName         = "hq67khm3"
-	DefaultVerifyEndpoint      = "/api/payments/verify"
-	DefaultVerifyPollIntervalMS = 3000
-	DefaultVerifyPollTimeoutMS  = 300000
+	DefaultQRWorkerBaseURL        = "https://wamart.rkmtech633.workers.dev"
+	DefaultQRGeneratorURL         = "https://wamart.rkmtech633.workers.dev/generate"
+	DefaultQRCloudName            = "hq67khm3"
+	DefaultVerifyEndpoint         = "/api/payments/verify"
+	DefaultPaytmStatusURL         = "https://securegw.paytm.in/order/status"
+	DefaultPaymentConfirmEndpoint = "/api/vendor-bot/events/payment-confirmed"
+	DefaultVerifyPollIntervalMS   = 3000
+	DefaultVerifyPollTimeoutMS    = 300000
+	DefaultBannerQRSize           = 480
+	DefaultBannerQROffsetX        = 0
+	DefaultBannerQROffsetY        = -130
+	DefaultBannerQRPadding        = 14
 )
 
-// PaymentConfig holds UPI / Paytm / Branded Banner QR & Central verification polling config synced from Central Brain Node in RAM.
-type PaymentConfig struct {
-	Enabled              bool   `json:"enabled"`
-	Gateway              string `json:"gateway,omitempty"`
-	MerchantPhone        string `json:"merchant_phone"`
-	UPIID                string `json:"upi_id"`
-	MerchantVPA          string `json:"merchant_vpa"`
-	PaytmMID             string `json:"paytm_mid"`
-	PayeeName            string `json:"payee_name"`
-	CloudinaryCloudName  string `json:"cloudinary_cloud_name"`
-	QRWorkerBaseURL      string `json:"qr_worker_base_url"`
-	QRGeneratorURL       string `json:"qr_generator_url"`
-	QRCloudName          string `json:"qr_cloud_name"`
-	QROnlyMode           bool   `json:"qr_only_mode"`
-	SendPaymentLink      bool   `json:"send_payment_link"`
-	VerifyEndpoint       string `json:"verify_endpoint"`
-	VerifyPollIntervalMS int    `json:"verify_poll_interval_ms"`
-	VerifyPollTimeoutMS  int    `json:"verify_poll_timeout_ms"`
+// BannerTemplate holds Central Admin Studio's blank banner template layout for local in-memory QR compositing.
+type BannerTemplate struct {
+	Enabled      bool   `json:"enabled"`
+	BannerURL    string `json:"banner_url"`
+	BannerWidth  int    `json:"banner_width"`
+	BannerHeight int    `json:"banner_height"`
+	QRSize       int    `json:"qr_size"`
+	QROffsetX    int    `json:"qr_offset_x"`
+	QROffsetY    int    `json:"qr_offset_y"`
+	QRPadding    int    `json:"qr_padding"`
+	UpdatedAt    string `json:"updated_at"`
 }
 
-// DefaultPaymentConfig returns a PaymentConfig initialized with WaMart Branded Banner QR & 3s verification defaults.
-func DefaultPaymentConfig() PaymentConfig {
-	return PaymentConfig{
-		Enabled:              false,
-		QRWorkerBaseURL:      DefaultQRWorkerBaseURL,
-		QRGeneratorURL:       DefaultQRGeneratorURL,
-		QRCloudName:          DefaultQRCloudName,
-		CloudinaryCloudName:  DefaultQRCloudName,
-		QROnlyMode:           true,
-		SendPaymentLink:      false,
-		VerifyEndpoint:       DefaultVerifyEndpoint,
-		VerifyPollIntervalMS: DefaultVerifyPollIntervalMS,
-		VerifyPollTimeoutMS:  DefaultVerifyPollTimeoutMS,
+// DefaultBannerTemplate returns a BannerTemplate prefilled with Central Admin Studio default QR placement coordinates.
+func DefaultBannerTemplate() BannerTemplate {
+	return BannerTemplate{
+		Enabled:   false,
+		QRSize:    DefaultBannerQRSize,
+		QROffsetX: DefaultBannerQROffsetX,
+		QROffsetY: DefaultBannerQROffsetY,
+		QRPadding: DefaultBannerQRPadding,
 	}
 }
 
-// ApplyDefaults fills empty payment/QR/polling fields with WaMart defaults and keeps UPIID/MerchantVPA synced.
+// PaymentConfig holds UPI / Paytm / Local Banner QR & 3-second verification config synced from Central Brain Node in RAM.
+type PaymentConfig struct {
+	Enabled                bool           `json:"enabled"`
+	Gateway                string         `json:"gateway,omitempty"`
+	MerchantPhone          string         `json:"merchant_phone"`
+	UPIID                  string         `json:"upi_id"`
+	MerchantVPA            string         `json:"merchant_vpa"`
+	PaytmMID               string         `json:"paytm_mid"`
+	PayeeName              string         `json:"payee_name"`
+	CloudinaryCloudName    string         `json:"cloudinary_cloud_name"`
+	QRWorkerBaseURL        string         `json:"qr_worker_base_url"`
+	QRGeneratorURL         string         `json:"qr_generator_url"`
+	QRCloudName            string         `json:"qr_cloud_name"`
+	QROnlyMode             bool           `json:"qr_only_mode"`
+	SendPaymentLink        bool           `json:"send_payment_link"`
+	LocalQRGeneration      bool           `json:"local_qr_generation"`
+	LocalPaytmVerify       bool           `json:"local_paytm_verify"`
+	PaytmStatusURL         string         `json:"paytm_status_url"`
+	PaymentConfirmEndpoint string         `json:"payment_confirm_endpoint"`
+	VerifyEndpoint         string         `json:"verify_endpoint"`
+	VerifyPollIntervalMS   int            `json:"verify_poll_interval_ms"`
+	VerifyPollTimeoutMS    int            `json:"verify_poll_timeout_ms"`
+	BannerTemplate         BannerTemplate `json:"banner_template"`
+}
+
+// DefaultPaymentConfig returns a PaymentConfig initialized with Local Banner QR & Direct Paytm 3s verification defaults.
+func DefaultPaymentConfig() PaymentConfig {
+	return PaymentConfig{
+		Enabled:                false,
+		QRWorkerBaseURL:        DefaultQRWorkerBaseURL,
+		QRGeneratorURL:         DefaultQRGeneratorURL,
+		QRCloudName:            DefaultQRCloudName,
+		CloudinaryCloudName:    DefaultQRCloudName,
+		QROnlyMode:             true,
+		SendPaymentLink:        false,
+		LocalQRGeneration:      true,
+		LocalPaytmVerify:       true,
+		PaytmStatusURL:         DefaultPaytmStatusURL,
+		PaymentConfirmEndpoint: DefaultPaymentConfirmEndpoint,
+		VerifyEndpoint:         DefaultVerifyEndpoint,
+		VerifyPollIntervalMS:   DefaultVerifyPollIntervalMS,
+		VerifyPollTimeoutMS:    DefaultVerifyPollTimeoutMS,
+		BannerTemplate:         DefaultBannerTemplate(),
+	}
+}
+
+// ApplyDefaults fills empty payment/QR/polling fields with defaults and keeps UPIID/MerchantVPA synced.
 func (p *PaymentConfig) ApplyDefaults(fallbackPayee string) {
 	if p == nil {
 		return
@@ -207,6 +247,15 @@ func (p *PaymentConfig) ApplyDefaults(fallbackPayee string) {
 	if strings.TrimSpace(p.CloudinaryCloudName) == "" {
 		p.CloudinaryCloudName = p.QRCloudName
 	}
+	if strings.TrimSpace(p.PaytmStatusURL) == "" {
+		p.PaytmStatusURL = DefaultPaytmStatusURL
+	}
+	if strings.TrimSpace(p.PaymentConfirmEndpoint) == "" {
+		p.PaymentConfirmEndpoint = DefaultPaymentConfirmEndpoint
+	}
+	if !strings.HasPrefix(p.PaymentConfirmEndpoint, "/") && !strings.HasPrefix(p.PaymentConfirmEndpoint, "http") {
+		p.PaymentConfirmEndpoint = "/" + p.PaymentConfirmEndpoint
+	}
 	if strings.TrimSpace(p.VerifyEndpoint) == "" {
 		p.VerifyEndpoint = DefaultVerifyEndpoint
 	}
@@ -218,6 +267,12 @@ func (p *PaymentConfig) ApplyDefaults(fallbackPayee string) {
 	}
 	if p.VerifyPollTimeoutMS <= 0 {
 		p.VerifyPollTimeoutMS = DefaultVerifyPollTimeoutMS
+	}
+	if p.BannerTemplate.QRSize <= 0 {
+		p.BannerTemplate.QRSize = DefaultBannerQRSize
+	}
+	if p.BannerTemplate.QRPadding < 0 {
+		p.BannerTemplate.QRPadding = DefaultBannerQRPadding
 	}
 	if !p.Enabled && (p.PaytmMID != "" || p.MerchantVPA != "" || p.UPIID != "" || p.Gateway != "") {
 		p.Enabled = true
@@ -295,6 +350,7 @@ type Product struct {
 	MRP                 float64     `json:"mrp"`
 	Description         string      `json:"description"`
 	Category            string      `json:"category"`
+	Tags                []string    `json:"tags,omitempty"`
 	UnitType            string      `json:"unit_type"`
 	Variants            VariantList `json:"variants,omitempty"`
 	InStock             bool        `json:"in_stock"`
@@ -799,6 +855,10 @@ func (s *Store) HydrateFromBootstrap(data *BootstrapData) {
 	s.syncStatus.LastBootstrapAt = now
 	s.syncStatus.LastSyncAt = now
 	s.syncStatus.LastError = ""
+
+	bannerTpl := s.payment.BannerTemplate
+	// Sync blank banner compressed bytes asynchronously (non-blocking)
+	go GlobalBannerCache.SyncAsync(bannerTpl)
 }
 
 // --- Vendor, AI, Payment getters & setters ---
@@ -932,7 +992,6 @@ func (s *Store) GetPayment() PaymentConfig {
 
 func (s *Store) SetPayment(p PaymentConfig) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if strings.TrimSpace(p.CloudinaryCloudName) == "" {
 		p.CloudinaryCloudName = s.payment.CloudinaryCloudName
 	}
@@ -945,6 +1004,12 @@ func (s *Store) SetPayment(p PaymentConfig) {
 	if strings.TrimSpace(p.QRGeneratorURL) == "" {
 		p.QRGeneratorURL = s.payment.QRGeneratorURL
 	}
+	if strings.TrimSpace(p.PaytmStatusURL) == "" {
+		p.PaytmStatusURL = s.payment.PaytmStatusURL
+	}
+	if strings.TrimSpace(p.PaymentConfirmEndpoint) == "" {
+		p.PaymentConfirmEndpoint = s.payment.PaymentConfirmEndpoint
+	}
 	if strings.TrimSpace(p.VerifyEndpoint) == "" {
 		p.VerifyEndpoint = s.payment.VerifyEndpoint
 	}
@@ -956,6 +1021,10 @@ func (s *Store) SetPayment(p PaymentConfig) {
 	}
 	p.ApplyDefaults(s.vendor.BusinessName)
 	s.payment = p
+	bannerTpl := p.BannerTemplate
+	s.mu.Unlock()
+
+	GlobalBannerCache.SyncAsync(bannerTpl)
 }
 
 // --- Products ---

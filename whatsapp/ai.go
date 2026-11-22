@@ -399,6 +399,9 @@ type AIProfileDataPayload struct {
 type AIActionPayload struct {
 	Category        string                `json:"category,omitempty"`
 	ProductCategory string                `json:"product_category,omitempty"`
+	Query           string                `json:"query,omitempty"`
+	Queries         []string              `json:"queries,omitempty"`
+	Categories      []string              `json:"categories,omitempty"`
 	OrderID         string                `json:"order_id,omitempty"`
 	PaymentMode     string                `json:"payment_mode,omitempty"` // "COD" or "ONLINE"
 	CartItems       []AICartItemPayload   `json:"cart_items,omitempty"`
@@ -454,15 +457,16 @@ TONE & WHATSAPP STYLE (HUMANOID + ENGAGING):
 • Set "quote_reply":true ONLY when directly answering a specific question/price/item/address/complaint so WhatsApp swipe-quote adds clarity; keep "quote_reply":false for normal greetings, simple replies, and smooth chat flow.
 
 HANDS (include only needed actions; empty [] for pure chat):
+• search_catalog: {"queries":["keyword1","keyword2"],"categories":["CategoryName"]} — ONLY when customer describes an indirect need/use-case or requests items NOT visible in INV below (uses CATS to fetch exact in-stock items in 1 lookup).
 • send_catalog_images: {"category":"item name|category|all"} — when user asks for photos/pics.
-• update_cart: {"cart_items":[{"id":"EXACT_ID","variant":"exact variant if any","qty":1}]} — ONLY from IN-STOCK INV below.
+• update_cart: {"cart_items":[{"id":"EXACT_ID","variant":"exact variant if any","qty":1}]} — ONLY from IN-STOCK INV/CLEAR_MATCH below. For multi-item lists, add all CLEAR_MATCH items immediately and politely ask customer to pick brand/size for VARIETY_OPTIONS.
 • extract_profile: {"profile":{"name":"","address":"","contact":""}} — save customer name/address/10-digit phone.
 • submit_order: {"payment_mode":"COD"|"ONLINE"} — when cart has items + address is known + customer chooses COD or Online.
 • generate_store_link: {} — when user asks for website/store/mall link.
 • clear_cart: {} | cancel_order: {} | escalate_to_human: {} (notify owner & keep helping warmly).
 
 RULES:
-1. NEVER suggest/add out-of-stock items. Only quote items/prices/IDs present in INV. If user asks for a category not expanded in INV, politely name matching categories from CATS & ask which item they want.
+1. NEVER suggest/add out-of-stock items. Only quote items/prices/IDs present in INV/CLEAR_MATCH/VARIETY_OPTIONS/SEARCH_RESULTS. If customer describes a need (e.g. "snacks for guests", "cough relief") not shown in INV, call search_catalog hand with relevant product words & categories from CATS.
 2. NEVER ask for UTR or payment screenshots, NEVER verify screenshots, NEVER mark orders Paid. If user says they paid, warmly reassure that our Central Payment System verifies online payments automatically and sends confirmation + PDF receipt right away.
 3. On greeting/menu ask, warmly welcome & highlight top categories/popular items with *₹prices* and offer photos!
 4. Before submit_order, show a crisp *Order Summary* (items, total, address) and ask *Online Payment* 💳 or *COD* 💵 (if COD allowed).
@@ -894,158 +898,10 @@ var ragStopWords = map[string]bool{
 	"confirm": true, "address": true, "delivery": true, "online": true, "payment": true,
 }
 
-// GetSmartCompactInventory injects ONLY relevant in-stock products + 1-line category summary +
-// active cart products, eliminating the 500-product full-catalog dump while keeping 100% accuracy.
+// GetSmartCompactInventory delegates to the 4-Layer Static Hybrid Catalog Search Engine
+// (Hinglish synonyms + phonetic/fuzzy matching + per-line multi-item splitting + checkout skip).
 func GetSmartCompactInventory(userMsg string, history []ChatMessage, cartProductIDs map[string]bool) string {
-	products := ramstore.Global.ListProducts(true)
-	if len(products) == 0 {
-		return "INV: No in-stock items loaded yet."
-	}
-
-	// Build 1-line category overview (~20 tokens even for 500 products!)
-	catCounts := make(map[string]int)
-	var catOrder []string
-	catBuckets := make(map[string][]ramstore.Product)
-	for _, p := range products {
-		c := strings.TrimSpace(p.Category)
-		if c == "" {
-			c = "General"
-		}
-		if _, exists := catCounts[c]; !exists {
-			catOrder = append(catOrder, c)
-		}
-		catCounts[c]++
-		catBuckets[c] = append(catBuckets[c], p)
-	}
-
-	var catSummary []string
-	for _, c := range catOrder {
-		catSummary = append(catSummary, fmt.Sprintf("%s(%d)", c, catCounts[c]))
-	}
-
-	var sb strings.Builder
-	sb.WriteString("CATS: " + strings.Join(catSummary, ", ") + "\n")
-
-	// Small catalog (<= 18 items): send all in ultra-compact format (~250 tokens total)
-	if len(products) <= 18 {
-		sb.WriteString("INV(id|name|cat|price|vars):\n")
-		for _, p := range products {
-			sb.WriteString(formatCompactProductLine(p) + "\n")
-		}
-		return strings.TrimSpace(sb.String())
-	}
-
-	// Large catalog (> 18 items, up to 500+): Smart Top-N RAG using current + last 2 user turns
-	var queryParts []string
-	queryParts = append(queryParts, userMsg)
-	addedPrev := 0
-	for i := len(history) - 2; i >= 0 && addedPrev < 2; i-- {
-		if history[i].Role == "user" {
-			queryParts = append(queryParts, history[i].Content)
-			addedPrev++
-		}
-	}
-	combinedQuery := strings.ToLower(strings.Join(queryParts, " "))
-
-	var keywords []string
-	seenKW := make(map[string]bool)
-	for _, tok := range strings.Fields(combinedQuery) {
-		tok = strings.Trim(tok, ".,!?-_\"'#()[]{}:;")
-		if len(tok) >= 3 && !ragStopWords[tok] && !seenKW[tok] {
-			seenKW[tok] = true
-			keywords = append(keywords, tok)
-		}
-	}
-
-	selectedIDs := make(map[string]bool)
-	var selected []ramstore.Product
-
-	// Always include products already in the customer's active cart
-	if len(cartProductIDs) > 0 {
-		for _, p := range products {
-			if cartProductIDs[p.ID] && !selectedIDs[p.ID] {
-				selectedIDs[p.ID] = true
-				selected = append(selected, p)
-			}
-		}
-	}
-
-	type scoredProd struct {
-		prod  ramstore.Product
-		score int
-	}
-	var scored []scoredProd
-	if len(keywords) > 0 {
-		for _, p := range products {
-			if selectedIDs[p.ID] {
-				continue
-			}
-			nameLow := strings.ToLower(p.Name)
-			catLow := strings.ToLower(p.Category)
-			descLow := strings.ToLower(p.Description)
-			s := 0
-			if strings.Contains(combinedQuery, nameLow) && len(nameLow) >= 3 {
-				s += 10
-			}
-			for _, kw := range keywords {
-				if strings.Contains(nameLow, kw) {
-					s += 4
-				} else if strings.Contains(catLow, kw) {
-					s += 3
-				} else if strings.Contains(descLow, kw) {
-					s += 1
-				}
-			}
-			if s > 0 {
-				scored = append(scored, scoredProd{prod: p, score: s})
-			}
-		}
-		sort.SliceStable(scored, func(i, j int) bool {
-			return scored[i].score > scored[j].score
-		})
-	}
-
-	const maxRAGItems = 12
-	for _, sp := range scored {
-		if len(selected) >= maxRAGItems {
-			break
-		}
-		selectedIDs[sp.prod.ID] = true
-		selected = append(selected, sp.prod)
-	}
-
-	// If few or zero keyword matches (e.g. greeting / "menu dikhao"), pick diverse items across categories
-	if len(selected) < 8 {
-		maxShow := 10
-		round := 0
-		for len(selected) < maxShow {
-			addedAny := false
-			for _, c := range catOrder {
-				bucket := catBuckets[c]
-				if round < len(bucket) {
-					p := bucket[round]
-					if !selectedIDs[p.ID] {
-						selectedIDs[p.ID] = true
-						selected = append(selected, p)
-						addedAny = true
-						if len(selected) >= maxShow {
-							break
-						}
-					}
-				}
-			}
-			if !addedAny {
-				break
-			}
-			round++
-		}
-	}
-
-	sb.WriteString(fmt.Sprintf("INV(showing %d/%d relevant in-stock; id|name|cat|price|vars):\n", len(selected), len(products)))
-	for _, p := range selected {
-		sb.WriteString(formatCompactProductLine(p) + "\n")
-	}
-	return strings.TrimSpace(sb.String())
+	return BuildSmartCatalogContext(userMsg, history, cartProductIDs)
 }
 
 // GetLiveInventoryRAG kept for backwards compatibility, returning the compact inventory format.
@@ -1380,11 +1236,19 @@ func ParseOctopusAIResponse(rawResponse string) (*OctopusAIResponse, error) {
 			h = "verify_payment"
 		case "human", "human_agent", "support":
 			h = "escalate_to_human"
+		case "search_catalog", "find_products", "browse_category", "lookup_catalog", "search_products":
+			h = "search_catalog"
 		}
 		act.Hand = h
 		if act.Payload != nil {
 			if act.Payload.Category == "" && act.Payload.ProductCategory != "" {
 				act.Payload.Category = act.Payload.ProductCategory
+			}
+			if act.Payload.Query != "" {
+				act.Payload.Queries = appendUniqueStrings(act.Payload.Queries, act.Payload.Query)
+			}
+			if act.Hand == "search_catalog" && act.Payload.Category != "" {
+				act.Payload.Categories = appendUniqueStrings(act.Payload.Categories, act.Payload.Category)
 			}
 			if act.Payload.Profile == nil && act.Payload.ProfileData != nil {
 				act.Payload.Profile = act.Payload.ProfileData
@@ -1546,6 +1410,57 @@ func GenerateOctopusAIReply(username, customerPhone, incomingText string, cfg *U
 	if errParse != nil || parsed == nil {
 		return &OctopusAIResponse{AIReplyText: SafeAIFallbackReply, Actions: []AIActionItem{}, ExecuteHand: "chat_only"}, nil
 	}
+
+	// Layer 4: On-Demand `search_catalog` Hand interception (STRICTLY max 1 follow-up pass — never loops!)
+	var lookupQueries []string
+	var lookupCategories []string
+	hasSearchHand := false
+	for _, act := range parsed.Actions {
+		if act.Hand == "search_catalog" {
+			hasSearchHand = true
+			if act.Payload != nil {
+				lookupQueries = appendUniqueStrings(lookupQueries, act.Payload.Queries...)
+				if strings.TrimSpace(act.Payload.Query) != "" {
+					lookupQueries = appendUniqueStrings(lookupQueries, strings.TrimSpace(act.Payload.Query))
+				}
+				lookupCategories = appendUniqueStrings(lookupCategories, act.Payload.Categories...)
+				if strings.TrimSpace(act.Payload.Category) != "" {
+					lookupCategories = appendUniqueStrings(lookupCategories, strings.TrimSpace(act.Payload.Category))
+				}
+			}
+		}
+	}
+
+	if hasSearchHand && (len(lookupQueries) > 0 || len(lookupCategories) > 0) {
+		searchResultBlock := ExecuteSearchCatalogHand(lookupQueries, lookupCategories)
+		log.Printf("🔎 [Octopus search_catalog] queries=%v categories=%v -> resolved in RAM", lookupQueries, lookupCategories)
+
+		followUpPrompt := promptBuilder.String() + "\n\n" + searchResultBlock +
+			"\n\nFINAL PASS: Now answer the customer warmly using SEARCH_RESULTS above. Do NOT call search_catalog again."
+
+		aiResponse2, err2 := callAIWithKeyFallback(username, cfg, followUpPrompt, llmHistory, true)
+		if err2 == nil && strings.TrimSpace(aiResponse2) != "" {
+			if parsed2, errP2 := ParseOctopusAIResponse(aiResponse2); errP2 == nil && parsed2 != nil {
+				filtered := make([]AIActionItem, 0, len(parsed2.Actions))
+				for _, act := range parsed2.Actions {
+					if act.Hand != "search_catalog" {
+						filtered = append(filtered, act)
+					}
+				}
+				parsed2.Actions = filtered
+				return parsed2, nil
+			}
+		}
+		// If 2nd pass fails transiently, strip search_catalog so caller doesn't fail and return 1st reply cleanly
+		filtered := make([]AIActionItem, 0, len(parsed.Actions))
+		for _, act := range parsed.Actions {
+			if act.Hand != "search_catalog" {
+				filtered = append(filtered, act)
+			}
+		}
+		parsed.Actions = filtered
+	}
+
 	return parsed, nil
 }
 

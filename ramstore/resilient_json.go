@@ -420,7 +420,59 @@ func DecodeAIConfig(raw json.RawMessage) (*AIConfig, error) {
 	return a, nil
 }
 
-// DecodePaymentConfig resiliently decodes a PaymentConfig JSON object with WaMart Banner QR & verify defaults.
+// DecodeBannerTemplate resiliently decodes payment.banner_template preserving explicit 0 values for offset/padding.
+func DecodeBannerTemplate(raw json.RawMessage) BannerTemplate {
+	tpl := DefaultBannerTemplate()
+	if isNullOrEmpty(raw) {
+		return tpl
+	}
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return tpl
+	}
+	if r, ok := firstRaw(m, "enabled", "is_enabled", "active"); ok {
+		tpl.Enabled = ParseFlexBool(r, false)
+	}
+	if r, ok := firstRaw(m, "banner_url", "url", "image_url"); ok {
+		tpl.BannerURL = ParseFlexString(r)
+	}
+	if r, ok := firstRaw(m, "banner_width", "width"); ok {
+		if v := ParseFlexInt(r); v > 0 {
+			tpl.BannerWidth = v
+		}
+	}
+	if r, ok := firstRaw(m, "banner_height", "height"); ok {
+		if v := ParseFlexInt(r); v > 0 {
+			tpl.BannerHeight = v
+		}
+	}
+	if r, ok := firstRaw(m, "qr_size"); ok {
+		if v := ParseFlexInt(r); v > 0 {
+			tpl.QRSize = v
+		}
+	}
+	if r, ok := firstRaw(m, "qr_offset_x"); ok {
+		if ptr := ParseFlexIntPtr(r); ptr != nil {
+			tpl.QROffsetX = *ptr
+		}
+	}
+	if r, ok := firstRaw(m, "qr_offset_y"); ok {
+		if ptr := ParseFlexIntPtr(r); ptr != nil {
+			tpl.QROffsetY = *ptr
+		}
+	}
+	if r, ok := firstRaw(m, "qr_padding"); ok {
+		if ptr := ParseFlexIntPtr(r); ptr != nil && *ptr >= 0 {
+			tpl.QRPadding = *ptr
+		}
+	}
+	if r, ok := firstRaw(m, "updated_at"); ok {
+		tpl.UpdatedAt = ParseFlexString(r)
+	}
+	return tpl
+}
+
+// DecodePaymentConfig resiliently decodes a PaymentConfig JSON object with Local Banner QR & Direct Paytm verify defaults.
 func DecodePaymentConfig(raw json.RawMessage) (*PaymentConfig, error) {
 	if isNullOrEmpty(raw) {
 		return nil, nil
@@ -482,6 +534,22 @@ func DecodePaymentConfig(raw json.RawMessage) (*PaymentConfig, error) {
 	if r, ok := firstRaw(m, "send_payment_link"); ok {
 		p.SendPaymentLink = ParseFlexBool(r, false)
 	}
+	if r, ok := firstRaw(m, "local_qr_generation"); ok {
+		p.LocalQRGeneration = ParseFlexBool(r, true)
+	}
+	if r, ok := firstRaw(m, "local_paytm_verify"); ok {
+		p.LocalPaytmVerify = ParseFlexBool(r, true)
+	}
+	if r, ok := firstRaw(m, "paytm_status_url"); ok {
+		if v := ParseFlexString(r); v != "" {
+			p.PaytmStatusURL = v
+		}
+	}
+	if r, ok := firstRaw(m, "payment_confirm_endpoint"); ok {
+		if v := ParseFlexString(r); v != "" {
+			p.PaymentConfirmEndpoint = v
+		}
+	}
 	if r, ok := firstRaw(m, "verify_endpoint"); ok {
 		if v := ParseFlexString(r); v != "" {
 			p.VerifyEndpoint = v
@@ -496,6 +564,9 @@ func DecodePaymentConfig(raw json.RawMessage) (*PaymentConfig, error) {
 		if v := ParseFlexInt(r); v > 0 {
 			p.VerifyPollTimeoutMS = v
 		}
+	}
+	if r, ok := firstRaw(m, "banner_template"); ok {
+		p.BannerTemplate = DecodeBannerTemplate(r)
 	}
 	if r, ok := firstRaw(m, "gateway", "provider", "payment_gateway"); ok {
 		p.Gateway = ParseFlexString(r)
@@ -627,6 +698,9 @@ func DecodeProduct(raw json.RawMessage) (Product, error) {
 	}
 	if r, ok := firstRaw(m, "category", "category_name"); ok {
 		p.Category = ParseFlexString(r)
+	}
+	if r, ok := firstRaw(m, "tags", "aliases", "search_tags", "keywords"); ok {
+		p.Tags = ParseFlexStringSlice(r)
 	}
 	if r, ok := firstRaw(m, "unit_type", "unit"); ok {
 		p.UnitType = ParseFlexString(r)

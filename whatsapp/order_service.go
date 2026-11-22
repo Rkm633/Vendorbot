@@ -520,13 +520,16 @@ func SubmitWhatsAppOrderToCentral(client *whatsmeow.Client, username, customerPh
 		storeName = "Our Store"
 	}
 
-	resolvedQRURL := strings.TrimSpace(resp.PaymentQRURL)
 	resolvedPaytmMID := strings.TrimSpace(resp.PaytmMID)
 	if resolvedPaytmMID == "" {
 		resolvedPaytmMID = strings.TrimSpace(payCfg.PaytmMID)
 	}
 
-	// ONLINE / UPI Checkout: Generate Branded Banner QR & send ONLY the QR image (NO payment link!)
+	var localQRBytes []byte
+	localQRMime := ""
+
+	// ONLINE / UPI Checkout: Generate Branded Banner QR LOCALLY in memory (zero external QR Worker / Cloudinary)
+	// STRICT RULE: Send ONLY the Banner QR image — NEVER send upi:// or any payment link as text.
 	if mode == "ONLINE" {
 		upiID := strings.TrimSpace(resp.UPIID)
 		if upiID == "" {
@@ -547,33 +550,18 @@ func SubmitWhatsAppOrderToCentral(client *whatsmeow.Client, username, customerPh
 			payeeName = storeName
 		}
 
-		qrGenURL := strings.TrimSpace(resp.QRGeneratorURL)
-		if qrGenURL == "" {
-			qrGenURL = strings.TrimSpace(payCfg.QRGeneratorURL)
-		}
-		if qrGenURL == "" {
-			qrGenURL = ramstore.DefaultQRGeneratorURL
-		}
-
-		qrCloudName := strings.TrimSpace(resp.QRCloudName)
-		if qrCloudName == "" {
-			qrCloudName = strings.TrimSpace(payCfg.QRCloudName)
-		}
-		if qrCloudName == "" {
-			qrCloudName = strings.TrimSpace(payCfg.CloudinaryCloudName)
-		}
-		if qrCloudName == "" {
-			qrCloudName = ramstore.DefaultQRCloudName
-		}
-
-		if upiID != "" {
-			bannerURL, qrErr := GenerateBrandedBannerQR(qrGenURL, upiID, payeeName, ordID, finalAmount, qrCloudName)
-			if qrErr == nil && strings.TrimSpace(bannerURL) != "" {
-				resolvedQRURL = strings.TrimSpace(bannerURL)
-				log.Printf("🎨 [Banner QR Generated] Order #%s -> %s", ordID, resolvedQRURL)
+		upiStr := BuildUPIQRString(resp.UPIQRData, upiID, payeeName, ordID, finalAmount)
+		if upiStr != "" {
+			imgBytes, mimeType, qrErr := GenerateLocalBannerQRBytes(upiStr, payCfg.BannerTemplate)
+			if qrErr == nil && len(imgBytes) > 0 {
+				localQRBytes = imgBytes
+				localQRMime = mimeType
+				log.Printf("🎨 [Local Banner QR Generated] Order #%s | %s | %.1f KB (zero external worker)", ordID, mimeType, float64(len(imgBytes))/1024.0)
 			} else {
-				log.Printf("⚠️ [Banner QR Worker] Failed for Order #%s (%v) — falling back to Central payment_qr_url", ordID, qrErr)
+				log.Printf("⚠️ [Local Banner QR] Generation failed for Order #%s: %v", ordID, qrErr)
 			}
+		} else {
+			log.Printf("⚠️ [Local Banner QR] Missing UPI ID / upi_qr_data for Order #%s", ordID)
 		}
 	}
 
@@ -593,7 +581,7 @@ func SubmitWhatsAppOrderToCentral(client *whatsmeow.Client, username, customerPh
 		PaymentStatus:   payStatus,
 		OrderStatus:     ordStatus,
 		PaymentLink:     "",
-		PaymentQRURL:    resolvedQRURL,
+		PaymentQRURL:    "",
 		Source:          "whatsapp",
 		StatusUpdatedBy: "central",
 	})
@@ -610,27 +598,33 @@ func SubmitWhatsAppOrderToCentral(client *whatsmeow.Client, username, customerPh
 		)
 
 		qrSent := false
-		if resolvedQRURL != "" && client != nil && client.IsLoggedIn() {
-			if sendErr := SendImageFromURL(client, cleanPhone, resolvedQRURL, qrCaption); sendErr == nil {
+		if len(localQRBytes) > 0 && client != nil && client.IsLoggedIn() {
+			thumb := generateWhatsAppJPEGThumbnail(localQRBytes)
+			if sendErr := SendImageBytesWithThumb(client, cleanPhone, localQRBytes, thumb, localQRMime, qrCaption); sendErr == nil {
 				qrSent = true
 				SaveCustomerChatAndPrune(username, cleanPhone, "assistant", qrCaption)
 				PushToLiveChat(username, cleanPhone, qrCaption, "outgoing_ai")
 			} else {
-				log.Printf("⚠️ [Banner QR Image Send] Failed downloading/sending %s for Order #%s: %v", resolvedQRURL, ordID, sendErr)
+				log.Printf("⚠️ [Local Banner QR Send] WhatsApp upload/send failed for Order #%s: %v", ordID, sendErr)
 			}
 		}
+		// Release composite bytes immediately for GC
+		localQRBytes = nil
 
-		// Start non-blocking 3-second payment verification loop immediately after sending QR
+		// Start non-blocking 3-second direct Paytm payment verification loop immediately after sending QR
 		StartPaymentVerificationPoller(PaymentPollParams{
-			OrderID:         ordID,
-			CustomerPhone:   cleanPhone,
-			CustomerName:    custName,
-			DeliveryAddress: custAddr,
-			TotalAmount:     finalAmount,
-			PaytmMID:        resolvedPaytmMID,
-			VerifyEndpoint:  payCfg.VerifyEndpoint,
-			PollInterval:    time.Duration(payCfg.VerifyPollIntervalMS) * time.Millisecond,
-			PollTimeout:     time.Duration(payCfg.VerifyPollTimeoutMS) * time.Millisecond,
+			OrderID:                ordID,
+			CustomerPhone:          cleanPhone,
+			CustomerName:           custName,
+			DeliveryAddress:        custAddr,
+			TotalAmount:            finalAmount,
+			PaytmMID:               resolvedPaytmMID,
+			PaytmStatusURL:         payCfg.PaytmStatusURL,
+			PaymentConfirmEndpoint: payCfg.PaymentConfirmEndpoint,
+			LocalPaytmVerify:       payCfg.LocalPaytmVerify,
+			VerifyEndpoint:         payCfg.VerifyEndpoint,
+			PollInterval:           time.Duration(payCfg.VerifyPollIntervalMS) * time.Millisecond,
+			PollTimeout:            time.Duration(payCfg.VerifyPollTimeoutMS) * time.Millisecond,
 		})
 
 		if qrSent {
@@ -638,7 +632,7 @@ func SubmitWhatsAppOrderToCentral(client *whatsmeow.Client, username, customerPh
 			return "__QR_IMAGE_SENT__", resp, nil
 		}
 
-		// Fallback text only if QR image download/send failed (still ZERO payment links!)
+		// Fallback text only if QR generation/send failed (still ZERO payment links!)
 		return fmt.Sprintf(
 			"🏪 *%s*\n🧾 *Order ID:* #%s\n💰 *Total Amount:* ₹%.2f\n\nQR image load hone me thodi dikkat aayi — kripya store se sampark karein ya dobara try karein. 🙏",
 			storeName, ordID, finalAmount,

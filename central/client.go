@@ -54,6 +54,7 @@ type CentralOrderResponse struct {
 	TotalAmount         float64 `json:"total_amount"`
 	PaymentLink         string  `json:"payment_link,omitempty"`
 	PaymentQRURL        string  `json:"payment_qr_url,omitempty"`
+	UPIQRData           string  `json:"upi_qr_data,omitempty"`
 	PaymentInstructions string  `json:"payment_instructions,omitempty"`
 	UPIID               string  `json:"upi_id,omitempty"`
 	MerchantVPA         string  `json:"merchant_vpa,omitempty"`
@@ -62,6 +63,15 @@ type CentralOrderResponse struct {
 	QRGeneratorURL      string  `json:"qr_generator_url,omitempty"`
 	QRCloudName         string  `json:"qr_cloud_name,omitempty"`
 	Message             string  `json:"message,omitempty"`
+}
+
+// PaymentConfirmedEvent is sent as a single 1-shot sync call to Central Brain after Render verifies TXN_SUCCESS locally with Paytm.
+type PaymentConfirmedEvent struct {
+	OrderID       string  `json:"order_id"`
+	TxnID         string  `json:"txn_id"`
+	Amount        float64 `json:"amount"`
+	PaytmStatus   string  `json:"paytm_status"`
+	CustomerPhone string  `json:"customer_phone"`
 }
 
 // VerifyPaymentRequest is sent every 3 seconds to Central Brain's verify endpoint during an active ONLINE/UPI order.
@@ -722,9 +732,9 @@ func (c *SyncClient) SubmitOrderToCentral(req CentralOrderSubmission) (*CentralO
 	}
 
 	result := envelope.CentralOrderResponse
-	if envelope.Data != nil && (envelope.Data.OrderID != "" || envelope.Data.PaymentLink != "" || envelope.Data.PaymentQRURL != "" || envelope.Data.Message != "") {
+	if envelope.Data != nil && (envelope.Data.OrderID != "" || envelope.Data.UPIQRData != "" || envelope.Data.PaymentLink != "" || envelope.Data.PaymentQRURL != "" || envelope.Data.Message != "") {
 		result = *envelope.Data
-	} else if envelope.Order != nil && (envelope.Order.OrderID != "" || envelope.Order.PaymentLink != "" || envelope.Order.PaymentQRURL != "" || envelope.Order.Message != "") {
+	} else if envelope.Order != nil && (envelope.Order.OrderID != "" || envelope.Order.UPIQRData != "" || envelope.Order.PaymentLink != "" || envelope.Order.PaymentQRURL != "" || envelope.Order.Message != "") {
 		result = *envelope.Order
 	}
 	if result.PaymentMode == "" {
@@ -852,6 +862,94 @@ func (c *SyncClient) VerifyPayment(endpoint string, req VerifyPaymentRequest) (*
 		res.TotalAmount = res.Amount
 	}
 	return &res, nil
+}
+
+// PushPaymentConfirmedWithRetry notifies Central Brain ONCE after local Render Paytm verification receives TXN_SUCCESS.
+// Retries up to 3 times with exponential backoff (1s, 2s, 4s) on transient network failures.
+func (c *SyncClient) PushPaymentConfirmedWithRetry(endpoint string, evt PaymentConfirmedEvent) error {
+	if !c.IsConfigured() {
+		return fmt.Errorf("central brain node is not configured")
+	}
+	path := strings.TrimSpace(endpoint)
+	if path == "" {
+		path = ramstore.DefaultPaymentConfirmEndpoint
+	}
+	isFullURL := strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://")
+	if !isFullURL && !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+
+	evt.OrderID = strings.TrimSpace(evt.OrderID)
+	evt.TxnID = strings.TrimSpace(evt.TxnID)
+	evt.CustomerPhone = ramstore.NormalizePhone(evt.CustomerPhone)
+	if strings.TrimSpace(evt.PaytmStatus) == "" {
+		evt.PaytmStatus = "TXN_SUCCESS"
+	}
+
+	var lastErr error
+	backoff := 1 * time.Second
+	for attempt := 1; attempt <= 3; attempt++ {
+		if isFullURL {
+			c.mu.RLock()
+			apiKey := c.apiKey
+			c.mu.RUnlock()
+			b, mErr := json.Marshal(evt)
+			if mErr != nil {
+				return mErr
+			}
+			httpReq, rErr := http.NewRequest("POST", path, bytes.NewReader(b))
+			if rErr != nil {
+				return rErr
+			}
+			httpReq.Header.Set("Content-Type", "application/json")
+			httpReq.Header.Set("Authorization", "Bearer "+apiKey)
+			httpReq.Header.Set("X-Vendor-API-Key", apiKey)
+			httpReq.Header.Set("User-Agent", "VendorWhatsAppBotNode/2.5")
+			resp, dErr := c.httpClient.Do(httpReq)
+			if dErr == nil {
+				respBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
+				resp.Body.Close()
+				if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+					lastErr = nil
+				} else {
+					lastErr = fmt.Errorf("payment-confirmed HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(respBytes)))
+				}
+			} else {
+				lastErr = dErr
+			}
+		} else {
+			_, _, lastErr = c.doRequest("POST", path, evt)
+		}
+
+		if lastErr == nil {
+			ramstore.Global.UpdateSyncStatus(func(st *ramstore.SyncStatus) {
+				st.OutboundPushed++
+				st.LastSyncAt = time.Now()
+				st.Connected = true
+				st.LastError = ""
+			})
+			log.Printf("✅ [Central Payment Sync] Confirmed Order #%s (txn=%s) synced to Central Brain on attempt %d/3", evt.OrderID, evt.TxnID, attempt)
+			return nil
+		}
+
+		log.Printf("⚠️ [Central Payment Sync Attempt %d/3] Order #%s failed: %v", attempt, evt.OrderID, lastErr)
+		if attempt < 3 {
+			time.Sleep(backoff)
+			backoff *= 2
+		}
+	}
+
+	if !isFullURL {
+		c.storeInRetryBuffer(outboundJob{
+			Method:    "POST",
+			Path:      path,
+			Payload:   evt,
+			CreatedAt: time.Now(),
+			Attempts:  3,
+		})
+		c.updateQueueMetrics()
+	}
+	return lastErr
 }
 
 func (c *SyncClient) enqueue(method, path string, payload interface{}) {

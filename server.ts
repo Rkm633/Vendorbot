@@ -4,6 +4,10 @@ import crypto from 'crypto';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import QRCode from 'qrcode';
+import sharp from 'sharp';
+
+// CRITICAL for Render Free Tier 512MB RAM: disable libvips persistent decoded bitmap cache
+sharp.cache(false);
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -75,12 +79,42 @@ interface AIConfig {
   import_catalog: boolean;
 }
 
-const DEFAULT_QR_WORKER_BASE_URL = 'https://wamart.rkmtech633.workers.dev';
-const DEFAULT_QR_GENERATOR_URL = 'https://wamart.rkmtech633.workers.dev/generate';
-const DEFAULT_QR_CLOUD_NAME = 'hq67khm3';
+const DEFAULT_PAYTM_STATUS_URL = 'https://securegw.paytm.in/order/status';
+const DEFAULT_PAYMENT_CONFIRM_ENDPOINT = '/api/vendor-bot/events/payment-confirmed';
 const DEFAULT_VERIFY_ENDPOINT = '/api/payments/verify';
 const DEFAULT_VERIFY_POLL_INTERVAL_MS = 3000;
 const DEFAULT_VERIFY_POLL_TIMEOUT_MS = 300000;
+const DEFAULT_BANNER_QR_SIZE = 480;
+const DEFAULT_BANNER_QR_OFFSET_X = 0;
+const DEFAULT_BANNER_QR_OFFSET_Y = -130;
+const DEFAULT_BANNER_QR_PADDING = 14;
+const MAX_BLANK_BANNER_BYTES = 5 * 1024 * 1024;
+
+interface BannerTemplate {
+  enabled: boolean;
+  banner_url: string;
+  banner_width: number;
+  banner_height: number;
+  qr_size: number;
+  qr_offset_x: number;
+  qr_offset_y: number;
+  qr_padding: number;
+  updated_at: string;
+}
+
+function defaultBannerTemplate(): BannerTemplate {
+  return {
+    enabled: false,
+    banner_url: '',
+    banner_width: 0,
+    banner_height: 0,
+    qr_size: DEFAULT_BANNER_QR_SIZE,
+    qr_offset_x: DEFAULT_BANNER_QR_OFFSET_X,
+    qr_offset_y: DEFAULT_BANNER_QR_OFFSET_Y,
+    qr_padding: DEFAULT_BANNER_QR_PADDING,
+    updated_at: '',
+  };
+}
 
 interface PaymentConfig {
   enabled: boolean;
@@ -90,15 +124,16 @@ interface PaymentConfig {
   merchant_vpa: string;
   paytm_mid: string;
   payee_name: string;
-  cloudinary_cloud_name: string;
-  qr_worker_base_url: string;
-  qr_generator_url: string;
-  qr_cloud_name: string;
+  local_qr_generation: boolean;
+  local_paytm_verify: boolean;
+  paytm_status_url: string;
+  payment_confirm_endpoint: string;
   qr_only_mode: boolean;
   send_payment_link: boolean;
   verify_endpoint: string;
   verify_poll_interval_ms: number;
   verify_poll_timeout_ms: number;
+  banner_template: BannerTemplate;
 }
 
 interface ProductVariant {
@@ -120,6 +155,7 @@ interface Product {
   mrp: number;
   description: string;
   category: string;
+  tags?: string[];
   unit_type: string;
   variants?: ProductVariant[];
   stock_qty?: number | null;
@@ -443,6 +479,7 @@ function decodeProductItem(raw: any, fallbackIndex?: number): Product {
     mrp: parseFlexNumber(firstDefined(raw, 'mrp', 'compare_at_price'), 0),
     description: parseFlexString(firstDefined(raw, 'description', 'desc', 'short_description')),
     category: parseFlexString(firstDefined(raw, 'category', 'category_name')) || 'General',
+    tags: parseFlexStringArray(firstDefined(raw, 'tags', 'aliases', 'search_tags', 'keywords')),
     unit_type: parseFlexString(firstDefined(raw, 'unit_type', 'unit')) || 'pcs',
     variants: normalizeVariants(raw.variants),
     stock_qty: stockQty,
@@ -791,15 +828,16 @@ const ramStore = {
     merchant_vpa: '',
     paytm_mid: '',
     payee_name: '',
-    cloudinary_cloud_name: '',
-    qr_worker_base_url: DEFAULT_QR_WORKER_BASE_URL,
-    qr_generator_url: DEFAULT_QR_GENERATOR_URL,
-    qr_cloud_name: DEFAULT_QR_CLOUD_NAME,
+    local_qr_generation: true,
+    local_paytm_verify: true,
+    paytm_status_url: DEFAULT_PAYTM_STATUS_URL,
+    payment_confirm_endpoint: DEFAULT_PAYMENT_CONFIRM_ENDPOINT,
     qr_only_mode: true,
     send_payment_link: false,
     verify_endpoint: DEFAULT_VERIFY_ENDPOINT,
     verify_poll_interval_ms: DEFAULT_VERIFY_POLL_INTERVAL_MS,
     verify_poll_timeout_ms: DEFAULT_VERIFY_POLL_TIMEOUT_MS,
+    banner_template: defaultBannerTemplate(),
   } as PaymentConfig,
 
   products: new Map<string, Product>(),
@@ -1176,6 +1214,124 @@ function applyAISection(a: Record<string, any>): void {
   };
 }
 
+// Ultra-Low-RAM Blank Banner Raw Compressed Buffer Cache (~150-300 KB max, NEVER decoded RGBA bitmap)
+const blankBannerCache: {
+  rawBuffer: Buffer | null;
+  url: string;
+  updatedAt: string;
+  inFlightKey: string;
+} = {
+  rawBuffer: null,
+  url: '',
+  updatedAt: '',
+  inFlightKey: '',
+};
+
+function clearBlankBannerCache(): void {
+  if (blankBannerCache.rawBuffer) {
+    console.log('🧹 [BannerCache] Cleared blank banner bytes from RAM');
+  }
+  blankBannerCache.rawBuffer = null;
+  blankBannerCache.url = '';
+  blankBannerCache.updatedAt = '';
+  blankBannerCache.inFlightKey = '';
+}
+
+function getBlankBannerCacheStats(): { cached: boolean; size_bytes: number; url: string; updated_at: string } {
+  return {
+    cached: Boolean(blankBannerCache.rawBuffer && blankBannerCache.rawBuffer.length > 0),
+    size_bytes: blankBannerCache.rawBuffer ? blankBannerCache.rawBuffer.length : 0,
+    url: blankBannerCache.url,
+    updated_at: blankBannerCache.updatedAt,
+  };
+}
+
+async function downloadCompressedBannerBuffer(bannerUrl: string): Promise<Buffer> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 15000);
+  try {
+    const res = await fetch(bannerUrl, {
+      method: 'GET',
+      headers: { 'User-Agent': 'VendorWhatsAppBotNode/2.5' },
+      signal: ctrl.signal,
+    });
+    if (!res.ok) {
+      throw new Error(`HTTP ${res.status} downloading blank banner`);
+    }
+    const ab = await res.arrayBuffer();
+    const buf = Buffer.from(ab);
+    if (buf.length === 0) {
+      throw new Error('empty blank banner response');
+    }
+    if (buf.length > MAX_BLANK_BANNER_BYTES) {
+      throw new Error('blank banner exceeds 5MB RAM safety cap');
+    }
+    return buf;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function syncBlankBannerCacheAsync(tpl: BannerTemplate): void {
+  const cleanUrl = (tpl.banner_url || '').trim();
+  const cleanUpd = (tpl.updated_at || '').trim();
+  if (!tpl.enabled || !cleanUrl) {
+    clearBlankBannerCache();
+    return;
+  }
+  const key = `${cleanUrl}|${cleanUpd}`;
+  if (blankBannerCache.rawBuffer && blankBannerCache.url === cleanUrl && blankBannerCache.updatedAt === cleanUpd) {
+    return;
+  }
+  if (blankBannerCache.inFlightKey === key) return;
+  blankBannerCache.inFlightKey = key;
+
+  void downloadCompressedBannerBuffer(cleanUrl)
+    .then((buf) => {
+      blankBannerCache.rawBuffer = buf;
+      blankBannerCache.url = cleanUrl;
+      blankBannerCache.updatedAt = cleanUpd;
+      if (blankBannerCache.inFlightKey === key) blankBannerCache.inFlightKey = '';
+      console.log(`🖼️ [BannerCache] Cached blank banner raw bytes in RAM (${(buf.length / 1024).toFixed(1)} KB)`);
+    })
+    .catch((err: any) => {
+      if (blankBannerCache.inFlightKey === key) blankBannerCache.inFlightKey = '';
+      console.warn(`⚠️ [BannerCache] Failed downloading blank banner (${cleanUrl}): ${err?.message || String(err)}`);
+    });
+}
+
+async function getOrFetchBlankBannerBuffer(tpl: BannerTemplate): Promise<Buffer | null> {
+  const cleanUrl = (tpl.banner_url || '').trim();
+  const cleanUpd = (tpl.updated_at || '').trim();
+  if (!tpl.enabled || !cleanUrl) {
+    clearBlankBannerCache();
+    return null;
+  }
+  if (blankBannerCache.rawBuffer && blankBannerCache.url === cleanUrl && blankBannerCache.updatedAt === cleanUpd) {
+    return blankBannerCache.rawBuffer;
+  }
+  try {
+    const buf = await downloadCompressedBannerBuffer(cleanUrl);
+    blankBannerCache.rawBuffer = buf;
+    blankBannerCache.url = cleanUrl;
+    blankBannerCache.updatedAt = cleanUpd;
+    blankBannerCache.inFlightKey = '';
+    return buf;
+  } catch (err: any) {
+    console.warn(`⚠️ [BannerCache] On-demand banner fetch failed: ${err?.message || String(err)}`);
+    if (blankBannerCache.rawBuffer && blankBannerCache.url === cleanUrl) {
+      return blankBannerCache.rawBuffer;
+    }
+    return null;
+  }
+}
+
+function parseOptionalInt(val: any): number | undefined {
+  if (val === undefined || val === null || val === '') return undefined;
+  const n = Number(val);
+  return Number.isFinite(n) ? Math.round(n) : undefined;
+}
+
 function applyPaymentSection(p: Record<string, any>): void {
   const curr = ramStore.payment;
   const gateway = firstDefined(p, 'gateway', 'provider', 'payment_gateway') !== undefined
@@ -1193,24 +1349,18 @@ function applyPaymentSection(p: Record<string, any>): void {
   const merchantPhone = firstDefined(p, 'merchant_phone', 'phone') !== undefined
     ? parseFlexString(firstDefined(p, 'merchant_phone', 'phone'))
     : curr.merchant_phone;
-  const cloudinaryCloudName = p.cloudinary_cloud_name !== undefined && p.cloudinary_cloud_name !== null
-    ? parseFlexString(p.cloudinary_cloud_name)
-    : curr.cloudinary_cloud_name;
 
-  const qrWorkerBaseRaw = firstDefined(p, 'qr_worker_base_url');
-  const qrWorkerBaseUrl = (qrWorkerBaseRaw !== undefined ? parseFlexString(qrWorkerBaseRaw) : curr.qr_worker_base_url) || DEFAULT_QR_WORKER_BASE_URL;
-  const qrGenRaw = firstDefined(p, 'qr_generator_url');
-  const qrGeneratorUrl =
-    (qrGenRaw !== undefined ? parseFlexString(qrGenRaw) : '') ||
-    (qrWorkerBaseRaw !== undefined && qrWorkerBaseUrl ? `${qrWorkerBaseUrl.replace(/\/+$/, '')}/generate` : '') ||
-    curr.qr_generator_url ||
-    DEFAULT_QR_GENERATOR_URL;
-  const qrCloudRaw = firstDefined(p, 'qr_cloud_name');
-  const qrCloudName =
-    (qrCloudRaw !== undefined ? parseFlexString(qrCloudRaw) : '') ||
-    curr.qr_cloud_name ||
-    cloudinaryCloudName ||
-    DEFAULT_QR_CLOUD_NAME;
+  const localQrOpt = parseFlexBoolOpt(firstDefined(p, 'local_qr_generation'));
+  const localQrGeneration = localQrOpt !== undefined ? localQrOpt : (curr.local_qr_generation ?? true);
+  const localPaytmOpt = parseFlexBoolOpt(firstDefined(p, 'local_paytm_verify'));
+  const localPaytmVerify = localPaytmOpt !== undefined ? localPaytmOpt : (curr.local_paytm_verify ?? true);
+
+  const paytmStatusRaw = firstDefined(p, 'paytm_status_url');
+  const paytmStatusUrl = (paytmStatusRaw !== undefined ? parseFlexString(paytmStatusRaw) : curr.paytm_status_url) || DEFAULT_PAYTM_STATUS_URL;
+
+  const confirmEpRaw = firstDefined(p, 'payment_confirm_endpoint');
+  const paymentConfirmEndpoint = (confirmEpRaw !== undefined ? parseFlexString(confirmEpRaw) : curr.payment_confirm_endpoint) || DEFAULT_PAYMENT_CONFIRM_ENDPOINT;
+
   const qrOnlyOpt = parseFlexBoolOpt(firstDefined(p, 'qr_only_mode'));
   const qrOnlyMode = qrOnlyOpt !== undefined ? qrOnlyOpt : (curr.qr_only_mode ?? true);
   const sendLinkOpt = parseFlexBoolOpt(firstDefined(p, 'send_payment_link'));
@@ -1224,6 +1374,36 @@ function applyPaymentSection(p: Record<string, any>): void {
   const parsedTimeout = pollTimeoutRaw !== undefined ? Math.round(parseFlexNumber(pollTimeoutRaw, curr.verify_poll_timeout_ms || DEFAULT_VERIFY_POLL_TIMEOUT_MS)) : (curr.verify_poll_timeout_ms || DEFAULT_VERIFY_POLL_TIMEOUT_MS);
   const verifyPollTimeoutMs = parsedTimeout > 0 ? parsedTimeout : DEFAULT_VERIFY_POLL_TIMEOUT_MS;
 
+  // Parse payment.banner_template (preserving explicit 0 values for offset/padding)
+  const currTpl = curr.banner_template || defaultBannerTemplate();
+  let bannerTemplate: BannerTemplate = { ...currTpl };
+  const rawTpl = firstDefined(p, 'banner_template');
+  if (rawTpl === null) {
+    bannerTemplate = defaultBannerTemplate();
+  } else if (isPlainObject(rawTpl)) {
+    const tEnabled = parseFlexBoolOpt(firstDefined(rawTpl, 'enabled'));
+    const tUrlRaw = firstDefined(rawTpl, 'banner_url', 'url');
+    const tW = parseOptionalInt(firstDefined(rawTpl, 'banner_width', 'width'));
+    const tH = parseOptionalInt(firstDefined(rawTpl, 'banner_height', 'height'));
+    const tSize = parseOptionalInt(firstDefined(rawTpl, 'qr_size'));
+    const tOffX = parseOptionalInt(firstDefined(rawTpl, 'qr_offset_x'));
+    const tOffY = parseOptionalInt(firstDefined(rawTpl, 'qr_offset_y'));
+    const tPad = parseOptionalInt(firstDefined(rawTpl, 'qr_padding'));
+    const tUpdRaw = firstDefined(rawTpl, 'updated_at');
+
+    bannerTemplate = {
+      enabled: tEnabled !== undefined ? tEnabled : currTpl.enabled,
+      banner_url: tUrlRaw !== undefined ? parseFlexString(tUrlRaw) : currTpl.banner_url,
+      banner_width: tW !== undefined ? tW : currTpl.banner_width,
+      banner_height: tH !== undefined ? tH : currTpl.banner_height,
+      qr_size: tSize !== undefined && tSize > 0 ? tSize : (currTpl.qr_size || DEFAULT_BANNER_QR_SIZE),
+      qr_offset_x: tOffX !== undefined ? tOffX : currTpl.qr_offset_x,
+      qr_offset_y: tOffY !== undefined ? tOffY : currTpl.qr_offset_y,
+      qr_padding: tPad !== undefined && tPad >= 0 ? tPad : currTpl.qr_padding,
+      updated_at: tUpdRaw !== undefined ? parseFlexString(tUpdRaw) : currTpl.updated_at,
+    };
+  }
+
   const enabledOpt = parseFlexBoolOpt(firstDefined(p, 'enabled', 'online_payment_enabled', 'is_enabled', 'active'));
   const enabled = enabledOpt !== undefined ? enabledOpt : Boolean(gateway || merchantVpa || upiId || paytmMid || curr.enabled);
 
@@ -1235,16 +1415,20 @@ function applyPaymentSection(p: Record<string, any>): void {
     merchant_vpa: merchantVpa || upiId,
     paytm_mid: paytmMid,
     payee_name: payeeName,
-    cloudinary_cloud_name: cloudinaryCloudName,
-    qr_worker_base_url: qrWorkerBaseUrl,
-    qr_generator_url: qrGeneratorUrl,
-    qr_cloud_name: qrCloudName,
+    local_qr_generation: localQrGeneration,
+    local_paytm_verify: localPaytmVerify,
+    paytm_status_url: paytmStatusUrl,
+    payment_confirm_endpoint: paymentConfirmEndpoint,
     qr_only_mode: qrOnlyMode,
     send_payment_link: sendPaymentLink,
     verify_endpoint: verifyEndpoint,
     verify_poll_interval_ms: verifyPollIntervalMs,
     verify_poll_timeout_ms: verifyPollTimeoutMs,
+    banner_template: bannerTemplate,
   };
+
+  // Sync compressed blank banner bytes asynchronously (or immediately free RAM if disabled)
+  syncBlankBannerCacheAsync(bannerTemplate);
 }
 
 // Resiliently hydrates every top-level section independently so a malformed item in one section
@@ -1617,47 +1801,169 @@ function stopPaymentVerificationPoller(orderId: string): void {
   }
 }
 
-async function generateBrandedBannerQR(params: {
-  qrGeneratorUrl: string;
-  vpa: string;
+// Build UPI string strictly for QR encoding ONLY — NEVER send as text or clickable link!
+function buildUPIQRString(params: {
+  upiQrData?: string;
+  upiId: string;
   payeeName: string;
   orderId: string;
   amount: number;
-  cloudName: string;
-}): Promise<string> {
-  const endpoint = (params.qrGeneratorUrl || '').trim() || DEFAULT_QR_GENERATOR_URL;
-  const vpa = (params.vpa || '').trim();
-  if (!vpa) throw new Error('missing UPI VPA for branded banner QR generation');
-  const payee = (params.payeeName || '').trim() || ramStore.vendor.business_name || 'WaMart Store';
-  const cloudName = (params.cloudName || '').trim() || DEFAULT_QR_CLOUD_NAME;
+}): string {
+  const raw = (params.upiQrData || '').trim();
+  if (raw) return raw;
+  const vpa = (params.upiId || '').trim();
+  if (!vpa) return '';
+  const name = (params.payeeName || '').trim() || ramStore.vendor.business_name || 'Store';
+  return `upi://pay?pa=${vpa}&pn=${encodeURIComponent(name)}&tr=${encodeURIComponent(params.orderId.trim())}&am=${params.amount.toFixed(2)}&cu=INR`;
+}
+
+// Local In-Memory Dynamic Branded Banner QR Compositor (qrcode + sharp with sharp.cache(false))
+// Zero external QR Worker or Cloudinary dependency.
+async function generateLocalBannerQRBuffer(upiStr: string, tpl: BannerTemplate): Promise<{ buffer: Buffer; mimeType: string }> {
+  const cleanUri = (upiStr || '').trim();
+  if (!cleanUri) {
+    throw new Error('empty UPI QR data');
+  }
+
+  const bannerBytes = await getOrFetchBlankBannerBuffer(tpl);
+  if (bannerBytes && bannerBytes.length > 0) {
+    try {
+      const meta = await sharp(bannerBytes).metadata();
+      const bannerW = meta.width || tpl.banner_width || 1080;
+      const bannerH = meta.height || tpl.banner_height || 1350;
+
+      let qrSize = tpl.qr_size > 0 ? tpl.qr_size : DEFAULT_BANNER_QR_SIZE;
+      const minDim = Math.min(bannerW, bannerH);
+      if (minDim > 80 && qrSize > minDim - 20) {
+        qrSize = minDim - 20;
+      }
+      const offsetX = Number.isFinite(tpl.qr_offset_x) ? tpl.qr_offset_x : DEFAULT_BANNER_QR_OFFSET_X;
+      const offsetY = Number.isFinite(tpl.qr_offset_y) ? tpl.qr_offset_y : DEFAULT_BANNER_QR_OFFSET_Y;
+      const pad = tpl.qr_padding >= 0 ? tpl.qr_padding : DEFAULT_BANNER_QR_PADDING;
+
+      const qrX = Math.round((bannerW - qrSize) / 2) + offsetX;
+      const qrY = Math.round((bannerH - qrSize) / 2) + offsetY;
+
+      const qrPngBuf = await QRCode.toBuffer(cleanUri, {
+        type: 'png',
+        width: qrSize,
+        margin: 0,
+        errorCorrectionLevel: 'M',
+        color: { dark: '#000000', light: '#FFFFFF' },
+      });
+
+      const quietW = qrSize + pad * 2;
+      const quietH = qrSize + pad * 2;
+      const quietBoxBuf = await sharp({
+        create: {
+          width: quietW,
+          height: quietH,
+          channels: 4,
+          background: { r: 255, g: 255, b: 255, alpha: 1 },
+        },
+      })
+        .png()
+        .toBuffer();
+
+      const composited = await sharp(bannerBytes)
+        .composite([
+          { input: quietBoxBuf, left: Math.max(0, qrX - pad), top: Math.max(0, qrY - pad) },
+          { input: qrPngBuf, left: Math.max(0, qrX), top: Math.max(0, qrY) },
+        ])
+        .jpeg({ quality: 85 })
+        .toBuffer();
+
+      return { buffer: composited, mimeType: 'image/jpeg' };
+    } catch (err: any) {
+      console.warn(`⚠️ [LocalBannerQR] Banner composite fallback: ${err?.message || String(err)} — using standalone 500x500 PNG QR`);
+    }
+  }
+
+  // Fallback: standalone crisp 500x500 PNG UPI QR
+  const standalonePng = await QRCode.toBuffer(cleanUri, {
+    type: 'png',
+    width: 500,
+    margin: 2,
+    errorCorrectionLevel: 'M',
+    color: { dark: '#000000', light: '#FFFFFF' },
+  });
+  return { buffer: standalonePng, mimeType: 'image/png' };
+}
+
+// Direct Paytm Status API check (5-second HTTP timeout):
+// GET https://securegw.paytm.in/order/status?JsonData=<urlEncoded({"MID":"<mid>","ORDERID":"<order_id>"})>
+async function checkPaytmStatusDirect(statusUrl: string, paytmMid: string, orderId: string): Promise<{
+  STATUS?: string;
+  TXNID?: string;
+  TXNAMOUNT?: string;
+  ORDERID?: string;
+  RESPMSG?: string;
+}> {
+  const endpoint = (statusUrl || '').trim() || DEFAULT_PAYTM_STATUS_URL;
+  const jsonData = JSON.stringify({ MID: paytmMid.trim(), ORDERID: orderId.trim() });
+  const sep = endpoint.includes('?') ? '&' : '?';
+  const reqUrl = `${endpoint}${sep}JsonData=${encodeURIComponent(jsonData)}`;
 
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 15000);
+  const timer = setTimeout(() => ctrl.abort(), 5000);
   try {
-    const res = await fetch(endpoint, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        vpa,
-        name: payee,
-        orderId: params.orderId,
-        amount: params.amount,
-        cloudName,
-      }),
+    const res = await fetch(reqUrl, {
+      method: 'GET',
+      headers: { Accept: 'application/json', 'User-Agent': 'VendorWhatsAppBotNode/2.5' },
       signal: ctrl.signal,
     });
     const text = await res.text();
     if (!res.ok) {
-      throw new Error(`QR worker HTTP ${res.status}: ${text.slice(0, 200)}`);
+      throw new Error(`Paytm HTTP ${res.status}: ${text.slice(0, 160)}`);
     }
-    const parsed = text ? JSON.parse(text) : {};
-    const imageUrl = String(parsed?.imageUrl || parsed?.image_url || '').trim();
-    if (!imageUrl) {
-      throw new Error(`QR worker returned empty imageUrl (success=${String(parsed?.success)})`);
-    }
-    return imageUrl;
+    return text ? JSON.parse(text) : {};
   } finally {
     clearTimeout(timer);
+  }
+}
+
+// 1-Shot Central Brain payment-confirmed sync with 3 retries & exponential backoff (1s, 2s, 4s)
+async function pushPaymentConfirmedWithRetry(
+  endpoint: string,
+  evt: { order_id: string; txn_id: string; amount: number; paytm_status: string; customer_phone: string }
+): Promise<void> {
+  if (!centralNodeURL || !vendorApiKey) return;
+  const pathStr = (endpoint || '').trim() || DEFAULT_PAYMENT_CONFIRM_ENDPOINT;
+  const normalizedPath = pathStr.startsWith('http://') || pathStr.startsWith('https://') || pathStr.startsWith('/') ? pathStr : `/${pathStr}`;
+
+  let delayMs = 1000;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      if (normalizedPath.startsWith('http://') || normalizedPath.startsWith('https://')) {
+        const res = await fetch(normalizedPath, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Vendor-API-Key': vendorApiKey,
+            Authorization: `Bearer ${vendorApiKey}`,
+          },
+          body: JSON.stringify(evt),
+        });
+        if (!res.ok) {
+          throw new Error(`HTTP ${res.status}`);
+        }
+      } else {
+        await callCentralNode('POST', normalizedPath, evt);
+      }
+      ramStore.sync.outbound_pushed += 1;
+      ramStore.sync.last_sync_at = new Date().toISOString();
+      console.log(`✅ [CentralPaymentSync] Confirmed Order #${evt.order_id} (txn=${evt.txn_id}) synced on attempt ${attempt}/3`);
+      return;
+    } catch (err: any) {
+      console.warn(`⚠️ [CentralPaymentSync Attempt ${attempt}/3] Order #${evt.order_id} failed: ${err?.message || String(err)}`);
+      if (attempt < 3) {
+        await new Promise((r) => setTimeout(r, delayMs));
+        delayMs *= 2;
+      }
+    }
+  }
+  if (!normalizedPath.startsWith('http://') && !normalizedPath.startsWith('https://')) {
+    void pushToCentralAsync(normalizedPath, evt);
   }
 }
 
@@ -1711,14 +2017,19 @@ function startPaymentVerificationPoller(params: {
   paytmMid: string;
 }): void {
   const orderId = String(params.orderId || '').trim();
-  if (!orderId || !centralNodeURL || !vendorApiKey) return;
+  if (!orderId) return;
   if (activePaymentPollers.has(orderId)) return;
 
   const payCfg = ramStore.payment;
   const intervalMs = payCfg.verify_poll_interval_ms > 0 ? payCfg.verify_poll_interval_ms : DEFAULT_VERIFY_POLL_INTERVAL_MS;
   const timeoutMs = payCfg.verify_poll_timeout_ms > 0 ? payCfg.verify_poll_timeout_ms : DEFAULT_VERIFY_POLL_TIMEOUT_MS;
-  const verifyEndpoint = (payCfg.verify_endpoint || DEFAULT_VERIFY_ENDPOINT).trim() || DEFAULT_VERIFY_ENDPOINT;
   const paytmMid = (params.paytmMid || payCfg.paytm_mid || '').trim();
+  const paytmStatusUrl = (payCfg.paytm_status_url || DEFAULT_PAYTM_STATUS_URL).trim() || DEFAULT_PAYTM_STATUS_URL;
+  const confirmEndpoint = (payCfg.payment_confirm_endpoint || DEFAULT_PAYMENT_CONFIRM_ENDPOINT).trim() || DEFAULT_PAYMENT_CONFIRM_ENDPOINT;
+  const verifyEndpoint = (payCfg.verify_endpoint || DEFAULT_VERIFY_ENDPOINT).trim() || DEFAULT_VERIFY_ENDPOINT;
+  const useDirectPaytm = payCfg.local_paytm_verify !== false && Boolean(paytmMid);
+  if (!useDirectPaytm && (!centralNodeURL || !vendorApiKey)) return;
+
   const cleanPhone = normalizePhone(params.customerPhone);
 
   let inFlight = false;
@@ -1726,20 +2037,39 @@ function startPaymentVerificationPoller(params: {
     if (inFlight || !activePaymentPollers.has(orderId)) return;
     inFlight = true;
     try {
-      const username = (ramStore.vendor.username || '').trim();
-      const raw = await callCentralNode('POST', verifyEndpoint, {
-        order_id: orderId,
-        ORDERID: orderId,
-        username,
-        tenant_id: username,
-        paytm_mid: paytmMid,
-        source: 'vendor_bot',
-      });
-      const data = raw?.data && isPlainObject(raw.data) ? { ...raw, ...raw.data } : (raw || {});
-      const payStatus = String(data.payment_status || '').trim().toUpperCase();
-      const ordStatus = String(data.order_status || '').trim().toUpperCase();
-      const isPaid = data.is_paid === true || data.verified === true || payStatus === 'PAID';
-      const isCancelled = data.cancelled === true || payStatus === 'CANCELLED' || ordStatus === 'CANCELLED';
+      let isPaid = false;
+      let isCancelled = false;
+      let txnId = '';
+      let paidAmount = params.totalAmount;
+
+      if (useDirectPaytm) {
+        const pResp = await checkPaytmStatusDirect(paytmStatusUrl, paytmMid, orderId);
+        if (String(pResp?.STATUS || '').trim().toUpperCase() === 'TXN_SUCCESS') {
+          isPaid = true;
+          txnId = String(pResp?.TXNID || '').trim();
+          const parsedAmt = parseFloat(String(pResp?.TXNAMOUNT || ''));
+          if (Number.isFinite(parsedAmt) && parsedAmt > 0) {
+            paidAmount = parsedAmt;
+          }
+        }
+      } else {
+        const username = (ramStore.vendor.username || '').trim();
+        const raw = await callCentralNode('POST', verifyEndpoint, {
+          order_id: orderId,
+          ORDERID: orderId,
+          username,
+          tenant_id: username,
+          paytm_mid: paytmMid,
+          source: 'vendor_bot',
+        });
+        const data = raw?.data && isPlainObject(raw.data) ? { ...raw, ...raw.data } : (raw || {});
+        const payStatus = String(data.payment_status || '').trim().toUpperCase();
+        const ordStatus = String(data.order_status || '').trim().toUpperCase();
+        isPaid = data.is_paid === true || data.verified === true || payStatus === 'PAID';
+        isCancelled = data.cancelled === true || payStatus === 'CANCELLED' || ordStatus === 'CANCELLED';
+        txnId = String(data.txn_id || data.txnid || data.transaction_id || data.utr || '').trim();
+        if (Number(data.total_amount) > 0) paidAmount = Number(data.total_amount);
+      }
 
       if (isPaid) {
         stopPaymentVerificationPoller(orderId);
@@ -1752,7 +2082,7 @@ function startPaymentVerificationPoller(params: {
             customer_phone: cleanPhone,
             customer_name: existing?.customer_name || params.customerName,
             delivery_address: existing?.delivery_address || params.deliveryAddress,
-            total_amount: existing?.total_amount || params.totalAmount,
+            total_amount: paidAmount || existing?.total_amount || params.totalAmount,
             payment_mode: 'ONLINE',
             payment_status: 'PAID',
             order_status: 'CONFIRMED',
@@ -1765,18 +2095,27 @@ function startPaymentVerificationPoller(params: {
           current_state: 'ORDER_CONFIRMED',
           payment_status: 'PAID',
           current_order_id: '',
-          last_order_details: `Order #${orderId} (₹${params.totalAmount.toFixed(2)} • CONFIRMED & PAID)`,
+          last_order_details: `Order #${orderId} (₹${paidAmount.toFixed(2)} • CONFIRMED & PAID)`,
         });
 
         if (markOrderPaidNotifiedOnce(orderId)) {
-          const txnId = String(data.txn_id || data.txnid || data.transaction_id || data.utr || '').trim();
           sendPaidOrderConfirmationPreview({
             orderId,
             customerPhone: cleanPhone,
             customerName: params.customerName,
-            totalAmount: params.totalAmount,
+            totalAmount: paidAmount,
             txnId,
             deliveryAddress: params.deliveryAddress,
+          });
+        }
+
+        if (useDirectPaytm) {
+          void pushPaymentConfirmedWithRetry(confirmEndpoint, {
+            order_id: orderId,
+            txn_id: txnId,
+            amount: paidAmount,
+            paytm_status: 'TXN_SUCCESS',
+            customer_phone: cleanPhone,
           });
         }
         return;
@@ -1814,7 +2153,11 @@ function startPaymentVerificationPoller(params: {
   }, timeoutMs);
 
   activePaymentPollers.set(orderId, { timer, timeout });
-  console.log(`🔄 [PaymentPoller] Started 3s payment verify loop for Order #${orderId} (interval=${intervalMs}ms, timeout=${timeoutMs}ms, endpoint=${verifyEndpoint})`);
+  console.log(
+    useDirectPaytm
+      ? `🔄 [PaymentPoller] Started DIRECT Paytm 3s loop for Order #${orderId} (interval=${intervalMs}ms, timeout=${timeoutMs}ms)`
+      : `🔄 [PaymentPoller] Started fallback Central 3s loop for Order #${orderId} (interval=${intervalMs}ms, endpoint=${verifyEndpoint})`
+  );
 }
 
 async function submitWhatsAppOrderToCentral(phone: string, requestedMode: string): Promise<{ reply: string; order?: Order; qr_image_url?: string }> {
@@ -1864,12 +2207,10 @@ async function submitWhatsAppOrderToCentral(phone: string, requestedMode: string
   let centralStatus = mode === 'ONLINE' ? 'PENDING_PAYMENT' : 'PENDING_CONFIRMATION';
   let centralPayStatus = mode === 'COD' ? 'COD_PENDING' : 'PENDING';
   let centralTotal = subtotal;
-  let paymentQrUrl = '';
+  let upiQrData = '';
   let upiId = ramStore.payment.upi_id || ramStore.payment.merchant_vpa || '';
   let payeeName = ramStore.payment.payee_name || ramStore.vendor.business_name || 'WaMart Store';
   let paytmMid = ramStore.payment.paytm_mid || '';
-  let qrGeneratorUrl = ramStore.payment.qr_generator_url || DEFAULT_QR_GENERATOR_URL;
-  let qrCloudName = ramStore.payment.qr_cloud_name || ramStore.payment.cloudinary_cloud_name || DEFAULT_QR_CLOUD_NAME;
   let centralMsg = '';
 
   if (centralNodeURL && vendorApiKey) {
@@ -1883,13 +2224,11 @@ async function submitWhatsAppOrderToCentral(phone: string, requestedMode: string
         const parsedTotal = parseFlexNumber(data.total_amount, subtotal);
         if (parsedTotal > 0) centralTotal = parsedTotal;
       }
-      if (data.payment_qr_url) paymentQrUrl = String(data.payment_qr_url);
+      if (data.upi_qr_data) upiQrData = String(data.upi_qr_data);
       if (data.upi_id) upiId = String(data.upi_id);
       else if (data.merchant_vpa) upiId = String(data.merchant_vpa);
       if (data.payee_name) payeeName = String(data.payee_name);
       if (data.paytm_mid) paytmMid = String(data.paytm_mid);
-      if (data.qr_generator_url) qrGeneratorUrl = String(data.qr_generator_url);
-      if (data.qr_cloud_name) qrCloudName = String(data.qr_cloud_name);
       if (data.message) centralMsg = String(data.message);
       ramStore.sync.outbound_pushed += 1;
     } catch {
@@ -1897,21 +2236,22 @@ async function submitWhatsAppOrderToCentral(phone: string, requestedMode: string
     }
   }
 
-  let bannerQrUrl = paymentQrUrl;
+  let localQrDataUrl = '';
   if (mode === 'ONLINE') {
-    if (upiId) {
+    const upiStr = buildUPIQRString({
+      upiQrData,
+      upiId,
+      payeeName,
+      orderId: centralOrderId,
+      amount: centralTotal,
+    });
+    if (upiStr) {
       try {
-        bannerQrUrl = await generateBrandedBannerQR({
-          qrGeneratorUrl,
-          vpa: upiId,
-          payeeName,
-          orderId: centralOrderId,
-          amount: centralTotal,
-          cloudName: qrCloudName,
-        });
+        const { buffer, mimeType } = await generateLocalBannerQRBuffer(upiStr, ramStore.payment.banner_template);
+        localQrDataUrl = `data:${mimeType};base64,${buffer.toString('base64')}`;
+        console.log(`🎨 [LocalBannerQR] Generated Order #${centralOrderId} locally (${mimeType}, ${(buffer.length / 1024).toFixed(1)} KB)`);
       } catch (err: any) {
-        console.warn(`⚠️ [BrandedQR] Worker call failed for Order #${centralOrderId}: ${err?.message || String(err)} (falling back to payment_qr_url)`);
-        bannerQrUrl = paymentQrUrl;
+        console.warn(`⚠️ [LocalBannerQR] Failed for Order #${centralOrderId}: ${err?.message || String(err)}`);
       }
     }
   }
@@ -1931,7 +2271,7 @@ async function submitWhatsAppOrderToCentral(phone: string, requestedMode: string
       payment_status: centralPayStatus,
       order_status: centralStatus,
       payment_link: '',
-      payment_qr_url: bannerQrUrl,
+      payment_qr_url: '',
       estimated_delivery: ramStore.vendor.estimated_delivery_time,
       source: 'whatsapp',
     },
@@ -1966,7 +2306,7 @@ async function submitWhatsAppOrderToCentral(phone: string, requestedMode: string
     return {
       reply: caption,
       order: saved || undefined,
-      qr_image_url: bannerQrUrl || undefined,
+      qr_image_url: localQrDataUrl || undefined,
     };
   }
 
@@ -2112,6 +2452,332 @@ function formatCompactProductLine(p: Product): string {
   return `${p.id}|${p.name}|${cat}|₹${formatRupeeCompact(effectivePrice(p))}${unit}${varStr}${imgStr}`;
 }
 
+// =============================================================================
+// 4-LAYER STATIC HYBRID CATALOG SEARCH (Mirrors Go /whatsapp/smart_catalog.go)
+// =============================================================================
+
+const COMMERCE_SYNONYM_GROUPS: string[][] = [
+  ['sugar', 'chini', 'cheeni', 'shakkar', 'shakar', 'misri', 'mishri'],
+  ['atta', 'aata', 'ata', 'wheat', 'gehu', 'gehun', 'chakki', 'flour'],
+  ['maida', 'refined', 'allpurpose'],
+  ['besan', 'gram', 'chickpea'],
+  ['suji', 'sooji', 'rava', 'semolina'],
+  ['poha', 'chura', 'chivda', 'flattened'],
+  ['daliya', 'dalia', 'oats', 'porridge'],
+  ['sewai', 'sevai', 'vermicelli'],
+  ['rice', 'chawal', 'basmati', 'sona', 'kolam'],
+  ['dal', 'daal', 'lentil', 'pulses', 'arhar', 'toor', 'tuvar', 'moong', 'mung', 'masoor', 'urad', 'chana', 'rajma', 'chole', 'kabuli'],
+  ['mustard', 'sarso', 'sarson', 'kachi', 'ghani'],
+  ['oil', 'tel', 'tail', 'refind', 'refined', 'sunflower', 'soyabean', 'groundnut', 'olive'],
+  ['ghee', 'ghi', 'clarified'],
+  ['butter', 'makkhan', 'makhan'],
+  ['milk', 'doodh', 'dudh', 'dairy'],
+  ['curd', 'dahi', 'yogurt', 'yoghurt'],
+  ['paneer', 'cottage'],
+  ['buttermilk', 'chaas', 'chhaach', 'lassi', 'mattha'],
+  ['cheese', 'cheez'],
+  ['salt', 'namak', 'sendha', 'iodized'],
+  ['turmeric', 'haldi'],
+  ['chilli', 'chili', 'mirch', 'mirchi', 'lalmirch', 'kashmiri'],
+  ['coriander', 'dhaniya', 'dhania'],
+  ['cumin', 'jeera', 'jira'],
+  ['spice', 'spices', 'masala', 'masale', 'garam'],
+  ['pepper', 'kalimirch', 'blackpepper'],
+  ['cardamom', 'elaichi', 'ilaychi'],
+  ['clove', 'laung', 'long'],
+  ['cinnamon', 'dalchini'],
+  ['fenugreek', 'methi'],
+  ['fennel', 'saunf', 'sonf'],
+  ['carom', 'ajwain'],
+  ['asafoetida', 'hing', 'heeng'],
+  ['ginger', 'adrak', 'adarak'],
+  ['garlic', 'lahsun', 'lehsun', 'lasun'],
+  ['onion', 'pyaz', 'pyaaz', 'kanda'],
+  ['potato', 'aloo', 'alu'],
+  ['tomato', 'tamatar'],
+  ['lemon', 'nimbu', 'neebu'],
+  ['apple', 'seb'],
+  ['banana', 'kela'],
+  ['mango', 'aam'],
+  ['orange', 'santra', 'narangi'],
+  ['grapes', 'angoor', 'angur'],
+  ['pomegranate', 'anar', 'anaar'],
+  ['tea', 'chai', 'chay', 'patti', 'chaipatti'],
+  ['coffee', 'kafi', 'nescafe', 'bru'],
+  ['biscuit', 'biscuits', 'biskit', 'biskut', 'cookie', 'cookies', 'parle', 'britannia', 'marie', 'goodday', 'oreo'],
+  ['namkeen', 'snacks', 'snack', 'bhujia', 'bhujiya', 'mixture', 'sev', 'chips', 'kurkure', 'lays', 'haldiram'],
+  ['noodles', 'noodle', 'maggi', 'magi', 'yippee', 'pasta', 'macaroni', 'chowmein'],
+  ['chocolate', 'chocolates', 'choco', 'candy', 'toffee', 'kitkat', 'munch', 'perk'],
+  ['sweet', 'sweets', 'mithai', 'mithayi', 'laddu', 'ladoo', 'barfi', 'gulab', 'rasgulla', 'soan', 'papdi'],
+  ['bread', 'pav', 'bun', 'rusk', 'toast', 'cake', 'bakery', 'muffin', 'cupcake'],
+  ['juice', 'colddrink', 'drink', 'soda', 'beverage', 'coke', 'pepsi', 'sprite', 'frooti', 'maaza', 'real', 'tropicana'],
+  ['water', 'paani', 'pani', 'bisleri', 'mineral'],
+  ['jaggery', 'gur', 'gud'],
+  ['honey', 'shahad', 'sahad'],
+  ['pickle', 'achar', 'achaar'],
+  ['sauce', 'ketchup', 'chutney', 'jam', 'mayo', 'mayonnaise'],
+  ['soap', 'sabun', 'saabun', 'bath', 'lifebuoy', 'lux', 'dettol', 'detol', 'dove', 'pears', 'santoor'],
+  ['detergent', 'surf', 'washing', 'powder', 'rin', 'tide', 'ariel', 'wheel', 'ghadi', 'kapda'],
+  ['shampoo', 'hair', 'baal', 'conditioner', 'clinic', 'sunsilk', 'head', 'pantene', 'dove'],
+  ['toothpaste', 'paste', 'manjan', 'colgate', 'colgat', 'pepsodent', 'closeup', 'sensodyne', 'brush', 'toothbrush'],
+  ['facewash', 'cream', 'lotion', 'moisturizer', 'talc', 'deodorant', 'deo', 'perfume'],
+  ['dishwash', 'bartan', 'vim', 'pril', 'scrubber', 'utensil'],
+  ['cleaner', 'floor', 'toilet', 'harpic', 'lizol', 'phenyl', 'finayl', 'colin', 'domex'],
+  ['mosquito', 'machhar', 'machar', 'coil', 'allout', 'goodknight', 'mortien', 'hit', 'spray'],
+  ['diaper', 'diapers', 'pampers', 'huggies', 'mamy', 'baby', 'wipes'],
+  ['sanitary', 'pad', 'pads', 'whisper', 'stayfree', 'sofy'],
+  ['pooja', 'puja', 'agarbatti', 'incense', 'dhoop', 'kapoor', 'camphor', 'diya', 'batti', 'roli', 'chandan', 'kumkum'],
+  ['cough', 'khansi', 'khasi', 'cold', 'sardi', 'zukham', 'jukham', 'throat', 'gala', 'vicks', 'strepsils', 'honitus', 'inhaler'],
+  ['pain', 'dard', 'headache', 'sirdard', 'balm', 'zandu', 'amrutanjan', 'moov', 'volini', 'iodex', 'fever', 'bukhar'],
+  ['dryfruit', 'dryfruits', 'almond', 'badam', 'cashew', 'kaju', 'raisin', 'kishmish', 'kismis', 'walnut', 'akhrot', 'pistachio', 'pista', 'makhana', 'dates', 'khajoor'],
+  ['peanut', 'peanuts', 'moongfali', 'mungfali', 'singdana'],
+  ['coconut', 'nariyal', 'kopra'],
+  ['soya', 'soybean', 'soyabean', 'nutrela', 'chunks'],
+  ['egg', 'eggs', 'anda', 'ande'],
+  ['chicken', 'murga', 'mutton', 'meat', 'fish', 'machli'],
+  ['matchbox', 'machis', 'candle', 'mombatti'],
+  ['battery', 'cell', 'eveready', 'duracell'],
+  ['notebook', 'copy', 'register', 'pen', 'pencil', 'eraser', 'stationery'],
+  ['tiffin', 'lunchbox', 'kids', 'bachha', 'bachhe', 'school'],
+  ['guest', 'mehmaan', 'mehman', 'party'],
+];
+
+const FILLER_ORDER_WORDS = new Set([
+  'kilo', 'kg', 'gm', 'gms', 'gram', 'grams', 'ltr', 'litre', 'liter', 'ml',
+  'pkt', 'pkts', 'packet', 'packets', 'pack', 'packs', 'pcs', 'pc', 'piece', 'pieces',
+  'bottle', 'bottles', 'btl', 'box', 'boxes', 'dozen', 'pouch', 'bag', 'jar',
+  'mujhe', 'mujhko', 'chahiye', 'chahie', 'dena', 'dijiye', 'de', 'do', 'bhej', 'bhejo', 'bhejna',
+  'add', 'kar', 'karo', 'kardo', 'krdo', 'please', 'pls', 'plz', 'bhai', 'bhaiya', 'sir', 'ji',
+  'ka', 'ke', 'ki', 'ko', 'se', 'me', 'mein', 'ek', 'aur', 'and', 'or', 'ya',
+  'wala', 'wali', 'wale', 'want', 'need', 'send', 'give', 'get', 'order', 'item', 'items',
+  'batao', 'dikhao', 'hai', 'hain', 'hoga', 'kya', 'rate', 'price', 'kitna', 'kitne', 'kaun', 'sa',
+  'sabse', 'accha', 'acha', 'best', 'fresh', 'new', 'cart', 'list', 'ye', 'yeh', 'wo', 'woh',
+  'mera', 'meri', 'mere', 'apna', 'bhi', 'toh', 'thoda', 'kuch', 'kuchh', 'saman', 'saaman',
+]);
+
+const CHECKOUT_ONLY_WORDS = new Set([
+  'cod', 'cash', 'online', 'upi', 'paytm', 'gpay', 'phonepe', 'qr', 'pay', 'payment',
+  'confirm', 'confirmed', 'proceed', 'checkout', 'place', 'submit', 'yes', 'haan', 'han', 'ha',
+  'ok', 'okay', 'theek', 'thik', 'done', 'address', 'addr', 'pincode', 'pin', 'sector', 'road',
+  'nagar', 'colony', 'flat', 'house', 'gali', 'mohalla', 'near', 'behind', 'opposite', 'floor',
+  'tower', 'block', 'phase', 'village', 'post', 'dist', 'district', 'state', 'city', 'mobile',
+  'phone', 'number', 'name', 'naam', 'mera', 'hai', 'deliver', 'delivery', 'kar', 'do', 'karo',
+  'kardo', 'bhej', 'bhejo', 'order', 'bill', 'total', 'cancel', 'status', 'track', 'paid',
+]);
+
+function phoneticKey(word: string): string {
+  const w = word
+    .toLowerCase()
+    .trim()
+    .replace(/chh/g, 'ch')
+    .replace(/ph/g, 'f')
+    .replace(/sh/g, 's')
+    .replace(/kh/g, 'k')
+    .replace(/gh/g, 'g')
+    .replace(/bh/g, 'b')
+    .replace(/dh/g, 'd')
+    .replace(/th/g, 't')
+    .replace(/ee/g, 'i')
+    .replace(/oo/g, 'u')
+    .replace(/aa/g, 'a')
+    .replace(/ck/g, 'k')
+    .replace(/z/g, 'j')
+    .replace(/w/g, 'v')
+    .replace(/q/g, 'k')
+    .replace(/y/g, 'i')
+    .replace(/[^a-z0-9]/g, '');
+  let out = '';
+  for (let i = 0; i < w.length; i++) {
+    if (i === 0 || w[i] !== w[i - 1]) out += w[i];
+  }
+  return out;
+}
+
+const SYNONYM_LOOKUP = new Map<string, string[]>();
+const PHONETIC_SYN_LOOKUP = new Map<string, string[]>();
+for (const group of COMMERCE_SYNONYM_GROUPS) {
+  const clean = group.map((w) => w.toLowerCase().trim()).filter(Boolean);
+  for (const w of clean) {
+    SYNONYM_LOOKUP.set(w, Array.from(new Set([...(SYNONYM_LOOKUP.get(w) || []), ...clean])));
+    const pk = phoneticKey(w);
+    if (pk.length >= 3) {
+      PHONETIC_SYN_LOOKUP.set(pk, Array.from(new Set([...(PHONETIC_SYN_LOOKUP.get(pk) || []), ...clean])));
+    }
+  }
+}
+
+function levenshteinWithin(a: string, b: string, maxDist: number): boolean {
+  if (a === b) return true;
+  if (Math.abs(a.length - b.length) > maxDist) return false;
+  let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+  let curr = new Array<number>(b.length + 1);
+  for (let i = 1; i <= a.length; i++) {
+    curr[0] = i;
+    let rowMin = i;
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      const val = Math.min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + cost);
+      curr[j] = val;
+      if (val < rowMin) rowMin = val;
+    }
+    if (rowMin > maxDist) return false;
+    [prev, curr] = [curr, prev];
+  }
+  return prev[b.length] <= maxDist;
+}
+
+interface IndexedProduct {
+  p: Product;
+  nameLow: string;
+  catLow: string;
+  descLow: string;
+  tagsLow: string;
+  variantLow: string;
+  nameTokens: string[];
+  phonTokens: string[];
+}
+
+function tokenizeClean(s: string): string[] {
+  return Array.from(
+    new Set(
+      s
+        .toLowerCase()
+        .replace(/[^a-z0-9\s]+/g, ' ')
+        .split(/\s+/)
+        .filter((t) => t.length >= 2)
+    )
+  );
+}
+
+function buildIndexedProducts(products: Product[]): IndexedProduct[] {
+  return products.map((p) => {
+    const nameLow = p.name.toLowerCase().trim();
+    const catLow = (p.category || '').toLowerCase().trim();
+    const descLow = (p.description || '').toLowerCase().trim();
+    const tagsLow = (p.tags || []).join(' ').toLowerCase().trim();
+    const variantLow = (p.variants || []).map((v) => v.name.toLowerCase()).join(' ');
+    const nameTokens = tokenizeClean(nameLow);
+    const allTokens = tokenizeClean(`${nameLow} ${catLow} ${tagsLow} ${variantLow} ${descLow}`);
+    const phonTokens = Array.from(new Set(allTokens.map(phoneticKey).filter((k) => k.length >= 3)));
+    return { p, nameLow, catLow, descLow, tagsLow, variantLow, nameTokens, phonTokens };
+  });
+}
+
+const QTY_UNIT_RE = /\b(\d+(?:\.\d+)?)\s*(kg|kilo|g|gm|gms|gram|grams|l|ltr|litre|liter|ml|pkt|pkts|packet|packets|pack|packs|pcs|pc|piece|pieces|bottle|bottles|btl|box|boxes|dozen|dz|jar|tin|pouch|bag|sachet|strip|strips|x)\b/gi;
+
+function extractSearchTokensAndHint(rawChunk: string): { tokens: string[]; unitHint: string } {
+  const low = rawChunk.toLowerCase().trim();
+  let unitHint = '';
+  const unitMatch = /\b(\d+(?:\.\d+)?)\s*(kg|kilo|g|gm|gms|gram|grams|l|ltr|litre|liter|ml)\b/i.exec(low);
+  if (unitMatch) {
+    let u = unitMatch[2].toLowerCase();
+    if (u === 'kilo') u = 'kg';
+    else if (u === 'gm' || u === 'gms' || u === 'gram' || u === 'grams') u = 'g';
+    else if (u === 'ltr' || u === 'litre' || u === 'liter') u = 'l';
+    unitHint = `${unitMatch[1]}${u}`;
+  }
+  const cleaned = low.replace(QTY_UNIT_RE, ' ').replace(/[^a-z0-9\s]+/g, ' ');
+  const tokens = Array.from(
+    new Set(
+      cleaned
+        .split(/\s+/)
+        .filter((f) => f.length >= 2 && !/^\d+$/.test(f) && !FILLER_ORDER_WORDS.has(f) && !RAG_STOP_WORDS.has(f))
+    )
+  );
+  return { tokens, unitHint };
+}
+
+function scoreIndexedProduct(ip: IndexedProduct, rawChunk: string, tokens: string[], unitHint: string): number {
+  if (tokens.length === 0) return 0;
+  let score = 0;
+  const chunkLow = rawChunk.toLowerCase().trim();
+  if (ip.nameLow.length >= 3 && chunkLow.includes(ip.nameLow)) score += 20;
+
+  let matchedToks = 0;
+  for (const tok of tokens) {
+    let tokScore = 0;
+    const tokPhon = phoneticKey(tok);
+    const synList = Array.from(
+      new Set([...(SYNONYM_LOOKUP.get(tok) || []), ...(tokPhon.length >= 3 ? PHONETIC_SYN_LOOKUP.get(tokPhon) || [] : [])])
+    ).filter((s) => s !== tok);
+
+    if (ip.nameLow.includes(tok)) tokScore = Math.max(tokScore, 10);
+    for (const nt of ip.nameTokens) {
+      if (nt === tok) tokScore = Math.max(tokScore, 14);
+      else if (tok.length >= 4 && nt.startsWith(tok)) tokScore = Math.max(tokScore, 11);
+    }
+    if (ip.tagsLow && ip.tagsLow.includes(tok)) tokScore = Math.max(tokScore, 10);
+    if (ip.catLow.includes(tok)) tokScore = Math.max(tokScore, 6);
+    if (ip.descLow.includes(tok)) tokScore = Math.max(tokScore, 3);
+
+    if (tokScore < 12) {
+      for (const syn of synList) {
+        if (ip.nameLow.includes(syn)) tokScore = Math.max(tokScore, 11);
+        else if (ip.tagsLow && ip.tagsLow.includes(syn)) tokScore = Math.max(tokScore, 9);
+        else if (ip.catLow.includes(syn)) tokScore = Math.max(tokScore, 6);
+        else if (ip.descLow.includes(syn)) tokScore = Math.max(tokScore, 3);
+      }
+    }
+
+    if (tokScore < 8 && tok.length >= 4) {
+      if (tokPhon.length >= 3 && ip.phonTokens.includes(tokPhon)) {
+        tokScore = Math.max(tokScore, 9);
+      }
+      if (tokScore < 7) {
+        const maxDist = tok.length >= 6 ? 2 : 1;
+        for (const nt of ip.nameTokens) {
+          if (nt.length >= 4 && levenshteinWithin(tok, nt, maxDist)) {
+            tokScore = Math.max(tokScore, 8);
+            break;
+          }
+        }
+      }
+    }
+
+    if (tokScore > 0) {
+      matchedToks++;
+      score += tokScore;
+    }
+  }
+
+  if (tokens.length >= 2 && matchedToks === tokens.length) score += 8;
+  else if (tokens.length >= 2 && matchedToks === 0) return 0;
+
+  if (score > 0 && unitHint) {
+    if (ip.nameLow.replace(/\s+/g, '').includes(unitHint) || ip.variantLow.replace(/\s+/g, '').includes(unitHint)) {
+      score += 5;
+    }
+  }
+  return score;
+}
+
+function splitCustomerItemLines(msg: string): string[] {
+  const s = msg.trim().replace(/(?:^|\s)\d{1,2}[.)]\s+/g, '\n');
+  if (!s) return [];
+  const chunks: string[] = [];
+  for (const part of s.split(/[\n\r,;•|]+/)) {
+    for (const sub of part.split(/\s+(?:aur|and|\+|&)\s+/i)) {
+      const clean = sub
+        .trim()
+        .replace(/^(?:[-*•]+|\d{1,2}[.)])\s*/, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+      if (clean.length < 2) continue;
+      if (extractSearchTokensAndHint(clean).tokens.length === 0) continue;
+      chunks.push(clean);
+      if (chunks.length >= 35) return chunks;
+    }
+  }
+  return chunks;
+}
+
+function isPureCheckoutOrProfileMessage(msg: string, hasCart: boolean): boolean {
+  if (!hasCart) return false;
+  const toks = tokenizeClean(msg);
+  if (toks.length === 0) return true;
+  return toks.every((t) => /^\d+$/.test(t) || CHECKOUT_ONLY_WORDS.has(t) || FILLER_ORDER_WORDS.has(t) || RAG_STOP_WORDS.has(t));
+}
+
 function buildSmartCompactInventory(
   inStockProducts: Product[],
   query: string,
@@ -2135,55 +2801,97 @@ function buildSmartCompactInventory(
     return `CATS: ${catSummary}\nINV(id|name|cat|price|vars):\n${inStockProducts.map(formatCompactProductLine).join('\n')}`;
   }
 
+  const cartProds = inStockProducts.filter((p) => cartProductIDs.has(p.id));
+  if (isPureCheckoutOrProfileMessage(query, cartProds.length > 0)) {
+    return `CATS: ${catSummary}\nINV(checkout mode — cart items only):\n${cartProds.map(formatCompactProductLine).join('\n')}`;
+  }
+
+  const indexed = buildIndexedProducts(inStockProducts);
+  const itemChunks = splitCustomerItemLines(query);
+  if (itemChunks.length >= 2) {
+    const clearLines: string[] = [];
+    const optionLines: string[] = [];
+    const unmatched: string[] = [];
+    const includedIds = new Set<string>();
+    let totalLines = 0;
+
+    for (const chunk of itemChunks) {
+      const { tokens, unitHint } = extractSearchTokensAndHint(chunk);
+      if (tokens.length === 0) continue;
+      const scored = indexed
+        .map((ip) => ({ ip, score: scoreIndexedProduct(ip, chunk, tokens, unitHint) }))
+        .filter((x) => x.score >= 6)
+        .sort((a, b) => b.score - a.score);
+
+      if (scored.length === 0) {
+        unmatched.push(chunk);
+        continue;
+      }
+
+      const top = scored[0];
+      const isClear = top.score >= 12 && (scored.length === 1 || top.score >= scored[1].score + 6);
+      if (isClear) {
+        clearLines.push(`• ${chunk} => ${formatCompactProductLine(top.ip.p)}`);
+        if (!includedIds.has(top.ip.p.id)) {
+          includedIds.add(top.ip.p.id);
+          totalLines++;
+        }
+      } else {
+        const limit = scored.length >= 3 && scored[2].score >= top.score - 2 && totalLines < 40 ? 3 : Math.min(2, scored.length);
+        const opts: string[] = [];
+        for (let k = 0; k < limit; k++) {
+          if (totalLines >= 42 && !includedIds.has(scored[k].ip.p.id)) break;
+          opts.push(formatCompactProductLine(scored[k].ip.p));
+          if (!includedIds.has(scored[k].ip.p.id)) {
+            includedIds.add(scored[k].ip.p.id);
+            totalLines++;
+          }
+        }
+        if (opts.length > 0) optionLines.push(`• ${chunk} => ${opts.join(' OR ')}`);
+      }
+    }
+
+    if (clearLines.length > 0 || optionLines.length > 0) {
+      const parts = [`CATS: ${catSummary}`, `MULTI_ITEM_MATCH(${clearLines.length + optionLines.length} lines matched from ${inStockProducts.length} in-stock):`];
+      if (clearLines.length > 0) parts.push(`CLEAR_MATCH(ready to add):\n${clearLines.join('\n')}`);
+      if (optionLines.length > 0) parts.push(`VARIETY_OPTIONS(ask/pick best):\n${optionLines.join('\n')}`);
+      if (unmatched.length > 0) parts.push(`UNMATCHED(use search_catalog if indirect need, else inform): ${unmatched.join(', ')}`);
+      const extraCart = cartProds.filter((cp) => !includedIds.has(cp.id)).map(formatCompactProductLine);
+      if (extraCart.length > 0) parts.push(`IN_CART_REF:\n${extraCart.join('\n')}`);
+      return parts.join('\n');
+    }
+  }
+
   const prevUserMsgs = history.filter((m) => m.role === 'user').slice(-2).map((m) => m.content);
-  const combinedQuery = `${query} ${prevUserMsgs.join(' ')}`.toLowerCase();
-  const keywords = Array.from(
-    new Set(
-      combinedQuery
-        .split(/\s+/)
-        .map((t) => t.replace(/^[.,!?\-_" '#()[\]{}:;]+|[.,!?\-_" '#()[\]{}:;]+$/g, ''))
-        .filter((t) => t.length >= 3 && !RAG_STOP_WORDS.has(t))
-    )
-  );
+  const combinedQuery = `${query} ${prevUserMsgs.join(' ')}`;
+  const { tokens, unitHint } = extractSearchTokensAndHint(combinedQuery);
 
   const selectedIds = new Set<string>();
   const selected: Product[] = [];
-  for (const p of inStockProducts) {
-    if (cartProductIDs.has(p.id) && !selectedIds.has(p.id)) {
-      selectedIds.add(p.id);
-      selected.push(p);
-    }
+  for (const cp of cartProds) {
+    selectedIds.add(cp.id);
+    selected.push(cp);
   }
 
-  if (keywords.length > 0) {
-    const scored = inStockProducts
-      .filter((p) => !selectedIds.has(p.id))
-      .map((p) => {
-        const nameLow = p.name.toLowerCase();
-        const catLow = (p.category || '').toLowerCase();
-        const descLow = (p.description || '').toLowerCase();
-        let score = nameLow.length >= 3 && combinedQuery.includes(nameLow) ? 10 : 0;
-        for (const kw of keywords) {
-          if (nameLow.includes(kw)) score += 4;
-          else if (catLow.includes(kw)) score += 3;
-          else if (descLow.includes(kw)) score += 1;
-        }
-        return { p, score };
-      })
-      .filter((x) => x.score > 0)
-      .sort((a, b) => b.score - a.score);
+  const scored =
+    tokens.length > 0
+      ? indexed
+          .filter((ip) => !selectedIds.has(ip.p.id))
+          .map((ip) => ({ ip, score: scoreIndexedProduct(ip, combinedQuery, tokens, unitHint) }))
+          .filter((x) => x.score >= 5)
+          .sort((a, b) => b.score - a.score)
+      : [];
 
-    for (const item of scored) {
-      if (selected.length >= 12) break;
-      selectedIds.add(item.p.id);
-      selected.push(item.p);
-    }
+  for (const item of scored) {
+    if (selected.length >= 14) break;
+    selectedIds.add(item.ip.p.id);
+    selected.push(item.ip.p);
   }
 
-  if (selected.length < 8) {
+  if (selected.length < 6) {
     const cats = Array.from(catBuckets.values());
     let round = 0;
-    while (selected.length < 10) {
+    while (selected.length < 8) {
       let added = false;
       for (const bucket of cats) {
         if (round < bucket.length) {
@@ -2192,7 +2900,7 @@ function buildSmartCompactInventory(
             selectedIds.add(p.id);
             selected.push(p);
             added = true;
-            if (selected.length >= 10) break;
+            if (selected.length >= 8) break;
           }
         }
       }
@@ -2201,7 +2909,36 @@ function buildSmartCompactInventory(
     }
   }
 
-  return `CATS: ${catSummary}\nINV(showing ${selected.length}/${inStockProducts.length} relevant; id|name|cat|price|vars):\n${selected.map(formatCompactProductLine).join('\n')}`;
+  const hint =
+    scored.length === 0 && tokens.length > 0
+      ? '\nHINT: 0 direct keyword hits. If customer described a need/use-case, call search_catalog hand with product keywords or categories from CATS.'
+      : '';
+  return `CATS: ${catSummary}\nINV(showing ${selected.length}/${inStockProducts.length} relevant; id|name|cat|price|vars):\n${selected.map(formatCompactProductLine).join('\n')}${hint}`;
+}
+
+function executeSearchCatalogHand(inStockProducts: Product[], queries: string[], categories: string[]): string {
+  if (inStockProducts.length === 0) return 'SEARCH_RESULTS: No in-stock products available.';
+  const indexed = buildIndexedProducts(inStockProducts);
+  const cleanCats = categories.map((c) => c.toLowerCase().trim()).filter(Boolean);
+  const combinedQ = queries.join(' ');
+  const { tokens, unitHint } = extractSearchTokensAndHint(combinedQ);
+
+  const results = indexed
+    .map((ip) => {
+      let sc = tokens.length > 0 ? scoreIndexedProduct(ip, combinedQ, tokens, unitHint) : 0;
+      for (const wantCat of cleanCats) {
+        if (ip.catLow === wantCat || ip.catLow.includes(wantCat) || wantCat.includes(ip.catLow)) sc += 12;
+      }
+      return { p: ip.p, score: sc };
+    })
+    .filter((x) => x.score > 0)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 15);
+
+  if (results.length === 0) {
+    return `SEARCH_RESULTS(0 matches): None of those exact items are currently in stock. Politely inform customer and suggest available categories from CATS.`;
+  }
+  return `SEARCH_RESULTS(${results.length} in-stock matches; id|name|cat|price|vars):\n${results.map((r) => formatCompactProductLine(r.p)).join('\n')}`;
 }
 
 async function callGroqPool(
@@ -2408,8 +3145,8 @@ TONE & WHATSAPP STYLE:
 • Use WhatsApp blockquote (> ) ONLY sparingly for highlight boxes (> 🧾 *Total* / > 💳 *Payment*), never on every line.
 • Set "quote_reply":true ONLY when directly answering a specific question/price/item/complaint; false for normal greetings/chat flow.
 
-HANDS: send_catalog_images, update_cart, extract_profile, submit_order (payment_mode: COD|ONLINE), generate_store_link, clear_cart, cancel_order, escalate_to_human.
-RULES: NEVER suggest out-of-stock items. NEVER ask for UTR/screenshots or mark orders Paid locally — Central Brain verifies online payment & sends confirmation + PDF receipt. On a customer's FIRST message, politely request them to write their full message together in one message (not in small pieces).
+HANDS: search_catalog ({"queries":[...],"categories":[...]} — ONLY if customer describes indirect need or item not in INV), send_catalog_images, update_cart (add CLEAR_MATCH immediately; ask for VARIETY_OPTIONS), extract_profile, submit_order (payment_mode: COD|ONLINE), generate_store_link, clear_cart, cancel_order, escalate_to_human.
+RULES: NEVER suggest out-of-stock items. Only quote IDs/prices in INV/CLEAR_MATCH/VARIETY_OPTIONS/SEARCH_RESULTS. NEVER ask for UTR/screenshots or mark orders Paid locally — Central Brain verifies online payment & sends confirmation + PDF receipt. On a customer's FIRST message, politely request them to write their full message together in one message (not in small pieces).
 ${ramStore.ai.system_prompt ? `VENDOR NOTE: ${compactStr(ramStore.ai.system_prompt, 280)}\n` : ''}STORE: Hrs:${ramStore.vendor.operating_hours} | ETA:${ramStore.vendor.estimated_delivery_time} | MinOrd:₹${formatRupeeCompact(ramStore.vendor.min_order_amount)} | Pay:${payMode}
 
 STATE:${currentCart.length > 0 ? 'CART_ACTIVE' : 'BROWSING'} | ${cartLine}
@@ -2420,92 +3157,138 @@ ${inventoryBlock}`;
     const groqKeys = candidateKeys.filter((k) => isGroqProvider(provider, k));
     const otherKeys = candidateKeys.filter((k) => !isGroqProvider(provider, k));
 
-    if (groqKeys.length > 0) {
-      const groqRes = await callGroqPool(groqKeys, systemPrompt, finalHistory, ramStore.ai.temperature || 0.72);
-      if (groqRes?.text) {
-        const match = groqRes.text.match(/\{[\s\S]*\}/);
-        if (match) {
-          try {
-            const parsed = JSON.parse(match[0]);
-            return {
-              ai_reply_text: String(parsed.ai_reply_text || parsed.reply_to_customer || '').trim(),
-              quote_reply: Boolean(parsed.quote_reply),
-              actions: Array.isArray(parsed.actions) ? parsed.actions : [],
-              engine: `groq:${groqRes.model} (key #${groqRes.keyIdx + 1}/${groqKeys.length})`,
-              key_used_index: groqRes.keyIdx,
-            };
-          } catch {
-            // Fall through to backup keys / deterministic responder
-          }
-        }
-      }
-    }
-
-    for (let idx = 0; idx < otherKeys.length; idx++) {
-      const apiKey = otherKeys[idx];
-      try {
-        let rawText = '';
-        if (provider === 'gemini' || apiKey.startsWith('AIzaSy')) {
-          const model = ramStore.ai.model?.includes('gemini') ? ramStore.ai.model : 'gemini-2.0-flash';
-          const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              system_instruction: { parts: [{ text: systemPrompt }] },
-              contents: finalHistory.map((m) => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] })),
-              generationConfig: { temperature: ramStore.ai.temperature || 0.72, maxOutputTokens: 600, response_mime_type: 'application/json' },
-            }),
-            signal: AbortSignal.timeout(15000),
-          });
-          if (!r.ok) throw new Error(`HTTP ${r.status}`);
-          const json: any = await r.json();
-          rawText = json?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-        } else {
-          const endpoint =
-            provider === 'deepseek'
-              ? 'https://api.deepseek.com/chat/completions'
-              : provider === 'openrouter' || apiKey.startsWith('sk-or-')
-                ? 'https://openrouter.ai/api/v1/chat/completions'
-                : 'https://api.openai.com/v1/chat/completions';
-          const model =
-            provider === 'deepseek'
-              ? ramStore.ai.model || 'deepseek-chat'
-              : provider === 'openrouter' || apiKey.startsWith('sk-or-')
-                ? ramStore.ai.model || 'meta-llama/llama-3.1-8b-instruct:free'
-                : ramStore.ai.model || 'gpt-4o-mini';
-          const r = await fetch(endpoint, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-            body: JSON.stringify({
-              model,
-              temperature: ramStore.ai.temperature || 0.72,
-              max_tokens: 600,
-              response_format: { type: 'json_object' },
-              messages: [{ role: 'system', content: systemPrompt }, ...finalHistory],
-            }),
-            signal: AbortSignal.timeout(15000),
-          });
-          if (!r.ok) throw new Error(`HTTP ${r.status}`);
-          const json: any = await r.json();
-          rawText = stripThinkBlocks(json?.choices?.[0]?.message?.content || '');
-        }
-
-        if (rawText) {
-          const match = rawText.match(/\{[\s\S]*\}/);
+    const invokeLLMOnce = async (promptToSend: string): Promise<{
+      ai_reply_text: string;
+      quote_reply: boolean;
+      actions: Array<{ hand: string; payload?: any }>;
+      engine: string;
+      key_used_index: number;
+    } | null> => {
+      if (groqKeys.length > 0) {
+        const groqRes = await callGroqPool(groqKeys, promptToSend, finalHistory, ramStore.ai.temperature || 0.72);
+        if (groqRes?.text) {
+          const match = groqRes.text.match(/\{[\s\S]*\}/);
           if (match) {
-            const parsed = JSON.parse(match[0]);
-            return {
-              ai_reply_text: String(parsed.ai_reply_text || parsed.reply_to_customer || '').trim(),
-              quote_reply: Boolean(parsed.quote_reply),
-              actions: Array.isArray(parsed.actions) ? parsed.actions : [],
-              engine: `${provider} (key #${idx + 1}/${otherKeys.length})`,
-              key_used_index: idx,
-            };
+            try {
+              const parsed = JSON.parse(match[0]);
+              return {
+                ai_reply_text: String(parsed.ai_reply_text || parsed.reply_to_customer || '').trim(),
+                quote_reply: Boolean(parsed.quote_reply),
+                actions: Array.isArray(parsed.actions) ? parsed.actions : [],
+                engine: `groq:${groqRes.model} (key #${groqRes.keyIdx + 1}/${groqKeys.length})`,
+                key_used_index: groqRes.keyIdx,
+              };
+            } catch {
+              // Fall through to backup keys
+            }
           }
         }
-      } catch (err) {
-        console.warn(`⚠️ [Multi-Key AI Fallback] Key #${idx + 1}/${otherKeys.length} failed, rotating...`, err);
       }
+
+      for (let idx = 0; idx < otherKeys.length; idx++) {
+        const apiKey = otherKeys[idx];
+        try {
+          let rawText = '';
+          if (provider === 'gemini' || apiKey.startsWith('AIzaSy')) {
+            const model = ramStore.ai.model?.includes('gemini') ? ramStore.ai.model : 'gemini-2.0-flash';
+            const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                system_instruction: { parts: [{ text: promptToSend }] },
+                contents: finalHistory.map((m) => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] })),
+                generationConfig: { temperature: ramStore.ai.temperature || 0.72, maxOutputTokens: 600, response_mime_type: 'application/json' },
+              }),
+              signal: AbortSignal.timeout(15000),
+            });
+            if (!r.ok) throw new Error(`HTTP ${r.status}`);
+            const json: any = await r.json();
+            rawText = json?.candidates?.[0]?.content?.parts?.[0]?.text || '';
+          } else {
+            const endpoint =
+              provider === 'deepseek'
+                ? 'https://api.deepseek.com/chat/completions'
+                : provider === 'openrouter' || apiKey.startsWith('sk-or-')
+                  ? 'https://openrouter.ai/api/v1/chat/completions'
+                  : 'https://api.openai.com/v1/chat/completions';
+            const model =
+              provider === 'deepseek'
+                ? ramStore.ai.model || 'deepseek-chat'
+                : provider === 'openrouter' || apiKey.startsWith('sk-or-')
+                  ? ramStore.ai.model || 'meta-llama/llama-3.1-8b-instruct:free'
+                  : ramStore.ai.model || 'gpt-4o-mini';
+            const r = await fetch(endpoint, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+              body: JSON.stringify({
+                model,
+                temperature: ramStore.ai.temperature || 0.72,
+                max_tokens: 600,
+                response_format: { type: 'json_object' },
+                messages: [{ role: 'system', content: promptToSend }, ...finalHistory],
+              }),
+              signal: AbortSignal.timeout(15000),
+            });
+            if (!r.ok) throw new Error(`HTTP ${r.status}`);
+            const json: any = await r.json();
+            rawText = stripThinkBlocks(json?.choices?.[0]?.message?.content || '');
+          }
+
+          if (rawText) {
+            const match = rawText.match(/\{[\s\S]*\}/);
+            if (match) {
+              const parsed = JSON.parse(match[0]);
+              return {
+                ai_reply_text: String(parsed.ai_reply_text || parsed.reply_to_customer || '').trim(),
+                quote_reply: Boolean(parsed.quote_reply),
+                actions: Array.isArray(parsed.actions) ? parsed.actions : [],
+                engine: `${provider} (key #${idx + 1}/${otherKeys.length})`,
+                key_used_index: idx,
+              };
+            }
+          }
+        } catch (err) {
+          console.warn(`⚠️ [Multi-Key AI Fallback] Key #${idx + 1}/${otherKeys.length} failed, rotating...`, err);
+        }
+      }
+      return null;
+    };
+
+    const firstPass = await invokeLLMOnce(systemPrompt);
+    if (firstPass) {
+      // Layer 4: On-Demand `search_catalog` Hand interception (STRICTLY max 1 follow-up pass!)
+      const searchActions = firstPass.actions.filter((a) =>
+        ['search_catalog', 'find_products', 'browse_category', 'lookup_catalog', 'search_products'].includes(
+          String(a.hand || '').toLowerCase()
+        )
+      );
+      if (searchActions.length > 0) {
+        const queries: string[] = [];
+        const categories: string[] = [];
+        for (const sa of searchActions) {
+          const p = sa.payload || {};
+          if (Array.isArray(p.queries)) queries.push(...p.queries.map((x: any) => String(x || '').trim()).filter(Boolean));
+          if (typeof p.query === 'string' && p.query.trim()) queries.push(p.query.trim());
+          if (Array.isArray(p.categories)) categories.push(...p.categories.map((x: any) => String(x || '').trim()).filter(Boolean));
+          if (typeof p.category === 'string' && p.category.trim()) categories.push(p.category.trim());
+        }
+        if (queries.length > 0 || categories.length > 0) {
+          const lookupBlock = executeSearchCatalogHand(inStockProducts, queries, categories);
+          const secondPass = await invokeLLMOnce(
+            `${systemPrompt}\n\n${lookupBlock}\n\nFINAL PASS: Now answer the customer warmly using SEARCH_RESULTS above. Do NOT call search_catalog again.`
+          );
+          if (secondPass) {
+            secondPass.actions = secondPass.actions.filter(
+              (a) => !['search_catalog', 'find_products', 'browse_category', 'lookup_catalog', 'search_products'].includes(String(a.hand || '').toLowerCase())
+            );
+            return secondPass;
+          }
+        }
+        firstPass.actions = firstPass.actions.filter(
+          (a) => !['search_catalog', 'find_products', 'browse_category', 'lookup_catalog', 'search_products'].includes(String(a.hand || '').toLowerCase())
+        );
+      }
+      return firstPass;
     }
   }
 
@@ -2730,15 +3513,17 @@ app.get('/api/bot/overview', (_req: Request, res: Response) => {
       paytm_mid: ramStore.payment.paytm_mid,
       payee_name: ramStore.payment.payee_name || ramStore.vendor.business_name,
       merchant_phone: ramStore.payment.merchant_phone,
-      cloudinary_cloud_name: ramStore.payment.cloudinary_cloud_name,
-      qr_worker_base_url: ramStore.payment.qr_worker_base_url || DEFAULT_QR_WORKER_BASE_URL,
-      qr_generator_url: ramStore.payment.qr_generator_url || DEFAULT_QR_GENERATOR_URL,
-      qr_cloud_name: ramStore.payment.qr_cloud_name || DEFAULT_QR_CLOUD_NAME,
+      local_qr_generation: ramStore.payment.local_qr_generation,
+      local_paytm_verify: ramStore.payment.local_paytm_verify,
+      paytm_status_url: ramStore.payment.paytm_status_url || DEFAULT_PAYTM_STATUS_URL,
+      payment_confirm_endpoint: ramStore.payment.payment_confirm_endpoint || DEFAULT_PAYMENT_CONFIRM_ENDPOINT,
       qr_only_mode: ramStore.payment.qr_only_mode,
       send_payment_link: ramStore.payment.send_payment_link,
       verify_endpoint: ramStore.payment.verify_endpoint || DEFAULT_VERIFY_ENDPOINT,
       verify_poll_interval_ms: ramStore.payment.verify_poll_interval_ms || DEFAULT_VERIFY_POLL_INTERVAL_MS,
       verify_poll_timeout_ms: ramStore.payment.verify_poll_timeout_ms || DEFAULT_VERIFY_POLL_TIMEOUT_MS,
+      banner_template: ramStore.payment.banner_template,
+      banner_cache: getBlankBannerCacheStats(),
     },
     whatsapp: ramStore.whatsapp,
     media_cache_entries: mediaThumbCache.size,
