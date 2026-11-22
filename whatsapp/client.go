@@ -1,13 +1,11 @@
 package whatsapp
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
-	"mime/multipart"
 	"net/http"
 	"regexp"
 	"strings"
@@ -631,57 +629,7 @@ func extractIncomingAudioMessage(msg *waE2E.Message) *waE2E.AudioMessage {
 	return nil
 }
 
-// transcribeVoiceNoteGroq transcribes a customer WhatsApp voice note using Groq Whisper if a Groq key is available.
-func transcribeVoiceNoteGroq(username string, audioBytes []byte) string {
-	cfg := GetUserConfigRAM(username)
-	keys := collectCandidateAPIKeys(username, cfg)
-	groqKey := ""
-	for _, k := range keys {
-		if strings.HasPrefix(k, "gsk_") {
-			groqKey = k
-			break
-		}
-	}
-	if groqKey == "" || len(audioBytes) == 0 {
-		return ""
-	}
-
-	var body bytes.Buffer
-	writer := multipart.NewWriter(&body)
-	part, err := writer.CreateFormFile("file", "voice.ogg")
-	if err != nil {
-		return ""
-	}
-	if _, err := part.Write(audioBytes); err != nil {
-		return ""
-	}
-	_ = writer.WriteField("model", "whisper-large-v3-turbo")
-	_ = writer.Close()
-
-	req, err := http.NewRequest("POST", "https://api.groq.com/openai/v1/audio/transcriptions", &body)
-	if err != nil {
-		return ""
-	}
-	req.Header.Set("Content-Type", writer.FormDataContentType())
-	req.Header.Set("Authorization", "Bearer "+groqKey)
-
-	httpClient := &http.Client{Timeout: 12 * time.Second}
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return ""
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return ""
-	}
-	var parsed struct {
-		Text string `json:"text"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&parsed); err == nil {
-		return strings.TrimSpace(parsed.Text)
-	}
-	return ""
-}
+// Voice note transcription is handled by the Octopus Voice Hand (`ExecuteVoiceNoteHand` in voice_router.go).
 
 func extractMessageText(msg *waE2E.Message) string {
 	if msg == nil {
@@ -969,21 +917,29 @@ func processSingleCustomerTurn(username string, client *whatsmeow.Client, msgID 
 	_ = client.MarkRead(ctxRead, []types.MessageID{msgID}, msgTime, chatJID, senderJID)
 	cancelRead()
 
-	// Transcribe voice note only after turn lock & 1s delay
+	cfg := GetUserConfigRAM(username)
+
+	// Transcribe voice note via Octopus Voice Hand (Gemini Live 2-model | Groq Whisper 2-model | Dual Rotation)
+	aiInputText := text
+	var voiceHandResult *VoiceNoteHandResult
 	if audMsg != nil {
 		audioBytes, dlErr := client.Download(context.Background(), audMsg)
 		transcript := ""
 		if dlErr == nil && len(audioBytes) > 0 {
-			transcript = transcribeVoiceNoteGroq(username, audioBytes)
+			vh := ExecuteVoiceNoteHand(username, cfg, audioBytes, audMsg.GetMimetype(), audMsg.GetSeconds())
+			voiceHandResult = &vh
+			transcript = strings.TrimSpace(vh.Transcript)
 		}
 		if transcript != "" {
-			text = fmt.Sprintf("[Customer Voice Note]: %s", transcript)
+			text = fmt.Sprintf("🎙️ [Voice Note]: %s", transcript)
+			aiInputText = transcript
 		} else {
-			text = fmt.Sprintf("[Customer sent a %ds Voice Note. Politely ask them to type the product name or order detail if anything is unclear.]", audMsg.GetSeconds())
+			text = fmt.Sprintf("🎙️ [Voice Note %ds — audio unclear]", audMsg.GetSeconds())
+			aiInputText = fmt.Sprintf("Customer sent a %ds voice note that was unclear or silent. Politely ask them to type the product name or send a clearer voice note.", audMsg.GetSeconds())
 		}
 	}
 
-	if strings.TrimSpace(text) == "" {
+	if strings.TrimSpace(aiInputText) == "" {
 		return
 	}
 
@@ -993,7 +949,7 @@ func processSingleCustomerTurn(username string, client *whatsmeow.Client, msgID 
 	// Persist incoming customer message immediately into RAM (last 10 msgs/customer) BEFORE SSE push
 	SaveCustomerChatAndPrune(username, phone, "customer", text)
 	PushToLiveChat(username, phone, text, "incoming")
-	go ExtractAndPersistCustomerDetails(username, phone, text)
+	go ExtractAndPersistCustomerDetails(username, phone, aiInputText)
 
 	// Central Admin Feature Gating & Subscription Validity Check
 	if allowed, reason := ramstore.Global.CanAutoReply(); !allowed {
@@ -1029,8 +985,6 @@ func processSingleCustomerTurn(username string, client *whatsmeow.Client, msgID 
 		return
 	}
 
-	cfg := GetUserConfigRAM(username)
-
 	// Natural typing indicator loop (Anti-Ban human-like pacing)
 	stopTyping := make(chan struct{})
 	go func() {
@@ -1048,7 +1002,7 @@ func processSingleCustomerTurn(username string, client *whatsmeow.Client, msgID 
 		}
 	}()
 
-	octResp, err := GenerateOctopusAIReply(username, phone, text, cfg)
+	octResp, err := GenerateOctopusAIReply(username, phone, aiInputText, cfg)
 	// Slight natural human typing pause (450ms) before stopping typing & delivering message
 	time.Sleep(450 * time.Millisecond)
 	close(stopTyping)
@@ -1056,6 +1010,15 @@ func processSingleCustomerTurn(username string, client *whatsmeow.Client, msgID 
 	if err != nil || octResp == nil {
 		log.Printf("⚠️ [Octopus AI] Error for +%s: %v", phone, err)
 		return
+	}
+	if voiceHandResult != nil && voiceHandResult.Transcript != "" {
+		octResp.Actions = append([]AIActionItem{{
+			Hand: "voice_note_transcribe",
+			Payload: &AIActionPayload{
+				Query:    voiceHandResult.Transcript,
+				Category: voiceHandResult.Provider + ":" + voiceHandResult.Model,
+			},
+		}}, octResp.Actions...)
 	}
 
 	// Execute Octopus Actions (cart variants/stock, QR, PDF, magic links, owner escalation)

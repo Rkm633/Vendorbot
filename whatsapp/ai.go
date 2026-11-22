@@ -148,7 +148,7 @@ func isGroqProvider(provider, apiKey string) bool {
 	if strings.HasPrefix(k, "gsk_") {
 		return true
 	}
-	if strings.HasPrefix(k, "AIzaSy") || strings.HasPrefix(k, "sk-or-") || strings.HasPrefix(k, "sk-") {
+	if strings.HasPrefix(k, "AIza") || strings.HasPrefix(k, "sk-or-") || strings.HasPrefix(k, "sk-") {
 		return false
 	}
 	p := strings.ToLower(strings.TrimSpace(provider))
@@ -540,6 +540,10 @@ func GetUserConfigRAM(_ string) *UserConfigRAM {
 		if !isGroqModelAllowed(model) {
 			model = groqAllowedModels[0]
 		}
+	} else if strings.EqualFold(provider, "gemini") || strings.EqualFold(provider, "google") || strings.EqualFold(provider, "gemma") {
+		if !isGeminiModelAllowed(model) {
+			model = geminiAllowedModels[0]
+		}
 	} else if model == "" {
 		model = groqAllowedModels[0]
 	}
@@ -618,10 +622,13 @@ func collectCandidateAPIKeys(username string, cfg *UserConfigRAM) []string {
 		return keys
 	}
 
-	// Preserve deterministic order for GroqPool (which runs its own K × 3 round-robin TPD matrix);
-	// for non-Groq providers, rotate start index per request.
-	if cfg != nil && strings.EqualFold(strings.TrimSpace(cfg.Provider), "groq") {
-		return keys
+	// Preserve deterministic order for Groq & Gemini pools (they manage their own key × model rotation matrices);
+	// for other providers, rotate start index per request.
+	if cfg != nil {
+		p := strings.ToLower(strings.TrimSpace(cfg.Provider))
+		if p == "" || p == "groq" || p == "gemini" || p == "google" || p == "gemma" {
+			return keys
+		}
 	}
 
 	keyRotationLock.Lock()
@@ -635,40 +642,52 @@ func collectCandidateAPIKeys(username string, cfg *UserConfigRAM) []string {
 	return rotated
 }
 
-// callAIWithKeyFallback routes Groq keys through the strict 3-model × multi-key TPD/TPM pool,
-// while keeping Gemini/OpenAI/DeepSeek/OpenRouter on their own standard provider failover.
+// callAIWithKeyFallback implements the 3-mode AI scheduling engine:
+//  1. Dual Mode (Groq + Gemini both configured): Alternates ("bari-bari") between Groq (3 models)
+//     and Gemini (4 models) across all active keys with instant cross-provider failover on TPM/RPM/TPD/429.
+//  2. Groq-Only Mode: Preserves strict 3-model Groq TPD/TPM pool (qwen3.8-27b, gpt-oss-20b, gpt-oss-120b).
+//  3. Gemini-Only Mode: Strictly uses 4 models (gemma-4-31b-it, gemma-4-26b-a4b-it, gemini-3.1-flash-lite, gemini-3.5-flash-lite).
 func callAIWithKeyFallback(username string, cfg *UserConfigRAM, sysPrompt string, history []ChatMessage, jsonMode bool) (string, error) {
-	keys := collectCandidateAPIKeys(username, cfg)
-	if len(keys) == 0 {
+	groqKeys, geminiKeys, otherKeys := ClassifyConfiguredAIKeys(username, cfg)
+	if len(groqKeys) == 0 && len(geminiKeys) == 0 && len(otherKeys) == 0 {
 		return "", fmt.Errorf("no AI API key configured in vendor AI settings or environment")
-	}
-
-	var groqKeys []string
-	var otherKeys []string
-	for _, k := range keys {
-		if isGroqProvider(cfg.Provider, k) {
-			groqKeys = append(groqKeys, k)
-		} else {
-			otherKeys = append(otherKeys, k)
-		}
 	}
 
 	var lastErr error
 
-	// 1. Groq Pool: strictly 3 models (qwen/qwen3.8-27b, openai/gpt-oss-20b, openai/gpt-oss-120b)
-	// across ALL active Groq keys for full combined TPD utilization + instant TPM model-switch!
-	if len(groqKeys) > 0 {
+	// Case 1: Dual Mode (BOTH Groq & Gemini keys configured -> alternating rotation across all keys × models)
+	if len(groqKeys) > 0 && len(geminiKeys) > 0 {
+		res, err := callDualGroqGeminiPoolWithHistory(groqKeys, geminiKeys, cfg.Temperature, sysPrompt, history, jsonMode)
+		if err == nil && strings.TrimSpace(res) != "" {
+			return res, nil
+		}
+		lastErr = err
+		if len(otherKeys) > 0 {
+			log.Printf("🔄 [AI Fallback] All Groq + Gemini slots unavailable (%v) — falling back to backup key...", err)
+		}
+	} else if len(groqKeys) > 0 {
+		// Case 2: Groq-Only Mode (exact existing 3-model Groq TPD/TPM architecture)
 		res, err := callGroqPoolWithHistory(groqKeys, cfg.Temperature, sysPrompt, history, jsonMode)
 		if err == nil && strings.TrimSpace(res) != "" {
 			return res, nil
 		}
 		lastErr = err
 		if len(otherKeys) > 0 {
-			log.Printf("🔄 [AI Fallback] All Groq key×model slots unavailable (%v) — falling back to non-Groq backup key...", err)
+			log.Printf("🔄 [AI Fallback] All Groq slots unavailable (%v) — falling back to backup key...", err)
+		}
+	} else if len(geminiKeys) > 0 {
+		// Case 3: Gemini-Only Mode (strictly 4 allowed Gemini/Gemma models across all active Gemini keys)
+		res, err := callGeminiPoolWithHistory(geminiKeys, cfg.Temperature, sysPrompt, history, jsonMode)
+		if err == nil && strings.TrimSpace(res) != "" {
+			return res, nil
+		}
+		lastErr = err
+		if len(otherKeys) > 0 {
+			log.Printf("🔄 [AI Fallback] All Gemini slots unavailable (%v) — falling back to backup key...", err)
 		}
 	}
 
-	// 2. Non-Groq Providers (Gemini / OpenAI / DeepSeek / OpenRouter — unaffected by Groq-only rule)
+	// Backup Non-Groq/Non-Gemini Providers (OpenAI / DeepSeek / OpenRouter)
 	for idx, key := range otherKeys {
 		res, err := callNonGroqModelWithHistory(cfg.Provider, cfg.Model, cfg.Temperature, key, sysPrompt, history, jsonMode)
 		if err == nil && strings.TrimSpace(res) != "" {
@@ -1330,9 +1349,10 @@ func GenerateOctopusAIReply(username, customerPhone, incomingText string, cfg *U
 		return nil, fmt.Errorf("no AI API key configured in vendor AI settings or environment")
 	}
 
+	cleanQueryForRouting := stripVoiceNoteMarkers(incomingText)
 	fullHistory := getSlidingWindowRAM(username, cleanPhone)
-	if len(fullHistory) == 0 || fullHistory[len(fullHistory)-1].Content != compactText(incomingText, 400) {
-		fullHistory = updateSlidingWindowRAM(username, cleanPhone, "user", incomingText)
+	if len(fullHistory) == 0 || stripVoiceNoteMarkers(fullHistory[len(fullHistory)-1].Content) != compactText(cleanQueryForRouting, 400) {
+		fullHistory = updateSlidingWindowRAM(username, cleanPhone, "user", cleanQueryForRouting)
 	}
 
 	// Strictly limit LLM sliding window to MaxLLMHistoryMessages (6 total messages)
@@ -1390,6 +1410,14 @@ func GenerateOctopusAIReply(username, customerPhone, incomingText string, cfg *U
 	}
 	ruleParts = append(ruleParts, "Pay:"+payMode)
 
+	// Optional Gemini Decision 1 Smart Router (active ONLY when Gemini key(s) are configured — 0 output tokens!)
+	// Saves 50-70% tokens by skipping catalog on non-shopping turns and pre-routing vague Hinglish categories.
+	_, geminiKeys, _ := ClassifyConfiguredAIKeys(username, cfg)
+	var routeDec DecisionRouteResult
+	if len(geminiKeys) > 0 {
+		routeDec = RunGeminiDecisionSmartRoute(geminiKeys, cleanQueryForRouting, len(cartProductIDs) > 0)
+	}
+
 	// Static prefix first (prompt-cache friendly!), dynamic per-customer state + smart RAG at the end!
 	var promptBuilder strings.Builder
 	promptBuilder.WriteString(fmt.Sprintf(octopusSystemPromptJSON, bName, bType, policies, lang))
@@ -1397,8 +1425,27 @@ func GenerateOctopusAIReply(username, customerPhone, incomingText string, cfg *U
 		promptBuilder.WriteString("\nVENDOR NOTE: " + extra)
 	}
 	promptBuilder.WriteString("\nSTORE: " + strings.Join(ruleParts, " | "))
-	promptBuilder.WriteString("\n\n" + BuildOctopusContext(username, cleanPhone, incomingText))
-	promptBuilder.WriteString("\n\n" + GetSmartCompactInventory(incomingText, llmHistory, cartProductIDs))
+	promptBuilder.WriteString("\n\n" + BuildOctopusContext(username, cleanPhone, cleanQueryForRouting))
+
+	if routeDec.UsedDecisionAPI && routeDec.NeedsEscalation {
+		promptBuilder.WriteString("\nROUTER_HINT: Customer needs human/owner help — include escalate_to_human action and reply with empathy.")
+	}
+
+	if routeDec.UsedDecisionAPI && routeDec.SkipCatalog {
+		// Huge token savings: skip full catalog on non-shopping turns (address, payment status, complaint, chitchat)
+		promptBuilder.WriteString("\n\nINV: (Catalog omitted by smart router — non-shopping turn. Use search_catalog only if user asks for a new product.)")
+	} else {
+		invBlock := GetSmartCompactInventory(cleanQueryForRouting, llmHistory, cartProductIDs)
+		promptBuilder.WriteString("\n\n" + invBlock)
+		if routeDec.UsedDecisionAPI && routeDec.MatchedCategory != "" &&
+			!strings.Contains(invBlock, "MULTI_ITEM_MATCH") &&
+			!strings.Contains(invBlock, "checkout mode") &&
+			(strings.Contains(invBlock, "HINT: 0 direct keyword hits") || !strings.Contains(strings.ToLower(invBlock), "|"+strings.ToLower(routeDec.MatchedCategory)+"|")) {
+			// Pre-inject exact matched category from RAM on Pass 1 -> saves an entire 2nd LLM round-trip!
+			catBlock := ExecuteSearchCatalogHand(nil, []string{routeDec.MatchedCategory})
+			promptBuilder.WriteString("\n\n" + catBlock)
+		}
+	}
 
 	aiResponse, err := callAIWithKeyFallback(username, cfg, promptBuilder.String(), llmHistory, true)
 	if err != nil || aiResponse == "" {
@@ -1409,6 +1456,9 @@ func GenerateOctopusAIReply(username, customerPhone, incomingText string, cfg *U
 	parsed, errParse := ParseOctopusAIResponse(aiResponse)
 	if errParse != nil || parsed == nil {
 		return &OctopusAIResponse{AIReplyText: SafeAIFallbackReply, Actions: []AIActionItem{}, ExecuteHand: "chat_only"}, nil
+	}
+	if routeDec.UsedDecisionAPI && routeDec.NeedsQuoteReply {
+		parsed.QuoteReply = true
 	}
 
 	// Layer 4: On-Demand `search_catalog` Hand interception (STRICTLY max 1 follow-up pass — never loops!)
@@ -1441,6 +1491,9 @@ func GenerateOctopusAIReply(username, customerPhone, incomingText string, cfg *U
 		aiResponse2, err2 := callAIWithKeyFallback(username, cfg, followUpPrompt, llmHistory, true)
 		if err2 == nil && strings.TrimSpace(aiResponse2) != "" {
 			if parsed2, errP2 := ParseOctopusAIResponse(aiResponse2); errP2 == nil && parsed2 != nil {
+				if routeDec.UsedDecisionAPI && routeDec.NeedsQuoteReply {
+					parsed2.QuoteReply = true
+				}
 				filtered := make([]AIActionItem, 0, len(parsed2.Actions))
 				for _, act := range parsed2.Actions {
 					if act.Hand != "search_catalog" {
@@ -1495,7 +1548,7 @@ func AsyncCentralSync(username, customerPhone, incomingText, aiReplyText string)
 	}()
 }
 
-// CallAIModelWithHistory calls Groq (strictly 3-model TPD/TPM rotation), Gemini, OpenAI, DeepSeek, or OpenRouter.
+// CallAIModelWithHistory calls Groq (strictly 3-model TPD/TPM rotation), Gemini (strictly 4-model pool), OpenAI, DeepSeek, or OpenRouter.
 func CallAIModelWithHistory(provider, model string, temperature float64, rawApiKey, sysPrompt string, history []ChatMessage) (string, error) {
 	apiKey := strings.TrimSpace(rawApiKey)
 	if apiKey == "" {
@@ -1504,6 +1557,9 @@ func CallAIModelWithHistory(provider, model string, temperature float64, rawApiK
 
 	if isGroqProvider(provider, apiKey) {
 		return callGroqPoolWithHistory([]string{apiKey}, temperature, sysPrompt, history, true)
+	}
+	if isGeminiProvider(provider, apiKey) {
+		return callGeminiPoolWithHistory([]string{apiKey}, temperature, sysPrompt, history, true)
 	}
 	return callNonGroqModelWithHistory(provider, model, temperature, apiKey, sysPrompt, history, true)
 }
@@ -1690,7 +1746,7 @@ func callNonGroqModelWithHistory(provider, model string, temperature float64, ap
 		prov = "openrouter"
 	} else if strings.HasPrefix(apiKey, "sk-") && prov != "deepseek" {
 		prov = "openai"
-	} else if strings.HasPrefix(apiKey, "AIzaSy") {
+	} else if strings.HasPrefix(apiKey, "AIza") {
 		prov = "gemini"
 	}
 
@@ -1699,8 +1755,8 @@ func callNonGroqModelWithHistory(provider, model string, temperature float64, ap
 		cleanModel = ""
 	}
 
-	if prov == "gemini" {
-		return callGeminiAPIWithHistory(apiKey, cleanModel, temperature, sysPrompt, history, jsonMode)
+	if prov == "gemini" || prov == "google" || prov == "gemma" {
+		return callGeminiPoolWithHistory([]string{apiKey}, temperature, sysPrompt, history, jsonMode)
 	}
 	return callOpenAIFormatWithHistory(prov, cleanModel, temperature, apiKey, sysPrompt, history, jsonMode)
 }
@@ -1782,76 +1838,8 @@ func callOpenAIFormatWithHistory(provider, model string, temperature float64, ap
 	return "", fmt.Errorf("empty AI reply received")
 }
 
-func callGeminiAPIWithHistory(apiKey, model string, temperature float64, sysPrompt string, history []ChatMessage, jsonMode bool) (string, error) {
-	candidateModels := []string{"gemini-2.0-flash", "gemini-1.5-flash"}
-	reqModel := strings.TrimSpace(model)
-	if reqModel != "" && !isNumericOrPhone(reqModel) && !strings.Contains(reqModel, "gemini-1.0") {
-		candidateModels = append([]string{reqModel}, candidateModels...)
-	}
-
-	var contents []map[string]interface{}
-	for _, m := range history {
-		role := "user"
-		if m.Role == "assistant" || m.Role == "outgoing" || m.Role == "outgoing_ai" {
-			role = "model"
-		}
-		if strings.TrimSpace(m.Content) != "" {
-			contents = append(contents, map[string]interface{}{
-				"role":  role,
-				"parts": []map[string]string{{"text": m.Content}},
-			})
-		}
-	}
-	if len(contents) == 0 {
-		return "", fmt.Errorf("empty chat history for Gemini")
-	}
-
-	var lastErr error
-	for _, mdl := range candidateModels {
-		endpoint := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s", mdl, apiKey)
-		genCfg := map[string]interface{}{
-			"temperature":     temperature,
-			"maxOutputTokens": 600,
-		}
-		if jsonMode {
-			genCfg["response_mime_type"] = "application/json"
-		}
-		payload := map[string]interface{}{
-			"system_instruction": map[string]interface{}{
-				"parts": []map[string]string{{"text": sysPrompt}},
-			},
-			"contents":         contents,
-			"generationConfig": genCfg,
-		}
-		body, _ := json.Marshal(payload)
-
-		client := &http.Client{Timeout: 15 * time.Second}
-		resp, err := client.Post(endpoint, "application/json", bytes.NewBuffer(body))
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		respBytes, _ := io.ReadAll(resp.Body)
-		resp.Body.Close()
-
-		if resp.StatusCode == http.StatusOK {
-			var result struct {
-				Candidates []struct {
-					Content struct {
-						Parts []struct {
-							Text string `json:"text"`
-						} `json:"parts"`
-					} `json:"content"`
-				} `json:"candidates"`
-			}
-			if err := json.Unmarshal(respBytes, &result); err == nil && len(result.Candidates) > 0 && len(result.Candidates[0].Content.Parts) > 0 {
-				return strings.TrimSpace(result.Candidates[0].Content.Parts[0].Text), nil
-			}
-		}
-		lastErr = fmt.Errorf("gemini status %d for model %s", resp.StatusCode, mdl)
-	}
-	if lastErr != nil {
-		return "", lastErr
-	}
-	return "", fmt.Errorf("empty response from Gemini")
+// callGeminiAPIWithHistory delegates strictly to the 4-model Gemini/Gemma pool
+// (gemma-4-31b-it, gemma-4-26b-a4b-it, gemini-3.1-flash-lite, gemini-3.5-flash-lite).
+func callGeminiAPIWithHistory(apiKey, _ string, temperature float64, sysPrompt string, history []ChatMessage, jsonMode bool) (string, error) {
+	return callGeminiPoolWithHistory([]string{apiKey}, temperature, sysPrompt, history, jsonMode)
 }

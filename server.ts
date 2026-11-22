@@ -2,9 +2,11 @@ import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import crypto from 'crypto';
 import path from 'path';
+import { execFile } from 'child_process';
 import { fileURLToPath } from 'url';
 import QRCode from 'qrcode';
 import sharp from 'sharp';
+import { GoogleGenAI, Modality } from '@google/genai';
 
 // CRITICAL for Render Free Tier 512MB RAM: disable libvips persistent decoded bitmap cache
 sharp.cache(false);
@@ -2326,13 +2328,31 @@ async function submitWhatsAppOrderToCentral(phone: string, requestedMode: string
 }
 
 // =============================================================================
-// 4. OCTOPUS AGENTIC AI ENGINE (Groq 3-Model TPD/TPM Pool + Smart Token RAG)
+// 4. OCTOPUS AGENTIC AI ENGINE (3-Mode Groq/Gemini Pool + Gemini Decision 1)
 // =============================================================================
 
 const GROQ_ALLOWED_MODELS = [
   'qwen/qwen3.8-27b',
   'openai/gpt-oss-20b',
   'openai/gpt-oss-120b',
+] as const;
+
+// Strictly ONLY these 4 Gemini/Gemma models are used for Gemini text generation.
+const GEMINI_ALLOWED_MODELS = [
+  'gemma-4-31b-it',
+  'gemma-4-26b-a4b-it',
+  'gemini-3.1-flash-lite',
+  'gemini-3.5-flash-lite',
+] as const;
+
+// Dedicated zero-output-token Decisions API model used strictly for smart routing.
+const GEMINI_DECISION_MODEL = 'gemini-decision-1';
+
+// Voice Note Octopus Hand Models (Groq Whisper vs Gemini Live Native Audio)
+const GROQ_VOICE_MODELS = ['whisper-large-v3-turbo', 'whisper-large-v3'] as const;
+const GEMINI_VOICE_LIVE_MODELS = [
+  'gemini-3.1-flash-live-preview',
+  'gemini-2.5-flash-native-audio-preview-12-2025',
 ] as const;
 
 const MAX_LLM_HISTORY_MESSAGES = 6;
@@ -2346,8 +2366,64 @@ interface GroqSlotState {
   dayUTC: string;
 }
 
+interface GeminiSlotState {
+  rpmCooldownUntil: number;
+  rpdCooldownUntil: number;
+  authDisabledUntil: number;
+  tokensUsedToday: number;
+  requestsToday: number;
+  dayUTC: string;
+}
+
+interface DecisionKeyState {
+  rpmCooldownUntil: number;
+  rpdCooldownUntil: number;
+  authDisabledUntil: number;
+  requestsToday: number;
+  dayUTC: string;
+}
+
+export interface DecisionRouteResult {
+  intent: string;
+  skipCatalog: boolean;
+  needsQuoteReply: boolean;
+  needsEscalation: boolean;
+  matchedCategory: string;
+  confidence: number;
+  used: boolean;
+}
+
 const groqSlotStates = new Map<string, GroqSlotState>();
 let groqPoolCursor = 0;
+
+const geminiSlotStates = new Map<string, GeminiSlotState>();
+let geminiPoolCursor = 0;
+let dualTurnCursor = 0;
+
+const decisionKeyStates = new Map<string, DecisionKeyState>();
+let decisionKeyCursor = 0;
+const decisionsAIClients = new Map<string, GoogleGenAI>();
+
+function getDecisionsAIClient(apiKey: string): GoogleGenAI {
+  const k = apiKey.trim();
+  const existing = decisionsAIClients.get(k);
+  if (existing) return existing;
+  if (decisionsAIClients.size >= 32) {
+    const firstKey = decisionsAIClients.keys().next().value;
+    if (firstKey) decisionsAIClients.delete(firstKey);
+  }
+  const client = new GoogleGenAI({
+    apiKey: k,
+    apiVersion: 'v1beta',
+    httpOptions: {
+      headers: {
+        'User-Agent': 'aistudio-build',
+      },
+    },
+  });
+  decisionsAIClients.set(k, client);
+  return client;
+}
 
 function shortKeyHash(apiKey: string): string {
   return crypto.createHash('sha256').update(apiKey.trim()).digest('hex').slice(0, 12);
@@ -2356,9 +2432,137 @@ function shortKeyHash(apiKey: string): string {
 function isGroqProvider(provider: string, apiKey: string): boolean {
   const k = apiKey.trim();
   if (k.startsWith('gsk_')) return true;
-  if (k.startsWith('AIzaSy') || k.startsWith('sk-or-') || k.startsWith('sk-')) return false;
+  if (k.startsWith('AIza') || k.startsWith('sk-or-') || k.startsWith('sk-')) return false;
   const p = provider.trim().toLowerCase();
   return p === '' || p === 'groq';
+}
+
+function isGeminiProvider(provider: string, apiKey: string): boolean {
+  const k = apiKey.trim();
+  if (k.startsWith('AIza')) return true;
+  if (k.startsWith('gsk_') || k.startsWith('sk-or-') || k.startsWith('sk-')) return false;
+  const p = provider.trim().toLowerCase();
+  return p === 'gemini' || p === 'google' || p === 'gemma';
+}
+
+function classifyConfiguredAIKeys(
+  provider: string,
+  keys: string[]
+): { groqKeys: string[]; geminiKeys: string[]; otherKeys: string[] } {
+  const groqKeys: string[] = [];
+  const geminiKeys: string[] = [];
+  const otherKeys: string[] = [];
+  for (const raw of keys) {
+    const k = raw.trim();
+    if (!k) continue;
+    if (isGroqProvider(provider, k)) groqKeys.push(k);
+    else if (isGeminiProvider(provider, k)) geminiKeys.push(k);
+    else otherKeys.push(k);
+  }
+  return { groqKeys, geminiKeys, otherKeys };
+}
+
+function getActiveAIRoutingMode(provider: string, keys: string[]): string {
+  const { groqKeys, geminiKeys, otherKeys } = classifyConfiguredAIKeys(provider, keys);
+  if (groqKeys.length > 0 && geminiKeys.length > 0) return 'dual_groq_gemini';
+  if (groqKeys.length > 0) return 'groq_only';
+  if (geminiKeys.length > 0) return 'gemini_only';
+  if (otherKeys.length > 0) return 'other_provider';
+  return 'offline_deterministic';
+}
+
+function getActiveVoiceRoutingInfo(groqCount: number, geminiCount: number): { mode: string; models: string[] } {
+  if (groqCount > 0 && geminiCount > 0) {
+    return { mode: 'dual_voice_rotation', models: [...GROQ_VOICE_MODELS, ...GEMINI_VOICE_LIVE_MODELS] };
+  }
+  if (geminiCount > 0) {
+    return { mode: 'gemini_live_rotation', models: [...GEMINI_VOICE_LIVE_MODELS] };
+  }
+  if (groqCount > 0) {
+    return { mode: 'groq_whisper_rotation', models: [...GROQ_VOICE_MODELS] };
+  }
+  return { mode: 'disabled', models: [] };
+}
+
+interface VoiceSlotState {
+  shortCooldownUntil: number;
+  dailyCooldownUntil: number;
+  authDisabledUntil: number;
+  requestsToday: number;
+  dayUTC: string;
+}
+
+const groqVoiceSlotStates = new Map<string, VoiceSlotState>();
+const geminiVoiceSlotStates = new Map<string, VoiceSlotState>();
+let groqVoiceCursor = 0;
+let geminiVoiceCursor = 0;
+let dualVoiceTurnCursor = 0;
+
+function getVoiceSlotState(map: Map<string, VoiceSlotState>, kHash: string, model: string, now: number): VoiceSlotState {
+  const dayUTC = new Date(now).toISOString().slice(0, 10);
+  const id = `${kHash}|${model}`;
+  let st = map.get(id);
+  if (!st) {
+    st = { shortCooldownUntil: 0, dailyCooldownUntil: 0, authDisabledUntil: 0, requestsToday: 0, dayUTC };
+    map.set(id, st);
+    return st;
+  }
+  if (st.dayUTC !== dayUTC) {
+    st.dayUTC = dayUTC;
+    st.requestsToday = 0;
+    st.dailyCooldownUntil = 0;
+  }
+  return st;
+}
+
+function getGeminiSlot(kHash: string, model: string, now: number): GeminiSlotState {
+  const dayUTC = new Date(now).toISOString().slice(0, 10);
+  const id = `${kHash}|${model}`;
+  let st = geminiSlotStates.get(id);
+  if (!st) {
+    st = { rpmCooldownUntil: 0, rpdCooldownUntil: 0, authDisabledUntil: 0, tokensUsedToday: 0, requestsToday: 0, dayUTC };
+    geminiSlotStates.set(id, st);
+    return st;
+  }
+  if (st.dayUTC !== dayUTC) {
+    st.dayUTC = dayUTC;
+    st.tokensUsedToday = 0;
+    st.requestsToday = 0;
+    st.rpdCooldownUntil = 0;
+  }
+  return st;
+}
+
+function getDecisionKeyState(kHash: string, now: number): DecisionKeyState {
+  const dayUTC = new Date(now).toISOString().slice(0, 10);
+  let st = decisionKeyStates.get(kHash);
+  if (!st) {
+    st = { rpmCooldownUntil: 0, rpdCooldownUntil: 0, authDisabledUntil: 0, requestsToday: 0, dayUTC };
+    decisionKeyStates.set(kHash, st);
+    return st;
+  }
+  if (st.dayUTC !== dayUTC) {
+    st.dayUTC = dayUTC;
+    st.requestsToday = 0;
+    st.rpdCooldownUntil = 0;
+  }
+  return st;
+}
+
+function classifyGemini429(headers: Headers | null, bodyText: string): { isRPD: boolean; cooldownMs: number } {
+  const lower = bodyText.toLowerCase();
+  const retryAfter = headers ? parseGroqDurationMs(headers.get('retry-after')) : 0;
+  if (
+    lower.includes('per day') ||
+    lower.includes('perday') ||
+    lower.includes('daily') ||
+    lower.includes('rpd') ||
+    lower.includes('quota_exceeded') ||
+    retryAfter >= 300_000
+  ) {
+    return { isRPD: true, cooldownMs: Math.max(retryAfter, 2 * 3_600_000) };
+  }
+  return { isRPD: false, cooldownMs: (retryAfter > 0 && retryAfter < 300_000 ? retryAfter : 65_000) + 2000 };
 }
 
 function getGroqSlot(kHash: string, model: string, now: number): GroqSlotState {
@@ -2778,12 +2982,18 @@ function isPureCheckoutOrProfileMessage(msg: string, hasCart: boolean): boolean 
   return toks.every((t) => /^\d+$/.test(t) || CHECKOUT_ONLY_WORDS.has(t) || FILLER_ORDER_WORDS.has(t) || RAG_STOP_WORDS.has(t));
 }
 
+function stripVoiceNoteMarkers(s: string): string {
+  return s.replace(/^\s*(?:🎙️\s*)?\[(?:customer\s+)?voice\s+note\]:?\s*/i, '').trim();
+}
+
 function buildSmartCompactInventory(
   inStockProducts: Product[],
   query: string,
   history: Array<{ role: string; content: string }>,
   cartProductIDs: Set<string>
 ): string {
+  query = stripVoiceNoteMarkers(query);
+  history = history.map((h) => ({ ...h, content: stripVoiceNoteMarkers(h.content) }));
   if (inStockProducts.length === 0) return 'INV: No in-stock items loaded yet.';
 
   const catBuckets = new Map<string, Product[]>();
@@ -3057,6 +3267,388 @@ async function callGroqPool(
   return null;
 }
 
+function shouldSkipDecisionRouter(incomingText: string, cartActive: boolean): boolean {
+  const clean = incomingText.trim().toLowerCase().replace(/[.!?,]+$/g, '');
+  if (!clean) return true;
+  if (!cartActive && clean.length <= 2) return true;
+  const trivialAcks = new Set([
+    'ok', 'okay', 'k', 'kk', 'haan', 'ha', 'han', 'ji', 'yes', 'no', 'nahi', 'nope',
+    'thanks', 'thank you', 'thx', 'ty', 'dhanyawad', 'shukriya', 'hmm', 'hm', 'accha',
+    'acha', 'theek', 'thik', 'thik hai', 'theek hai', 'nice', 'good', 'great', 'cool',
+    'hi', 'hello', 'hey', 'hii', 'hiii', 'namaste', 'namaskar', 'gm', 'gn',
+  ]);
+  return !cartActive && trivialAcks.has(clean);
+}
+
+async function runGeminiDecisionSmartRoute(
+  geminiKeys: string[],
+  incomingText: string,
+  cartActive: boolean,
+  inStockProducts: Product[]
+): Promise<DecisionRouteResult | null> {
+  if (geminiKeys.length === 0 || shouldSkipDecisionRouter(incomingText, cartActive)) {
+    return null;
+  }
+
+  const now = Date.now();
+  const start = decisionKeyCursor % geminiKeys.length;
+  decisionKeyCursor++;
+  let chosenKey = '';
+  let chosenHash = '';
+  for (let i = 0; i < geminiKeys.length; i++) {
+    const idx = (start + i) % geminiKeys.length;
+    const key = geminiKeys[idx].trim();
+    if (!key) continue;
+    const kh = shortKeyHash(key);
+    const st = getDecisionKeyState(kh, now);
+    if (now < st.authDisabledUntil || now < st.rpdCooldownUntil || now < st.rpmCooldownUntil) {
+      continue;
+    }
+    chosenKey = key;
+    chosenHash = kh;
+    break;
+  }
+  if (!chosenKey) return null;
+
+  // Build unique category criteria map (2..240 categories) for smart category pre-picking
+  const catSlugToName = new Map<string, string>();
+  const catCriteria: Record<string, string> = {};
+  const seenCatLower = new Set<string>();
+  for (const p of inStockProducts) {
+    const c = String(p.category || '').trim();
+    if (!c) continue;
+    const cl = c.toLowerCase();
+    if (seenCatLower.has(cl)) continue;
+    seenCatLower.add(cl);
+    const slug = `cat_${c.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '').slice(0, 36) || catSlugToName.size + 1}`;
+    if (!catSlugToName.has(slug)) {
+      catSlugToName.set(slug, c);
+      catCriteria[slug] = `Products in store category "${c}"`;
+    }
+    if (catSlugToName.size >= 240) break;
+  }
+
+  const questions: Record<string, any> = {
+    route_intent: {
+      type: 'choice',
+      instructions: "Classify the WhatsApp customer's primary intent for this shop message.",
+      criteria: {
+        greeting: 'Simple greeting, small talk, or thank-you with no product or order request.',
+        shopping: 'Asking about products, prices, photos, variants, recommendations, or adding items.',
+        cart_checkout: 'Confirming cart, giving delivery address/name, choosing COD/UPI, or placing order.',
+        order_support: 'Asking about order status, tracking, cancellation, or modifying an existing order.',
+        store_info: 'Asking about store hours, delivery time, policies, minimum order, or store link.',
+        complaint: 'Angry complaint, damaged/wrong item, refund demand, or asking for a human/owner.',
+        other: 'Anything outside the above categories.',
+      },
+    },
+    needs_catalog: {
+      type: 'noul',
+      instructions: 'Does answering this customer message require looking up store product catalog items or prices?',
+      criteria: {
+        true_description: 'Customer asks about items, prices, stock, recommendations, variants, photos, or wants to buy/add products.',
+        false_description: 'Greeting, thanks, store timings, address/payment confirmation, or general support not needing product lookup.',
+      },
+    },
+    needs_quote_reply: {
+      type: 'noul',
+      instructions: 'Is the customer asking a specific direct question (price, stock, policy, order issue, or complaint) where WhatsApp quote-reply improves clarity?',
+      criteria: {
+        true_description: 'Specific direct question, price check, complaint, or multi-part query.',
+        false_description: 'Casual greeting, acknowledgment, or simple chat flow.',
+      },
+    },
+    needs_escalation: {
+      type: 'noul',
+      instructions: 'Is the customer angry, reporting a serious complaint/refund/damaged order, or explicitly asking to talk to a human/owner?',
+      criteria: {
+        true_description: 'Frustrated/angry tone, refund/wrong item dispute, or explicit request for human/owner.',
+        false_description: 'Normal polite shopping, inquiry, or ordering message.',
+      },
+    },
+  };
+
+  if (catSlugToName.size >= 2) {
+    catCriteria.z_none = 'No single specific product category matches this message.';
+    questions.matched_category = {
+      type: 'choice',
+      instructions: 'If the customer is looking for products (even indirectly in Hinglish/Hindi/English), pick the single most relevant store category; otherwise pick z_none.',
+      criteria: catCriteria,
+    };
+  }
+
+  const inputText = `Store: ${ramStore.vendor.business_name} (${ramStore.vendor.business_type})\nCart active: ${cartActive ? 'yes' : 'no'}\nCustomer WhatsApp message: ${compactStr(incomingText, 400)}`;
+
+  try {
+    const decisionsAi = getDecisionsAIClient(chosenKey);
+    const resp: any = await Promise.race([
+      decisionsAi.decisions.create({
+        model: GEMINI_DECISION_MODEL,
+        input: inputText,
+        questions,
+      }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('decision_timeout')), 6000)),
+    ]);
+
+    const st = getDecisionKeyState(chosenHash, Date.now());
+    st.requestsToday += 1;
+    st.rpmCooldownUntil = 0;
+
+    const out: DecisionRouteResult = {
+      intent: 'shopping',
+      skipCatalog: false,
+      needsQuoteReply: false,
+      needsEscalation: false,
+      matchedCategory: '',
+      confidence: 0,
+      used: true,
+    };
+
+    const answers = resp?.answers || {};
+    const ri = answers.route_intent;
+    if (ri?.type === 'choice') {
+      out.intent = String(ri.choice || 'shopping');
+      out.confidence = Number(ri.confidence || 0);
+    }
+    const nc = answers.needs_catalog;
+    if (nc?.type === 'noul') {
+      const pYes = Number(nc.noul ?? 0.5);
+      if (
+        pYes < 0.25 &&
+        !cartActive &&
+        (out.intent === 'greeting' || out.intent === 'store_info' || out.intent === 'order_support')
+      ) {
+        out.skipCatalog = true;
+      }
+    }
+    const nq = answers.needs_quote_reply;
+    if (nq?.type === 'noul' && Number(nq.noul ?? 0) >= 0.72) {
+      out.needsQuoteReply = true;
+    }
+    const ne = answers.needs_escalation;
+    if (ne?.type === 'noul' && Number(ne.noul ?? 0) >= 0.78) {
+      out.needsEscalation = true;
+    }
+    const mc = answers.matched_category;
+    if (mc?.type === 'choice' && mc.choice && mc.choice !== 'z_none' && Number(mc.confidence ?? 0) >= 0.55) {
+      const realCat = catSlugToName.get(String(mc.choice));
+      if (realCat) out.matchedCategory = realCat;
+    }
+
+    console.log(
+      `🧭 [Gemini Decision 1] intent=${out.intent} (conf=${out.confidence.toFixed(2)}) | skipCatalog=${out.skipCatalog} | quote=${out.needsQuoteReply} | escalate=${out.needsEscalation} | cat=${out.matchedCategory || 'none'}`
+    );
+    return out;
+  } catch (err: any) {
+    const msg = String(err?.message || err || '');
+    const status = Number(err?.status || err?.statusCode || 0);
+    const st = getDecisionKeyState(chosenHash, Date.now());
+    if (status === 429 || msg.includes('429') || msg.toLowerCase().includes('resource_exhausted')) {
+      const { isRPD, cooldownMs } = classifyGemini429(null, msg);
+      if (isRPD) {
+        const utcMidnight = new Date();
+        utcMidnight.setUTCHours(24, 1, 0, 0);
+        st.rpdCooldownUntil = Math.min(utcMidnight.getTime(), Date.now() + cooldownMs);
+      } else {
+        st.rpmCooldownUntil = Date.now() + Math.max(cooldownMs, 120_000);
+      }
+      console.warn(`⚡ [Gemini Decision 1 Quota Guard] Cooling down key for smart router, falling back cleanly`);
+    } else if (status === 401 || status === 403) {
+      st.authDisabledUntil = Date.now() + 30 * 60_000;
+    } else {
+      st.rpmCooldownUntil = Date.now() + 60_000;
+    }
+    return null;
+  }
+}
+
+async function callGeminiSingleSlot(
+  slot: { keyIdx: number; apiKey: string; kHash: string; model: string },
+  systemPrompt: string,
+  history: Array<{ role: string; content: string }>,
+  temperature: number
+): Promise<{ text: string; keyIdx: number; model: string } | null> {
+  const isGemma = slot.model.toLowerCase().startsWith('gemma');
+
+  const execReq = async (minimal: boolean) => {
+    const contents: Array<{ role: string; parts: Array<{ text: string }> }> = [];
+    if (isGemma) {
+      let sysFolded = false;
+      for (const m of history) {
+        const role = m.role === 'assistant' || m.role === 'model' ? 'model' : 'user';
+        let txt = m.content;
+        if (!sysFolded && role === 'user') {
+          txt = `[SYSTEM INSTRUCTIONS]\n${systemPrompt}\n\n[CUSTOMER MESSAGE]\n${txt}`;
+          sysFolded = true;
+        }
+        contents.push({ role, parts: [{ text: txt }] });
+      }
+      if (!sysFolded) {
+        contents.unshift({ role: 'user', parts: [{ text: `[SYSTEM INSTRUCTIONS]\n${systemPrompt}` }] });
+      }
+    } else {
+      for (const m of history) {
+        contents.push({
+          role: m.role === 'assistant' || m.role === 'model' ? 'model' : 'user',
+          parts: [{ text: m.content }],
+        });
+      }
+    }
+
+    const genConfig: Record<string, any> = {
+      temperature,
+      maxOutputTokens: 650,
+    };
+    if (!isGemma && !minimal) {
+      genConfig.response_mime_type = 'application/json';
+    }
+
+    const payload: Record<string, any> = {
+      contents,
+      generationConfig: genConfig,
+    };
+    if (!isGemma) {
+      payload.system_instruction = { parts: [{ text: systemPrompt }] };
+    }
+
+    return fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${slot.model}:generateContent?key=${slot.apiKey}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(20000),
+      }
+    );
+  };
+
+  try {
+    let r = await execReq(false);
+    if (r.status === 400) {
+      r = await execReq(true);
+    }
+    const bodyText = await r.text();
+    const st = getGeminiSlot(slot.kHash, slot.model, Date.now());
+    if (r.ok) {
+      const json: any = JSON.parse(bodyText);
+      const parts: any[] = json?.candidates?.[0]?.content?.parts || [];
+      const joined = parts.map((p) => String(p?.text || '')).join('\n');
+      const content = stripThinkBlocks(joined);
+      if (content) {
+        const usageTok = Number(json?.usageMetadata?.totalTokenCount || 0);
+        st.tokensUsedToday += usageTok > 0 ? usageTok : 500;
+        st.requestsToday += 1;
+        st.rpmCooldownUntil = 0;
+        return { text: content, keyIdx: slot.keyIdx, model: slot.model };
+      }
+    } else if (r.status === 429) {
+      const { isRPD, cooldownMs } = classifyGemini429(r.headers, bodyText);
+      if (isRPD) {
+        const utcMidnight = new Date();
+        utcMidnight.setUTCHours(24, 1, 0, 0);
+        st.rpdCooldownUntil = Math.min(utcMidnight.getTime(), Date.now() + cooldownMs);
+        console.warn(`🚫 [Gemini RPD Exhausted] Key #${slot.keyIdx + 1} | model=${slot.model} -> rotating`);
+      } else {
+        st.rpmCooldownUntil = Date.now() + cooldownMs;
+        console.warn(`⚡ [Gemini RPM Limit] Key #${slot.keyIdx + 1} | model=${slot.model} -> switching model/key`);
+      }
+    } else if (r.status === 401 || r.status === 403) {
+      for (const m of GEMINI_ALLOWED_MODELS) {
+        getGeminiSlot(slot.kHash, m, Date.now()).authDisabledUntil = Date.now() + 30 * 60_000;
+      }
+    } else if (r.status === 404) {
+      st.rpmCooldownUntil = Date.now() + 15 * 60_000;
+    } else {
+      st.rpmCooldownUntil = Date.now() + 45_000;
+    }
+  } catch {
+    getGeminiSlot(slot.kHash, slot.model, Date.now()).rpmCooldownUntil = Date.now() + 45_000;
+  }
+  return null;
+}
+
+async function callGeminiPool(
+  geminiKeys: string[],
+  systemPrompt: string,
+  history: Array<{ role: string; content: string }>,
+  temperature: number
+): Promise<{ text: string; keyIdx: number; model: string } | null> {
+  const now = Date.now();
+  const matrix: Array<{ keyIdx: number; apiKey: string; kHash: string; model: string }> = [];
+  for (const model of GEMINI_ALLOWED_MODELS) {
+    for (let kIdx = 0; kIdx < geminiKeys.length; kIdx++) {
+      matrix.push({ keyIdx: kIdx, apiKey: geminiKeys[kIdx], kHash: shortKeyHash(geminiKeys[kIdx]), model });
+    }
+  }
+  if (matrix.length === 0) return null;
+
+  const start = geminiPoolCursor % matrix.length;
+  geminiPoolCursor++;
+  const rotated = [...matrix.slice(start), ...matrix.slice(0, start)];
+
+  const ready: Array<(typeof matrix)[number] & { tokensDay: number }> = [];
+  const rpmDelayed: Array<(typeof matrix)[number] & { rpmUntil: number }> = [];
+
+  for (const slot of rotated) {
+    const st = getGeminiSlot(slot.kHash, slot.model, now);
+    if (now < st.authDisabledUntil || now < st.rpdCooldownUntil) continue;
+    if (now < st.rpmCooldownUntil) rpmDelayed.push({ ...slot, rpmUntil: st.rpmCooldownUntil });
+    else ready.push({ ...slot, tokensDay: st.tokensUsedToday });
+  }
+
+  ready.sort((a, b) => Math.floor(a.tokensDay / 5000) - Math.floor(b.tokensDay / 5000));
+  rpmDelayed.sort((a, b) => a.rpmUntil - b.rpmUntil);
+
+  for (const slot of ready) {
+    const res = await callGeminiSingleSlot(slot, systemPrompt, history, temperature);
+    if (res) return res;
+  }
+  if (rpmDelayed.length > 0) {
+    const best = rpmDelayed[0];
+    const waitMs = best.rpmUntil - Date.now();
+    if (waitMs > 0 && waitMs <= 3000) {
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
+    }
+    const res = await callGeminiSingleSlot(best, systemPrompt, history, temperature);
+    if (res) return res;
+  }
+  return null;
+}
+
+async function callDualGroqGeminiPool(
+  groqKeys: string[],
+  geminiKeys: string[],
+  systemPrompt: string,
+  history: Array<{ role: string; content: string }>,
+  temperature: number
+): Promise<{ text: string; provider: 'groq' | 'gemini'; keyIdx: number; totalProviderKeys: number; model: string } | null> {
+  // Strictly alternate turn-by-turn ("bari-bari") between Groq and Gemini pools,
+  // rotating across all keys × allowed models on both sides with instant cross-provider failover.
+  const preferGeminiFirst = dualTurnCursor % 2 === 1;
+  dualTurnCursor++;
+
+  if (preferGeminiFirst) {
+    const gemRes = await callGeminiPool(geminiKeys, systemPrompt, history, temperature);
+    if (gemRes) {
+      return { text: gemRes.text, provider: 'gemini', keyIdx: gemRes.keyIdx, totalProviderKeys: geminiKeys.length, model: gemRes.model };
+    }
+    const groqRes = await callGroqPool(groqKeys, systemPrompt, history, temperature);
+    if (groqRes) {
+      return { text: groqRes.text, provider: 'groq', keyIdx: groqRes.keyIdx, totalProviderKeys: groqKeys.length, model: groqRes.model };
+    }
+  } else {
+    const groqRes = await callGroqPool(groqKeys, systemPrompt, history, temperature);
+    if (groqRes) {
+      return { text: groqRes.text, provider: 'groq', keyIdx: groqRes.keyIdx, totalProviderKeys: groqKeys.length, model: groqRes.model };
+    }
+    const gemRes = await callGeminiPool(geminiKeys, systemPrompt, history, temperature);
+    if (gemRes) {
+      return { text: gemRes.text, provider: 'gemini', keyIdx: gemRes.keyIdx, totalProviderKeys: geminiKeys.length, model: gemRes.model };
+    }
+  }
+  return null;
+}
+
 async function runOctopusAI(
   phone: string,
   query: string,
@@ -3103,20 +3695,53 @@ async function runOctopusAI(
   const currentCart = ramStore.activeCarts.get(cleanPhone) || [];
   const cust = ramStore.customers.get(cleanPhone);
 
-  // 3. Compact 6-Message Sliding Window + Smart Single-Pass RAG + Groq 3-Model TPD/TPM Pool
+  // 3. 3-Mode Multi-Provider AI Router (Groq-Only | Gemini-Only 4-Model + Decision 1 | Dual Rotation + Decision 1)
   if (candidateKeys.length > 0) {
+    const { groqKeys, geminiKeys, otherKeys } = classifyConfiguredAIKeys(provider, candidateKeys);
+
+    const cleanQueryForRouting = stripVoiceNoteMarkers(query);
     const rawHistory = (ramStore.chats.get(cleanPhone) || []).slice(-(MAX_LLM_HISTORY_MESSAGES - 1));
     const llmHistory: Array<{ role: string; content: string }> = rawHistory.map((m) => {
       const role = m.role === 'assistant' || m.direction.startsWith('outgoing') ? 'assistant' : 'user';
       return { role, content: compactStr(m.text, role === 'assistant' ? 160 : 200) };
     });
-    if (llmHistory.length === 0 || llmHistory[llmHistory.length - 1].content !== compactStr(query, 500)) {
-      llmHistory.push({ role: 'user', content: compactStr(query, 500) });
+    const lastHistContent = llmHistory.length > 0 ? stripVoiceNoteMarkers(llmHistory[llmHistory.length - 1].content) : '';
+    if (llmHistory.length === 0 || lastHistContent !== compactStr(cleanQueryForRouting, 200)) {
+      llmHistory.push({ role: 'user', content: compactStr(cleanQueryForRouting, 500) });
     }
     const finalHistory = llmHistory.slice(-MAX_LLM_HISTORY_MESSAGES);
 
+    // Smart Routing via Gemini Decision 1 ONLY when Gemini API key(s) are configured
+    // (Active in Gemini-Only & Dual modes; skipped completely in Groq-Only mode).
+    let routeDec: DecisionRouteResult | null = null;
+    if (geminiKeys.length > 0) {
+      routeDec = await runGeminiDecisionSmartRoute(geminiKeys, cleanQueryForRouting, currentCart.length > 0, inStockProducts);
+    }
+
     const cartProductIDs = new Set(currentCart.map((c) => c.product_id));
-    const inventoryBlock = buildSmartCompactInventory(inStockProducts, query, finalHistory, cartProductIDs);
+    let inventoryBlock = '';
+    if (routeDec?.skipCatalog) {
+      inventoryBlock = 'INV: skipped (non-shopping message; call search_catalog if customer asks for items)';
+    } else {
+      inventoryBlock = buildSmartCompactInventory(inStockProducts, cleanQueryForRouting, finalHistory, cartProductIDs);
+      if (
+        routeDec?.matchedCategory &&
+        !inventoryBlock.includes('MULTI_ITEM_MATCH') &&
+        !inventoryBlock.includes('checkout mode') &&
+        (inventoryBlock.includes('HINT: 0 direct keyword hits') ||
+          !inventoryBlock.toLowerCase().includes(`|${routeDec.matchedCategory.toLowerCase()}|`))
+      ) {
+        const preFetched = executeSearchCatalogHand(inStockProducts, [], [routeDec.matchedCategory]);
+        if (preFetched) {
+          inventoryBlock += `\n\nSMART_CATEGORY_PREFETCH(${routeDec.matchedCategory}):\n${preFetched}`;
+        }
+      }
+    }
+
+    const routerHint = routeDec?.needsEscalation
+      ? '\nROUTER_HINT: Customer sounds upset or needs human/owner help — respond empathetically and include escalate_to_human action if warranted.'
+      : '';
+
     const cartTotal = currentCart.reduce((sum, it) => sum + it.line_total, 0);
     const cartLine =
       currentCart.length > 0
@@ -3152,10 +3777,24 @@ ${ramStore.ai.system_prompt ? `VENDOR NOTE: ${compactStr(ramStore.ai.system_prom
 STATE:${currentCart.length > 0 ? 'CART_ACTIVE' : 'BROWSING'} | ${cartLine}
 CUST:${profParts.join(' | ')}
 
-${inventoryBlock}`;
+${inventoryBlock}${routerHint}`;
 
-    const groqKeys = candidateKeys.filter((k) => isGroqProvider(provider, k));
-    const otherKeys = candidateKeys.filter((k) => !isGroqProvider(provider, k));
+    const parseJSONReply = (rawText: string, engineLabel: string, keyIdx: number) => {
+      const match = rawText.match(/\{[\s\S]*\}/);
+      if (!match) return null;
+      try {
+        const parsed = JSON.parse(match[0]);
+        return {
+          ai_reply_text: String(parsed.ai_reply_text || parsed.reply_to_customer || '').trim(),
+          quote_reply: Boolean(parsed.quote_reply) || Boolean(routeDec?.needsQuoteReply),
+          actions: Array.isArray(parsed.actions) ? parsed.actions : [],
+          engine: engineLabel,
+          key_used_index: keyIdx,
+        };
+      } catch {
+        return null;
+      }
+    };
 
     const invokeLLMOnce = async (promptToSend: string): Promise<{
       ai_reply_text: string;
@@ -3164,88 +3803,77 @@ ${inventoryBlock}`;
       engine: string;
       key_used_index: number;
     } | null> => {
-      if (groqKeys.length > 0) {
-        const groqRes = await callGroqPool(groqKeys, promptToSend, finalHistory, ramStore.ai.temperature || 0.72);
+      const temp = ramStore.ai.temperature || 0.72;
+
+      // Case 1: Dual Mode (BOTH Groq & Gemini keys configured -> turn-by-turn alternating rotation + cross-provider failover)
+      if (groqKeys.length > 0 && geminiKeys.length > 0) {
+        const dualRes = await callDualGroqGeminiPool(groqKeys, geminiKeys, promptToSend, finalHistory, temp);
+        if (dualRes?.text) {
+          const parsed = parseJSONReply(
+            dualRes.text,
+            `dual:${dualRes.provider}:${dualRes.model} (key #${dualRes.keyIdx + 1}/${dualRes.totalProviderKeys})`,
+            dualRes.keyIdx
+          );
+          if (parsed) return parsed;
+        }
+      } else if (groqKeys.length > 0) {
+        // Case 2: Groq-Only Mode (unchanged 3-model Groq TPD/TPM architecture)
+        const groqRes = await callGroqPool(groqKeys, promptToSend, finalHistory, temp);
         if (groqRes?.text) {
-          const match = groqRes.text.match(/\{[\s\S]*\}/);
-          if (match) {
-            try {
-              const parsed = JSON.parse(match[0]);
-              return {
-                ai_reply_text: String(parsed.ai_reply_text || parsed.reply_to_customer || '').trim(),
-                quote_reply: Boolean(parsed.quote_reply),
-                actions: Array.isArray(parsed.actions) ? parsed.actions : [],
-                engine: `groq:${groqRes.model} (key #${groqRes.keyIdx + 1}/${groqKeys.length})`,
-                key_used_index: groqRes.keyIdx,
-              };
-            } catch {
-              // Fall through to backup keys
-            }
-          }
+          const parsed = parseJSONReply(
+            groqRes.text,
+            `groq:${groqRes.model} (key #${groqRes.keyIdx + 1}/${groqKeys.length})`,
+            groqRes.keyIdx
+          );
+          if (parsed) return parsed;
+        }
+      } else if (geminiKeys.length > 0) {
+        // Case 3: Gemini-Only Mode (strictly the 4 allowed Gemma/Gemini Lite models)
+        const gemRes = await callGeminiPool(geminiKeys, promptToSend, finalHistory, temp);
+        if (gemRes?.text) {
+          const parsed = parseJSONReply(
+            gemRes.text,
+            `gemini:${gemRes.model} (key #${gemRes.keyIdx + 1}/${geminiKeys.length})`,
+            gemRes.keyIdx
+          );
+          if (parsed) return parsed;
         }
       }
 
+      // Backup non-Groq / non-Gemini providers (DeepSeek, OpenRouter, OpenAI)
       for (let idx = 0; idx < otherKeys.length; idx++) {
         const apiKey = otherKeys[idx];
         try {
-          let rawText = '';
-          if (provider === 'gemini' || apiKey.startsWith('AIzaSy')) {
-            const model = ramStore.ai.model?.includes('gemini') ? ramStore.ai.model : 'gemini-2.0-flash';
-            const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                system_instruction: { parts: [{ text: promptToSend }] },
-                contents: finalHistory.map((m) => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] })),
-                generationConfig: { temperature: ramStore.ai.temperature || 0.72, maxOutputTokens: 600, response_mime_type: 'application/json' },
-              }),
-              signal: AbortSignal.timeout(15000),
-            });
-            if (!r.ok) throw new Error(`HTTP ${r.status}`);
-            const json: any = await r.json();
-            rawText = json?.candidates?.[0]?.content?.parts?.[0]?.text || '';
-          } else {
-            const endpoint =
-              provider === 'deepseek'
-                ? 'https://api.deepseek.com/chat/completions'
-                : provider === 'openrouter' || apiKey.startsWith('sk-or-')
-                  ? 'https://openrouter.ai/api/v1/chat/completions'
-                  : 'https://api.openai.com/v1/chat/completions';
-            const model =
-              provider === 'deepseek'
-                ? ramStore.ai.model || 'deepseek-chat'
-                : provider === 'openrouter' || apiKey.startsWith('sk-or-')
-                  ? ramStore.ai.model || 'meta-llama/llama-3.1-8b-instruct:free'
-                  : ramStore.ai.model || 'gpt-4o-mini';
-            const r = await fetch(endpoint, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-              body: JSON.stringify({
-                model,
-                temperature: ramStore.ai.temperature || 0.72,
-                max_tokens: 600,
-                response_format: { type: 'json_object' },
-                messages: [{ role: 'system', content: promptToSend }, ...finalHistory],
-              }),
-              signal: AbortSignal.timeout(15000),
-            });
-            if (!r.ok) throw new Error(`HTTP ${r.status}`);
-            const json: any = await r.json();
-            rawText = stripThinkBlocks(json?.choices?.[0]?.message?.content || '');
-          }
-
+          const endpoint =
+            provider === 'deepseek'
+              ? 'https://api.deepseek.com/chat/completions'
+              : provider === 'openrouter' || apiKey.startsWith('sk-or-')
+                ? 'https://openrouter.ai/api/v1/chat/completions'
+                : 'https://api.openai.com/v1/chat/completions';
+          const model =
+            provider === 'deepseek'
+              ? ramStore.ai.model || 'deepseek-chat'
+              : provider === 'openrouter' || apiKey.startsWith('sk-or-')
+                ? ramStore.ai.model || 'meta-llama/llama-3.1-8b-instruct:free'
+                : ramStore.ai.model || 'gpt-4o-mini';
+          const r = await fetch(endpoint, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+            body: JSON.stringify({
+              model,
+              temperature: temp,
+              max_tokens: 600,
+              response_format: { type: 'json_object' },
+              messages: [{ role: 'system', content: promptToSend }, ...finalHistory],
+            }),
+            signal: AbortSignal.timeout(15000),
+          });
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          const json: any = await r.json();
+          const rawText = stripThinkBlocks(json?.choices?.[0]?.message?.content || '');
           if (rawText) {
-            const match = rawText.match(/\{[\s\S]*\}/);
-            if (match) {
-              const parsed = JSON.parse(match[0]);
-              return {
-                ai_reply_text: String(parsed.ai_reply_text || parsed.reply_to_customer || '').trim(),
-                quote_reply: Boolean(parsed.quote_reply),
-                actions: Array.isArray(parsed.actions) ? parsed.actions : [],
-                engine: `${provider} (key #${idx + 1}/${otherKeys.length})`,
-                key_used_index: idx,
-              };
-            }
+            const parsed = parseJSONReply(rawText, `${provider} (key #${idx + 1}/${otherKeys.length})`, idx);
+            if (parsed) return parsed;
           }
         } catch (err) {
           console.warn(`⚠️ [Multi-Key AI Fallback] Key #${idx + 1}/${otherKeys.length} failed, rotating...`, err);
@@ -3394,7 +4022,7 @@ ${inventoryBlock}`;
         .join('\n');
       const prefix =
         mediaType === 'voice_note'
-          ? `🎙️ *Voice Note Transcribed (Groq Whisper)*\n`
+          ? `🎙️ *Voice Note Processed*\n`
           : mediaType === 'burst'
             ? `⚡ *Debounced 3-Message Burst Combined (2.5s Window)*\n`
             : '';
@@ -3427,6 +4055,323 @@ ${inventoryBlock}`;
   }
 
   return { ai_reply_text: reply, actions, engine: 'ram-octopus-v2.2', key_used_index: -1 };
+}
+
+async function preparePCM16kForGeminiLive(audioBuffer: Buffer, mimeType: string): Promise<Buffer | null> {
+  const clean = mimeType.toLowerCase().split(';')[0].trim();
+  if (clean === 'audio/pcm' || clean === 'audio/l16') {
+    return audioBuffer;
+  }
+  try {
+    const { stdout } = await new Promise<{ stdout: Buffer }>((resolve, reject) => {
+      const proc = execFile(
+        'ffmpeg',
+        ['-hide_banner', '-loglevel', 'error', '-i', 'pipe:0', '-f', 's16le', '-acodec', 'pcm_s16le', '-ac', '1', '-ar', '16000', 'pipe:1'],
+        { encoding: 'buffer', maxBuffer: 10 * 1024 * 1024, timeout: 10000 },
+        (err, stdoutBuf) => {
+          if (err) reject(err);
+          else resolve({ stdout: stdoutBuf as Buffer });
+        }
+      );
+      proc.stdin?.end(audioBuffer);
+    });
+    return stdout && stdout.length > 0 ? stdout : null;
+  } catch {
+    return null;
+  }
+}
+
+async function callGroqWhisperVoiceSlot(
+  apiKey: string,
+  model: string,
+  bizContext: string,
+  audioBuffer: Buffer,
+  mimeType: string
+): Promise<{ ok: boolean; text?: string; status: number; isTPD: boolean; cooldownMs: number }> {
+  const ext = mimeType.includes('mp3') || mimeType.includes('mpeg')
+    ? 'mp3'
+    : mimeType.includes('wav')
+      ? 'wav'
+      : mimeType.includes('mp4') || mimeType.includes('m4a')
+        ? 'm4a'
+        : 'ogg';
+  const fd = new FormData();
+  fd.append('file', new Blob([new Uint8Array(audioBuffer)], { type: mimeType || 'audio/ogg' }), `voice.${ext}`);
+  fd.append('model', model);
+  fd.append(
+    'prompt',
+    `WhatsApp shopping voice note for ${bizContext}. Transcribe Hindi, Hinglish, or English words accurately.`
+  );
+
+  try {
+    const r = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${apiKey}` },
+      body: fd,
+      signal: AbortSignal.timeout(16000),
+    });
+    const bodyText = await r.text();
+    if (r.ok) {
+      const json: any = JSON.parse(bodyText);
+      const txt = String(json?.text || '').trim();
+      if (txt) return { ok: true, text: txt, status: 200, isTPD: false, cooldownMs: 0 };
+    }
+    if (r.status === 429) {
+      const cd = classifyGroq429(r.headers, bodyText);
+      return { ok: false, status: 429, isTPD: cd.isTPD, cooldownMs: cd.cooldownMs };
+    }
+    return { ok: false, status: r.status, isTPD: false, cooldownMs: 45_000 };
+  } catch {
+    return { ok: false, status: 0, isTPD: false, cooldownMs: 45_000 };
+  }
+}
+
+async function callGeminiLiveVoiceSlot(
+  apiKey: string,
+  model: string,
+  bizContext: string,
+  pcm16k: Buffer
+): Promise<{ ok: boolean; text?: string; status: number }> {
+  try {
+    const liveAi = getDecisionsAIClient(apiKey);
+    let inputTr = '';
+    let outputTr = '';
+    let textParts = '';
+    let settled = false;
+
+    const transcript = await new Promise<string>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (!settled) {
+          settled = true;
+          const combined = (inputTr || textParts || outputTr).trim();
+          if (combined) resolve(combined);
+          else reject(new Error('gemini_live_timeout'));
+        }
+      }, 15000);
+
+      void liveAi.live
+        .connect({
+          model,
+          config: {
+            responseModalities: [Modality.AUDIO],
+            inputAudioTranscription: {},
+            outputAudioTranscription: {},
+            systemInstruction: `Listen to the customer WhatsApp voice note for shop "${bizContext}" and help capture every spoken word accurately.`,
+          },
+          callbacks: {
+            onmessage: (msg: any) => {
+              const sc = msg?.serverContent;
+              if (sc?.inputTranscription?.text) inputTr += sc.inputTranscription.text;
+              if (sc?.outputTranscription?.text) outputTr += sc.outputTranscription.text;
+              for (const pt of sc?.modelTurn?.parts ?? []) {
+                if (pt?.text) textParts += pt.text;
+              }
+              if (sc?.turnComplete && !settled) {
+                settled = true;
+                clearTimeout(timer);
+                resolve((inputTr || textParts || outputTr).trim());
+              }
+            },
+            onerror: (err: any) => {
+              if (!settled) {
+                settled = true;
+                clearTimeout(timer);
+                reject(err);
+              }
+            },
+            onclose: () => {
+              if (!settled) {
+                settled = true;
+                clearTimeout(timer);
+                const combined = (inputTr || textParts || outputTr).trim();
+                if (combined) resolve(combined);
+                else reject(new Error('gemini_live_closed_empty'));
+              }
+            },
+          },
+        })
+        .then((session) => {
+          const chunkSize = 16000;
+          for (let off = 0; off < pcm16k.length; off += chunkSize) {
+            const chunk = pcm16k.subarray(off, Math.min(off + chunkSize, pcm16k.length));
+            session.sendRealtimeInput({
+              audio: { data: chunk.toString('base64'), mimeType: 'audio/pcm;rate=16000' },
+            });
+          }
+          session.sendRealtimeInput({ audioStreamEnd: true });
+          setTimeout(() => {
+            try {
+              session.close();
+            } catch {
+              // ignore
+            }
+          }, 14500);
+        })
+        .catch((err) => {
+          if (!settled) {
+            settled = true;
+            clearTimeout(timer);
+            reject(err);
+          }
+        });
+    });
+
+    return transcript ? { ok: true, text: transcript, status: 200 } : { ok: false, status: 200 };
+  } catch (err: any) {
+    const msg = String(err?.message || err || '');
+    const status = msg.includes('429') ? 429 : msg.includes('401') || msg.includes('403') ? 403 : 500;
+    return { ok: false, status };
+  }
+}
+
+async function executeVoiceNoteHand(
+  audioBase64: string,
+  mimeType = 'audio/ogg',
+  overrideProvider?: string,
+  overrideApiKey?: string
+): Promise<{
+  hand: 'voice_note_transcribe';
+  transcript: string;
+  routingMode: string;
+  provider?: string;
+  model?: string;
+  keyIdx?: number;
+}> {
+  const audioBuffer = Buffer.from(audioBase64, 'base64');
+  const candidateKeys: string[] = [];
+  if (overrideApiKey?.trim()) candidateKeys.push(overrideApiKey.trim());
+  for (const k of allAIKeys()) {
+    if (!candidateKeys.includes(k)) candidateKeys.push(k);
+  }
+  const provider = (overrideProvider || ramStore.ai.provider || 'groq').toLowerCase();
+  const { groqKeys, geminiKeys } = classifyConfiguredAIKeys(provider, candidateKeys);
+  const { mode } = getActiveVoiceRoutingInfo(groqKeys.length, geminiKeys.length);
+
+  if (audioBuffer.length === 0 || (groqKeys.length === 0 && geminiKeys.length === 0)) {
+    return { hand: 'voice_note_transcribe', transcript: '', routingMode: mode };
+  }
+
+  const now = Date.now();
+  const groqSlots: Array<{ provider: 'groq'; keyIdx: number; apiKey: string; kHash: string; model: string }> = [];
+  if (groqKeys.length > 0) {
+    const matrix: typeof groqSlots = [];
+    for (const model of GROQ_VOICE_MODELS) {
+      for (let i = 0; i < groqKeys.length; i++) {
+        matrix.push({ provider: 'groq', keyIdx: i, apiKey: groqKeys[i], kHash: shortKeyHash(groqKeys[i]), model });
+      }
+    }
+    const start = groqVoiceCursor % matrix.length;
+    groqVoiceCursor++;
+    for (const slot of [...matrix.slice(start), ...matrix.slice(0, start)]) {
+      const st = getVoiceSlotState(groqVoiceSlotStates, slot.kHash, slot.model, now);
+      if (now < st.authDisabledUntil || now < st.dailyCooldownUntil || now < st.shortCooldownUntil) continue;
+      groqSlots.push(slot);
+    }
+  }
+
+  const geminiSlots: Array<{ provider: 'gemini'; keyIdx: number; apiKey: string; kHash: string; model: string }> = [];
+  if (geminiKeys.length > 0) {
+    const matrix: typeof geminiSlots = [];
+    for (const model of GEMINI_VOICE_LIVE_MODELS) {
+      for (let i = 0; i < geminiKeys.length; i++) {
+        matrix.push({ provider: 'gemini', keyIdx: i, apiKey: geminiKeys[i], kHash: shortKeyHash(geminiKeys[i]), model });
+      }
+    }
+    const start = geminiVoiceCursor % matrix.length;
+    geminiVoiceCursor++;
+    for (const slot of [...matrix.slice(start), ...matrix.slice(0, start)]) {
+      const st = getVoiceSlotState(geminiVoiceSlotStates, slot.kHash, slot.model, now);
+      if (now < st.authDisabledUntil || now < st.dailyCooldownUntil || now < st.shortCooldownUntil) continue;
+      geminiSlots.push(slot);
+    }
+  }
+
+  type VoiceSlot = (typeof groqSlots)[number] | (typeof geminiSlots)[number];
+  const queue: VoiceSlot[] = [];
+  if (groqKeys.length > 0 && geminiKeys.length > 0) {
+    const gemFirst = dualVoiceTurnCursor % 2 === 1;
+    dualVoiceTurnCursor++;
+    let gi = 0;
+    let mi = 0;
+    let turnGem = gemFirst;
+    while (gi < groqSlots.length || mi < geminiSlots.length) {
+      if (turnGem) {
+        if (mi < geminiSlots.length) queue.push(geminiSlots[mi++]);
+        else if (gi < groqSlots.length) queue.push(groqSlots[gi++]);
+      } else {
+        if (gi < groqSlots.length) queue.push(groqSlots[gi++]);
+        else if (mi < geminiSlots.length) queue.push(geminiSlots[mi++]);
+      }
+      turnGem = !turnGem;
+    }
+  } else if (groqKeys.length > 0) {
+    queue.push(...groqSlots);
+  } else {
+    queue.push(...geminiSlots);
+  }
+
+  const bizContext = ramStore.vendor.business_name || 'Indian Retail Store';
+  let pcm16k: Buffer | null | undefined;
+
+  for (const slot of queue) {
+    if (slot.provider === 'groq') {
+      const r = await callGroqWhisperVoiceSlot(slot.apiKey, slot.model, bizContext, audioBuffer, mimeType);
+      const st = getVoiceSlotState(groqVoiceSlotStates, slot.kHash, slot.model, Date.now());
+      if (r.ok && r.text) {
+        st.requestsToday++;
+        st.shortCooldownUntil = 0;
+        return { hand: 'voice_note_transcribe', transcript: r.text, routingMode: mode, provider: 'groq', model: slot.model, keyIdx: slot.keyIdx };
+      }
+      if (r.status === 429 && r.isTPD) st.dailyCooldownUntil = Date.now() + r.cooldownMs;
+      else if (r.status === 401 || r.status === 403) st.authDisabledUntil = Date.now() + 30 * 60_000;
+      else st.shortCooldownUntil = Date.now() + r.cooldownMs;
+    } else {
+      if (pcm16k === undefined) {
+        pcm16k = await preparePCM16kForGeminiLive(audioBuffer, mimeType);
+      }
+      if (pcm16k) {
+        const r = await callGeminiLiveVoiceSlot(slot.apiKey, slot.model, bizContext, pcm16k);
+        const st = getVoiceSlotState(geminiVoiceSlotStates, slot.kHash, slot.model, Date.now());
+        if (r.ok && r.text) {
+          st.requestsToday++;
+          st.shortCooldownUntil = 0;
+          return { hand: 'voice_note_transcribe', transcript: r.text, routingMode: mode, provider: 'gemini', model: slot.model, keyIdx: slot.keyIdx };
+        }
+        if (r.status === 401 || r.status === 403) st.authDisabledUntil = Date.now() + 30 * 60_000;
+        else st.shortCooldownUntil = Date.now() + (r.status === 429 ? 65_000 : 45_000);
+      }
+    }
+  }
+
+  if (geminiKeys.length > 0 && !pcm16k) {
+    const cleanMime = mimeType.toLowerCase().split(';')[0].trim() || 'audio/ogg';
+    for (let i = 0; i < geminiKeys.length; i++) {
+      try {
+        const ai = getDecisionsAIClient(geminiKeys[i]);
+        const resp = await ai.models.generateContent({
+          model: 'gemini-3.1-flash-lite',
+          contents: [
+            {
+              role: 'user',
+              parts: [
+                { inlineData: { mimeType: cleanMime, data: audioBase64 } },
+                { text: `Transcribe this WhatsApp customer voice note for shop "${bizContext}" verbatim in the original Hindi/Hinglish/English words. Output ONLY the spoken transcript.` },
+              ],
+            },
+          ],
+          config: { temperature: 0.1, maxOutputTokens: 250 },
+        });
+        const txt = String(resp?.text || '').trim();
+        if (txt) {
+          return { hand: 'voice_note_transcribe', transcript: txt, routingMode: mode, provider: 'gemini', model: 'gemini-3.1-flash-lite', keyIdx: i };
+        }
+      } catch {
+        // try next key
+      }
+    }
+  }
+
+  return { hand: 'voice_note_transcribe', transcript: '', routingMode: mode };
 }
 
 // =============================================================================
@@ -3491,18 +4436,30 @@ app.get('/api/bot/overview', (_req: Request, res: Response) => {
       admin_ai_allowed: ramStore.vendor.admin_ai_auto_reply_allowed !== false,
       admin_pause_reason: ramStore.vendor.admin_pause_reason,
     },
-    ai: {
-      provider: ramStore.ai.provider,
-      model: ramStore.ai.model,
-      temperature: ramStore.ai.temperature,
-      auto_reply: ramStore.ai.auto_reply,
-      import_catalog: ramStore.ai.import_catalog,
-      has_api_key: keys.length > 0,
-      api_key_count: keys.length,
-      backup_api_key_count: ramStore.ai.backup_api_keys.length,
-      api_key_masked: maskedKey,
-      system_prompt: ramStore.ai.system_prompt,
-    },
+    ai: (() => {
+      const keyCls = classifyConfiguredAIKeys(ramStore.ai.provider || 'groq', keys);
+      const routingMode = getActiveAIRoutingMode(ramStore.ai.provider || 'groq', keys);
+      const voiceInfo = getActiveVoiceRoutingInfo(keyCls.groqKeys.length, keyCls.geminiKeys.length);
+      return {
+        provider: ramStore.ai.provider,
+        model: ramStore.ai.model,
+        temperature: ramStore.ai.temperature,
+        auto_reply: ramStore.ai.auto_reply,
+        import_catalog: ramStore.ai.import_catalog,
+        has_api_key: keys.length > 0,
+        api_key_count: keys.length,
+        backup_api_key_count: ramStore.ai.backup_api_keys.length,
+        api_key_masked: maskedKey,
+        system_prompt: ramStore.ai.system_prompt,
+        routing_mode: routingMode,
+        groq_key_count: keyCls.groqKeys.length,
+        gemini_key_count: keyCls.geminiKeys.length,
+        decision_router_active: keyCls.geminiKeys.length > 0,
+        decision_router_model: keyCls.geminiKeys.length > 0 ? GEMINI_DECISION_MODEL : '',
+        voice_routing_mode: voiceInfo.mode,
+        voice_models: voiceInfo.models,
+      };
+    })(),
     payment: {
       enabled:
         ramStore.payment.enabled ||
@@ -3997,11 +4954,13 @@ function replyHasSingleMsgTip(text: string): boolean {
 }
 
 app.post('/api/ai/test', async (req: Request, res: Response) => {
-  const query = String(req.body?.query || '').trim();
+  let query = String(req.body?.query || '').trim();
   const phone = normalizePhone(req.body?.customer_phone || '');
-  const mediaType = String(req.body?.media_type || 'text').toLowerCase();
-  if (!query || !phone) {
-    res.status(400).json({ status: 'error', message: 'query and customer_phone are required' });
+  const audioBase64 = String(req.body?.audio_base64 || '').trim();
+  const audioMime = String(req.body?.mime_type || 'audio/ogg').trim();
+  const mediaType = audioBase64 ? 'voice_note' : String(req.body?.media_type || 'text').toLowerCase();
+  if ((!query && !audioBase64) || !phone) {
+    res.status(400).json({ status: 'error', message: 'query (or audio_base64) and customer_phone are required' });
     return;
   }
 
@@ -4032,6 +4991,20 @@ app.post('/api/ai/test', async (req: Request, res: Response) => {
     // 1-second deliberate read delay before reading & processing the message
     await new Promise((resolve) => setTimeout(resolve, MESSAGE_READ_DELAY_MS));
 
+    let voiceHandTrace: { hand: string; payload: any } | null = null;
+    if (audioBase64) {
+      const vh = await executeVoiceNoteHand(audioBase64, audioMime, req.body?.provider, req.body?.api_key);
+      if (vh.transcript) {
+        query = vh.transcript;
+        voiceHandTrace = {
+          hand: 'voice_note_transcribe',
+          payload: { routing_mode: vh.routingMode, provider: vh.provider, model: vh.model, key_index: vh.keyIdx },
+        };
+      } else if (!query) {
+        query = 'Customer sent a voice note that was unclear or silent.';
+      }
+    }
+
     const { customer: cust, changed: custChanged } = upsertCustomerWithChangeCheckRAM({ wa_number: phone, source: 'whatsapp' });
     if (cust && custChanged) {
       void pushToCentralAsync('/api/vendor-bot/events/customer', { event: 'customer.upserted', source: 'whatsapp', customer: cust });
@@ -4045,6 +5018,9 @@ app.post('/api/ai/test', async (req: Request, res: Response) => {
     pushLiveEvent(phone, displayIncoming, 'incoming');
 
     const result = await runOctopusAI(phone, query, req.body?.provider, req.body?.api_key, mediaType);
+    if (voiceHandTrace) {
+      result.actions = [voiceHandTrace, ...result.actions];
+    }
     let finalReply = result.ai_reply_text;
     if (finalReply && isFirstTurn && !replyHasSingleMsgTip(finalReply)) {
       finalReply += FIRST_TURN_SINGLE_MESSAGE_TIP;

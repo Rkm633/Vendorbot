@@ -613,11 +613,26 @@ type scoredIndexedProd struct {
 	score int
 }
 
+var voiceMarkerRegex = regexp.MustCompile(`(?i)^\s*(?:🎙️\s*)?\[(?:customer\s+)?voice\s+note\]:?\s*`)
+
+// stripVoiceNoteMarkers ensures voice transcripts ("🎙️ [Voice Note]: atta 5kg") never
+// inject noise words ("customer", "voice", "note") into smart product matching or checkout detection.
+func stripVoiceNoteMarkers(s string) string {
+	return strings.TrimSpace(voiceMarkerRegex.ReplaceAllString(strings.TrimSpace(s), ""))
+}
+
 // BuildSmartCatalogContext builds a token-optimal, 500-product-ready catalog context using:
 //   - Layer 1: Hinglish/Hindi/English synonyms + phonetic + fuzzy matching
 //   - Layer 2: Multi-item line splitter for 20-25 item orders
 //   - Layer 3: Confidence grouping (CLEAR_MATCH / OPTIONS / UNMATCHED) + Checkout inventory skip
 func BuildSmartCatalogContext(userMsg string, history []ChatMessage, cartProductIDs map[string]bool) string {
+	userMsg = stripVoiceNoteMarkers(userMsg)
+	cleanHistory := make([]ChatMessage, 0, len(history))
+	for _, h := range history {
+		cleanHistory = append(cleanHistory, ChatMessage{Role: h.Role, Content: stripVoiceNoteMarkers(h.Content)})
+	}
+	history = cleanHistory
+
 	products := ramstore.Global.ListProducts(true)
 	if len(products) == 0 {
 		return "INV: No in-stock items loaded yet."

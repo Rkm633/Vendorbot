@@ -84,6 +84,10 @@ func BotOverviewHandler(w http.ResponseWriter, r *http.Request) {
 	subValid, subReason := vendor.IsSubscriptionValid()
 
 	bannerCached, bannerBytesSize, bannerCachedURL, bannerCachedUpdatedAt := ramstore.GlobalBannerCache.Stats()
+	aiCfgRAM := whatsapp.GetUserConfigRAM(vendor.Username)
+	groqKeys, geminiKeys, _ := whatsapp.ClassifyConfiguredAIKeys(vendor.Username, aiCfgRAM)
+	routingMode := whatsapp.GetActiveAIRoutingMode(len(groqKeys), len(geminiKeys))
+	voiceRoutingMode, voiceModels := whatsapp.GetActiveVoiceRoutingInfo(len(groqKeys), len(geminiKeys))
 
 	respondJSON(w, 200, map[string]interface{}{
 		"status": "success",
@@ -106,16 +110,23 @@ func BotOverviewHandler(w http.ResponseWriter, r *http.Request) {
 			"admin_pause_reason":       vendor.AdminPauseReason,
 		},
 		"ai": map[string]interface{}{
-			"provider":             ai.Provider,
-			"model":                ai.Model,
-			"temperature":          ai.Temperature,
-			"auto_reply":           ai.AutoReply,
-			"import_catalog":       ai.ImportCatalog,
-			"has_api_key":          len(allKeys) > 0,
-			"api_key_count":        len(allKeys),
-			"backup_api_key_count": len(ai.BackupAPIKeys),
-			"api_key_masked":       maskedKey,
-			"system_prompt":        ai.SystemPrompt,
+			"provider":               ai.Provider,
+			"model":                  ai.Model,
+			"temperature":            ai.Temperature,
+			"auto_reply":             ai.AutoReply,
+			"import_catalog":         ai.ImportCatalog,
+			"has_api_key":            len(allKeys) > 0,
+			"api_key_count":          len(allKeys),
+			"backup_api_key_count":   len(ai.BackupAPIKeys),
+			"api_key_masked":         maskedKey,
+			"system_prompt":          ai.SystemPrompt,
+			"routing_mode":           routingMode,
+			"groq_key_count":         len(groqKeys),
+			"gemini_key_count":       len(geminiKeys),
+			"decision_router_active": len(geminiKeys) > 0,
+			"decision_router_model":  whatsapp.GeminiDecisionModel,
+			"voice_routing_mode":     voiceRoutingMode,
+			"voice_models":           voiceModels,
 		},
 		"payment": map[string]interface{}{
 			"enabled":                  pay.Enabled || pay.PaytmMID != "" || pay.MerchantVPA != "" || pay.UPIID != "" || pay.Gateway != "",
