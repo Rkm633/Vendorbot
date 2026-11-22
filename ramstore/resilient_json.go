@@ -488,12 +488,12 @@ func DecodePaymentConfig(raw json.RawMessage) (*PaymentConfig, error) {
 		}
 	}
 	if r, ok := firstRaw(m, "verify_poll_interval_ms"); ok {
-		if v := ParseFlexInt(r, DefaultVerifyPollIntervalMS); v > 0 {
+		if v := ParseFlexInt(r); v > 0 {
 			p.VerifyPollIntervalMS = v
 		}
 	}
 	if r, ok := firstRaw(m, "verify_poll_timeout_ms"); ok {
-		if v := ParseFlexInt(r, DefaultVerifyPollTimeoutMS); v > 0 {
+		if v := ParseFlexInt(r); v > 0 {
 			p.VerifyPollTimeoutMS = v
 		}
 	}
