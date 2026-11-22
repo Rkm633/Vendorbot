@@ -132,15 +132,96 @@ func (a AIConfig) AllAPIKeys() []string {
 	return out
 }
 
-// PaymentConfig holds UPI / Paytm / Gateway payment details synced from Central Brain Node in RAM.
+const (
+	DefaultQRWorkerBaseURL     = "https://wamart.rkmtech633.workers.dev"
+	DefaultQRGeneratorURL      = "https://wamart.rkmtech633.workers.dev/generate"
+	DefaultQRCloudName         = "hq67khm3"
+	DefaultVerifyEndpoint      = "/api/payments/verify"
+	DefaultVerifyPollIntervalMS = 3000
+	DefaultVerifyPollTimeoutMS  = 300000
+)
+
+// PaymentConfig holds UPI / Paytm / Branded Banner QR & Central verification polling config synced from Central Brain Node in RAM.
 type PaymentConfig struct {
-	Enabled             bool   `json:"enabled"`
-	Gateway             string `json:"gateway,omitempty"`
-	MerchantPhone       string `json:"merchant_phone"`
-	MerchantVPA         string `json:"merchant_vpa"`
-	PaytmMID            string `json:"paytm_mid"`
-	PayeeName           string `json:"payee_name"`
-	CloudinaryCloudName string `json:"cloudinary_cloud_name"`
+	Enabled              bool   `json:"enabled"`
+	Gateway              string `json:"gateway,omitempty"`
+	MerchantPhone        string `json:"merchant_phone"`
+	UPIID                string `json:"upi_id"`
+	MerchantVPA          string `json:"merchant_vpa"`
+	PaytmMID             string `json:"paytm_mid"`
+	PayeeName            string `json:"payee_name"`
+	CloudinaryCloudName  string `json:"cloudinary_cloud_name"`
+	QRWorkerBaseURL      string `json:"qr_worker_base_url"`
+	QRGeneratorURL       string `json:"qr_generator_url"`
+	QRCloudName          string `json:"qr_cloud_name"`
+	QROnlyMode           bool   `json:"qr_only_mode"`
+	SendPaymentLink      bool   `json:"send_payment_link"`
+	VerifyEndpoint       string `json:"verify_endpoint"`
+	VerifyPollIntervalMS int    `json:"verify_poll_interval_ms"`
+	VerifyPollTimeoutMS  int    `json:"verify_poll_timeout_ms"`
+}
+
+// DefaultPaymentConfig returns a PaymentConfig initialized with WaMart Branded Banner QR & 3s verification defaults.
+func DefaultPaymentConfig() PaymentConfig {
+	return PaymentConfig{
+		Enabled:              false,
+		QRWorkerBaseURL:      DefaultQRWorkerBaseURL,
+		QRGeneratorURL:       DefaultQRGeneratorURL,
+		QRCloudName:          DefaultQRCloudName,
+		CloudinaryCloudName:  DefaultQRCloudName,
+		QROnlyMode:           true,
+		SendPaymentLink:      false,
+		VerifyEndpoint:       DefaultVerifyEndpoint,
+		VerifyPollIntervalMS: DefaultVerifyPollIntervalMS,
+		VerifyPollTimeoutMS:  DefaultVerifyPollTimeoutMS,
+	}
+}
+
+// ApplyDefaults fills empty payment/QR/polling fields with WaMart defaults and keeps UPIID/MerchantVPA synced.
+func (p *PaymentConfig) ApplyDefaults(fallbackPayee string) {
+	if p == nil {
+		return
+	}
+	if strings.TrimSpace(p.UPIID) == "" && strings.TrimSpace(p.MerchantVPA) != "" {
+		p.UPIID = strings.TrimSpace(p.MerchantVPA)
+	}
+	if strings.TrimSpace(p.MerchantVPA) == "" && strings.TrimSpace(p.UPIID) != "" {
+		p.MerchantVPA = strings.TrimSpace(p.UPIID)
+	}
+	if strings.TrimSpace(p.PayeeName) == "" {
+		p.PayeeName = strings.TrimSpace(fallbackPayee)
+	}
+	if strings.TrimSpace(p.QRWorkerBaseURL) == "" {
+		p.QRWorkerBaseURL = DefaultQRWorkerBaseURL
+	}
+	if strings.TrimSpace(p.QRGeneratorURL) == "" {
+		p.QRGeneratorURL = strings.TrimRight(strings.TrimSpace(p.QRWorkerBaseURL), "/") + "/generate"
+	}
+	if strings.TrimSpace(p.QRCloudName) == "" {
+		if strings.TrimSpace(p.CloudinaryCloudName) != "" {
+			p.QRCloudName = strings.TrimSpace(p.CloudinaryCloudName)
+		} else {
+			p.QRCloudName = DefaultQRCloudName
+		}
+	}
+	if strings.TrimSpace(p.CloudinaryCloudName) == "" {
+		p.CloudinaryCloudName = p.QRCloudName
+	}
+	if strings.TrimSpace(p.VerifyEndpoint) == "" {
+		p.VerifyEndpoint = DefaultVerifyEndpoint
+	}
+	if !strings.HasPrefix(p.VerifyEndpoint, "/") && !strings.HasPrefix(p.VerifyEndpoint, "http") {
+		p.VerifyEndpoint = "/" + p.VerifyEndpoint
+	}
+	if p.VerifyPollIntervalMS <= 0 {
+		p.VerifyPollIntervalMS = DefaultVerifyPollIntervalMS
+	}
+	if p.VerifyPollTimeoutMS <= 0 {
+		p.VerifyPollTimeoutMS = DefaultVerifyPollTimeoutMS
+	}
+	if !p.Enabled && (p.PaytmMID != "" || p.MerchantVPA != "" || p.UPIID != "" || p.Gateway != "") {
+		p.Enabled = true
+	}
 }
 
 // ProductVariant represents a weight/size/pack variant with optional custom pricing and stock quantity.
@@ -495,9 +576,7 @@ func NewStore() *Store {
 			AutoReply:     true,
 			ImportCatalog: true,
 		},
-		payment: PaymentConfig{
-			Enabled: false,
-		},
+		payment: DefaultPaymentConfig(),
 		products:    make(map[string]Product),
 		customers:   make(map[string]*Customer),
 		activeCarts: make(map[string][]CartItem),
@@ -600,13 +679,10 @@ func (s *Store) HydrateFromBootstrap(data *BootstrapData) {
 
 	if data.Payment != nil {
 		p := *data.Payment
-		if !p.Enabled && (p.PaytmMID != "" || p.MerchantVPA != "" || p.Gateway != "") {
-			p.Enabled = true
-		}
-		if p.PayeeName == "" {
-			p.PayeeName = s.vendor.BusinessName
-		}
+		p.ApplyDefaults(s.vendor.BusinessName)
 		s.payment = p
+	} else {
+		s.payment.ApplyDefaults(s.vendor.BusinessName)
 	}
 
 	if data.Products != nil {
@@ -857,15 +933,28 @@ func (s *Store) GetPayment() PaymentConfig {
 func (s *Store) SetPayment(p PaymentConfig) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if p.CloudinaryCloudName == "" {
+	if strings.TrimSpace(p.CloudinaryCloudName) == "" {
 		p.CloudinaryCloudName = s.payment.CloudinaryCloudName
 	}
-	if p.PayeeName == "" {
-		p.PayeeName = s.vendor.BusinessName
+	if strings.TrimSpace(p.QRCloudName) == "" {
+		p.QRCloudName = s.payment.QRCloudName
 	}
-	if !p.Enabled && (p.PaytmMID != "" || p.MerchantVPA != "" || p.Gateway != "") {
-		p.Enabled = true
+	if strings.TrimSpace(p.QRWorkerBaseURL) == "" {
+		p.QRWorkerBaseURL = s.payment.QRWorkerBaseURL
 	}
+	if strings.TrimSpace(p.QRGeneratorURL) == "" {
+		p.QRGeneratorURL = s.payment.QRGeneratorURL
+	}
+	if strings.TrimSpace(p.VerifyEndpoint) == "" {
+		p.VerifyEndpoint = s.payment.VerifyEndpoint
+	}
+	if p.VerifyPollIntervalMS <= 0 {
+		p.VerifyPollIntervalMS = s.payment.VerifyPollIntervalMS
+	}
+	if p.VerifyPollTimeoutMS <= 0 {
+		p.VerifyPollTimeoutMS = s.payment.VerifyPollTimeoutMS
+	}
+	p.ApplyDefaults(s.vendor.BusinessName)
 	s.payment = p
 }
 

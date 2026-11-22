@@ -75,14 +75,30 @@ interface AIConfig {
   import_catalog: boolean;
 }
 
+const DEFAULT_QR_WORKER_BASE_URL = 'https://wamart.rkmtech633.workers.dev';
+const DEFAULT_QR_GENERATOR_URL = 'https://wamart.rkmtech633.workers.dev/generate';
+const DEFAULT_QR_CLOUD_NAME = 'hq67khm3';
+const DEFAULT_VERIFY_ENDPOINT = '/api/payments/verify';
+const DEFAULT_VERIFY_POLL_INTERVAL_MS = 3000;
+const DEFAULT_VERIFY_POLL_TIMEOUT_MS = 300000;
+
 interface PaymentConfig {
   enabled: boolean;
   gateway: string;
   merchant_phone: string;
+  upi_id: string;
   merchant_vpa: string;
   paytm_mid: string;
   payee_name: string;
   cloudinary_cloud_name: string;
+  qr_worker_base_url: string;
+  qr_generator_url: string;
+  qr_cloud_name: string;
+  qr_only_mode: boolean;
+  send_payment_link: boolean;
+  verify_endpoint: string;
+  verify_poll_interval_ms: number;
+  verify_poll_timeout_ms: number;
 }
 
 interface ProductVariant {
@@ -771,10 +787,19 @@ const ramStore = {
     enabled: false,
     gateway: '',
     merchant_phone: '',
+    upi_id: '',
     merchant_vpa: '',
     paytm_mid: '',
     payee_name: '',
     cloudinary_cloud_name: '',
+    qr_worker_base_url: DEFAULT_QR_WORKER_BASE_URL,
+    qr_generator_url: DEFAULT_QR_GENERATOR_URL,
+    qr_cloud_name: DEFAULT_QR_CLOUD_NAME,
+    qr_only_mode: true,
+    send_payment_link: false,
+    verify_endpoint: DEFAULT_VERIFY_ENDPOINT,
+    verify_poll_interval_ms: DEFAULT_VERIFY_POLL_INTERVAL_MS,
+    verify_poll_timeout_ms: DEFAULT_VERIFY_POLL_TIMEOUT_MS,
   } as PaymentConfig,
 
   products: new Map<string, Product>(),
@@ -1156,32 +1181,69 @@ function applyPaymentSection(p: Record<string, any>): void {
   const gateway = firstDefined(p, 'gateway', 'provider', 'payment_gateway') !== undefined
     ? parseFlexString(firstDefined(p, 'gateway', 'provider', 'payment_gateway'))
     : curr.gateway;
-  const merchantVpa = firstDefined(p, 'merchant_vpa', 'paytm_vpa', 'upi_id', 'vpa') !== undefined
-    ? parseFlexString(firstDefined(p, 'merchant_vpa', 'paytm_vpa', 'upi_id', 'vpa'))
-    : curr.merchant_vpa;
+  const upiRaw = firstDefined(p, 'upi_id', 'merchant_vpa', 'paytm_vpa', 'vpa');
+  const merchantVpaRaw = firstDefined(p, 'merchant_vpa', 'upi_id', 'paytm_vpa', 'vpa');
+  const upiId = upiRaw !== undefined ? parseFlexString(upiRaw) : (curr.upi_id || curr.merchant_vpa);
+  const merchantVpa = merchantVpaRaw !== undefined ? parseFlexString(merchantVpaRaw) : (upiId || curr.merchant_vpa);
   const paytmMid = firstDefined(p, 'paytm_mid', 'mid', 'merchant_id') !== undefined
     ? parseFlexString(firstDefined(p, 'paytm_mid', 'mid', 'merchant_id'))
     : curr.paytm_mid;
-  const payeeName = firstDefined(p, 'payee_name', 'merchant_name', 'upi_name') !== undefined
-    ? parseFlexString(firstDefined(p, 'payee_name', 'merchant_name', 'upi_name'))
-    : curr.payee_name || ramStore.vendor.business_name;
+  const payeeRaw = firstDefined(p, 'payee_name', 'merchant_name', 'upi_name');
+  const payeeName = (payeeRaw !== undefined ? parseFlexString(payeeRaw) : curr.payee_name) || ramStore.vendor.business_name;
   const merchantPhone = firstDefined(p, 'merchant_phone', 'phone') !== undefined
     ? parseFlexString(firstDefined(p, 'merchant_phone', 'phone'))
     : curr.merchant_phone;
   const cloudinaryCloudName = p.cloudinary_cloud_name !== undefined && p.cloudinary_cloud_name !== null
     ? parseFlexString(p.cloudinary_cloud_name)
     : curr.cloudinary_cloud_name;
+
+  const qrWorkerBaseRaw = firstDefined(p, 'qr_worker_base_url');
+  const qrWorkerBaseUrl = (qrWorkerBaseRaw !== undefined ? parseFlexString(qrWorkerBaseRaw) : curr.qr_worker_base_url) || DEFAULT_QR_WORKER_BASE_URL;
+  const qrGenRaw = firstDefined(p, 'qr_generator_url');
+  const qrGeneratorUrl =
+    (qrGenRaw !== undefined ? parseFlexString(qrGenRaw) : '') ||
+    (qrWorkerBaseRaw !== undefined && qrWorkerBaseUrl ? `${qrWorkerBaseUrl.replace(/\/+$/, '')}/generate` : '') ||
+    curr.qr_generator_url ||
+    DEFAULT_QR_GENERATOR_URL;
+  const qrCloudRaw = firstDefined(p, 'qr_cloud_name');
+  const qrCloudName =
+    (qrCloudRaw !== undefined ? parseFlexString(qrCloudRaw) : '') ||
+    curr.qr_cloud_name ||
+    cloudinaryCloudName ||
+    DEFAULT_QR_CLOUD_NAME;
+  const qrOnlyOpt = parseFlexBoolOpt(firstDefined(p, 'qr_only_mode'));
+  const qrOnlyMode = qrOnlyOpt !== undefined ? qrOnlyOpt : (curr.qr_only_mode ?? true);
+  const sendLinkOpt = parseFlexBoolOpt(firstDefined(p, 'send_payment_link'));
+  const sendPaymentLink = sendLinkOpt !== undefined ? sendLinkOpt : (curr.send_payment_link ?? false);
+  const verifyEpRaw = firstDefined(p, 'verify_endpoint');
+  const verifyEndpoint = (verifyEpRaw !== undefined ? parseFlexString(verifyEpRaw) : curr.verify_endpoint) || DEFAULT_VERIFY_ENDPOINT;
+  const pollIntervalRaw = firstDefined(p, 'verify_poll_interval_ms');
+  const parsedInterval = pollIntervalRaw !== undefined ? Math.round(parseFlexNumber(pollIntervalRaw, curr.verify_poll_interval_ms || DEFAULT_VERIFY_POLL_INTERVAL_MS)) : (curr.verify_poll_interval_ms || DEFAULT_VERIFY_POLL_INTERVAL_MS);
+  const verifyPollIntervalMs = parsedInterval > 0 ? parsedInterval : DEFAULT_VERIFY_POLL_INTERVAL_MS;
+  const pollTimeoutRaw = firstDefined(p, 'verify_poll_timeout_ms');
+  const parsedTimeout = pollTimeoutRaw !== undefined ? Math.round(parseFlexNumber(pollTimeoutRaw, curr.verify_poll_timeout_ms || DEFAULT_VERIFY_POLL_TIMEOUT_MS)) : (curr.verify_poll_timeout_ms || DEFAULT_VERIFY_POLL_TIMEOUT_MS);
+  const verifyPollTimeoutMs = parsedTimeout > 0 ? parsedTimeout : DEFAULT_VERIFY_POLL_TIMEOUT_MS;
+
   const enabledOpt = parseFlexBoolOpt(firstDefined(p, 'enabled', 'online_payment_enabled', 'is_enabled', 'active'));
-  const enabled = enabledOpt !== undefined ? enabledOpt : Boolean(gateway || merchantVpa || paytmMid || curr.enabled);
+  const enabled = enabledOpt !== undefined ? enabledOpt : Boolean(gateway || merchantVpa || upiId || paytmMid || curr.enabled);
 
   ramStore.payment = {
     enabled,
     gateway,
     merchant_phone: merchantPhone,
-    merchant_vpa: merchantVpa,
+    upi_id: upiId || merchantVpa,
+    merchant_vpa: merchantVpa || upiId,
     paytm_mid: paytmMid,
     payee_name: payeeName,
     cloudinary_cloud_name: cloudinaryCloudName,
+    qr_worker_base_url: qrWorkerBaseUrl,
+    qr_generator_url: qrGeneratorUrl,
+    qr_cloud_name: qrCloudName,
+    qr_only_mode: qrOnlyMode,
+    send_payment_link: sendPaymentLink,
+    verify_endpoint: verifyEndpoint,
+    verify_poll_interval_ms: verifyPollIntervalMs,
+    verify_poll_timeout_ms: verifyPollTimeoutMs,
   };
 }
 
@@ -1451,28 +1513,35 @@ async function bootstrapFromCentral(): Promise<{ ok: boolean; error?: string }> 
   }
 
   try {
+    const bootstrapPayload = {
+      bot_public_url: botPublicURL,
+      node_version: '2.4-qr-banner-payment-polling',
+      capabilities: [
+        'auto_public_url',
+        'zero_downtime_redeploy',
+        'zero_polling_event_driven',
+        'zero_chat_sync_ram_only',
+        'admin_gating',
+        'multi_key_ai_fallback',
+        'variants_and_stock',
+        'thumb_ram_cache',
+        'debounce_and_voice',
+        'delivery_partner_alerts',
+        'central_controlled_checkout',
+        'branded_banner_qr_only',
+        'payment_verify_polling',
+      ],
+      timestamp: new Date().toISOString(),
+    };
     let data: any;
     try {
-      data = await callCentralNode('POST', '/api/vendor-bot/bootstrap', {
-        bot_public_url: botPublicURL,
-        node_version: '2.3-zero-polling-zero-chat-sync',
-        capabilities: [
-          'auto_public_url',
-          'zero_downtime_redeploy',
-          'zero_polling_event_driven',
-          'zero_chat_sync_ram_only',
-          'admin_gating',
-          'multi_key_ai_fallback',
-          'variants_and_stock',
-          'thumb_ram_cache',
-          'debounce_and_voice',
-          'delivery_partner_alerts',
-          'central_controlled_checkout',
-        ],
-        timestamp: new Date().toISOString(),
-      });
+      data = await callCentralNode('POST', '/api/node/bootstrap', bootstrapPayload);
     } catch {
-      data = await callCentralNode('GET', '/api/vendor-bot/bootstrap');
+      try {
+        data = await callCentralNode('POST', '/api/vendor-bot/bootstrap', bootstrapPayload);
+      } catch {
+        data = await callCentralNode('GET', '/api/vendor-bot/bootstrap');
+      }
     }
     const { warnings } = hydrateRAM(data);
     if (warnings.length > 0) {
@@ -1509,11 +1578,246 @@ function verifyCentralWebhookAuth(req: Request, res: Response, next: NextFunctio
 }
 
 // =============================================================================
-// 3. CENTRAL-BRAIN-CONTROLLED ORDER SUBMISSION (COD & ONLINE PAYMENT)
-//    Bot NEVER verifies payments locally, NEVER parses UTRs, NEVER marks PAID.
+// 3. CENTRAL-BRAIN BRANDED BANNER QR-ONLY PAYMENT & 3-SECOND VERIFY POLLING
+//    Bot NEVER sends upi:// links or checkout URLs — ONLY Branded Banner QR.
 // =============================================================================
 
-async function submitWhatsAppOrderToCentral(phone: string, requestedMode: string): Promise<{ reply: string; order?: Order }> {
+interface ActivePollerEntry {
+  timer: NodeJS.Timeout;
+  timeout: NodeJS.Timeout;
+}
+
+const activePaymentPollers = new Map<string, ActivePollerEntry>();
+const notifiedPaidOrders = new Map<string, number>();
+
+function markOrderPaidNotifiedOnce(orderId: string): boolean {
+  const key = String(orderId || '').trim();
+  if (!key) return false;
+  if (notifiedPaidOrders.has(key)) return false;
+  const now = Date.now();
+  notifiedPaidOrders.set(key, now);
+  if (notifiedPaidOrders.size > 500) {
+    const cutoff = now - 24 * 60 * 60 * 1000;
+    for (const [k, ts] of notifiedPaidOrders.entries()) {
+      if (ts < cutoff) notifiedPaidOrders.delete(k);
+    }
+  }
+  return true;
+}
+
+function stopPaymentVerificationPoller(orderId: string): void {
+  const key = String(orderId || '').trim();
+  if (!key) return;
+  const entry = activePaymentPollers.get(key);
+  if (entry) {
+    clearInterval(entry.timer);
+    clearTimeout(entry.timeout);
+    activePaymentPollers.delete(key);
+    console.log(`🛑 [PaymentPoller] Stopped verification loop for Order #${key}`);
+  }
+}
+
+async function generateBrandedBannerQR(params: {
+  qrGeneratorUrl: string;
+  vpa: string;
+  payeeName: string;
+  orderId: string;
+  amount: number;
+  cloudName: string;
+}): Promise<string> {
+  const endpoint = (params.qrGeneratorUrl || '').trim() || DEFAULT_QR_GENERATOR_URL;
+  const vpa = (params.vpa || '').trim();
+  if (!vpa) throw new Error('missing UPI VPA for branded banner QR generation');
+  const payee = (params.payeeName || '').trim() || ramStore.vendor.business_name || 'WaMart Store';
+  const cloudName = (params.cloudName || '').trim() || DEFAULT_QR_CLOUD_NAME;
+
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 15000);
+  try {
+    const res = await fetch(endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        vpa,
+        name: payee,
+        orderId: params.orderId,
+        amount: params.amount,
+        cloudName,
+      }),
+      signal: ctrl.signal,
+    });
+    const text = await res.text();
+    if (!res.ok) {
+      throw new Error(`QR worker HTTP ${res.status}: ${text.slice(0, 200)}`);
+    }
+    const parsed = text ? JSON.parse(text) : {};
+    const imageUrl = String(parsed?.imageUrl || parsed?.image_url || '').trim();
+    if (!imageUrl) {
+      throw new Error(`QR worker returned empty imageUrl (success=${String(parsed?.success)})`);
+    }
+    return imageUrl;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function sendPaidOrderConfirmationPreview(params: {
+  orderId: string;
+  customerPhone: string;
+  customerName: string;
+  totalAmount: number;
+  txnId?: string;
+  deliveryAddress: string;
+}): void {
+  const lines = [
+    `✅ *Payment & Order Confirmed!*`,
+    ``,
+    `• *Order ID:* #${params.orderId}`,
+    `• *Amount Paid:* ₹${params.totalAmount.toFixed(2)}`,
+  ];
+  if (params.txnId && params.txnId.trim()) {
+    lines.push(`• *Transaction ID:* ${params.txnId.trim()}`);
+  }
+  lines.push(`• *Status:* CONFIRMED & PAID`);
+  if (params.deliveryAddress && params.deliveryAddress.trim()) {
+    lines.push(`• *Delivery Address:* ${params.deliveryAddress.trim()}`);
+  }
+  lines.push(``, `🙏 Thank you for ordering with *${ramStore.vendor.business_name || 'our store'}*!`);
+  const msg = lines.join('\n');
+
+  appendChatRAM(params.customerPhone, 'assistant', 'outgoing_ai', msg);
+  pushLiveEvent(params.customerPhone, msg, 'outgoing_ai');
+
+  const notifyPhone = normalizePhone(ramStore.vendor.notification_phone || '');
+  if (notifyPhone && notifyPhone !== normalizePhone(params.customerPhone)) {
+    const custLabel = params.customerName || params.customerPhone;
+    let vendorAlert = `🔔 *New Paid Order #${params.orderId}*\n• Customer: ${custLabel} (+${params.customerPhone})\n• Amount Paid: ₹${params.totalAmount.toFixed(2)}\n• Status: CONFIRMED & PAID`;
+    if (params.txnId && params.txnId.trim()) {
+      vendorAlert += `\n• Txn ID: ${params.txnId.trim()}`;
+    }
+    if (params.deliveryAddress && params.deliveryAddress.trim()) {
+      vendorAlert += `\n• Address: ${params.deliveryAddress.trim()}`;
+    }
+    pushLiveEvent(notifyPhone, vendorAlert, 'outgoing_ai');
+  }
+}
+
+function startPaymentVerificationPoller(params: {
+  orderId: string;
+  customerPhone: string;
+  customerName: string;
+  deliveryAddress: string;
+  totalAmount: number;
+  paytmMid: string;
+}): void {
+  const orderId = String(params.orderId || '').trim();
+  if (!orderId || !centralNodeURL || !vendorApiKey) return;
+  if (activePaymentPollers.has(orderId)) return;
+
+  const payCfg = ramStore.payment;
+  const intervalMs = payCfg.verify_poll_interval_ms > 0 ? payCfg.verify_poll_interval_ms : DEFAULT_VERIFY_POLL_INTERVAL_MS;
+  const timeoutMs = payCfg.verify_poll_timeout_ms > 0 ? payCfg.verify_poll_timeout_ms : DEFAULT_VERIFY_POLL_TIMEOUT_MS;
+  const verifyEndpoint = (payCfg.verify_endpoint || DEFAULT_VERIFY_ENDPOINT).trim() || DEFAULT_VERIFY_ENDPOINT;
+  const paytmMid = (params.paytmMid || payCfg.paytm_mid || '').trim();
+  const cleanPhone = normalizePhone(params.customerPhone);
+
+  let inFlight = false;
+  const tick = async () => {
+    if (inFlight || !activePaymentPollers.has(orderId)) return;
+    inFlight = true;
+    try {
+      const username = (ramStore.vendor.username || '').trim();
+      const raw = await callCentralNode('POST', verifyEndpoint, {
+        order_id: orderId,
+        ORDERID: orderId,
+        username,
+        tenant_id: username,
+        paytm_mid: paytmMid,
+        source: 'vendor_bot',
+      });
+      const data = raw?.data && isPlainObject(raw.data) ? { ...raw, ...raw.data } : (raw || {});
+      const payStatus = String(data.payment_status || '').trim().toUpperCase();
+      const ordStatus = String(data.order_status || '').trim().toUpperCase();
+      const isPaid = data.is_paid === true || data.verified === true || payStatus === 'PAID';
+      const isCancelled = data.cancelled === true || payStatus === 'CANCELLED' || ordStatus === 'CANCELLED';
+
+      if (isPaid) {
+        stopPaymentVerificationPoller(orderId);
+        ramStore.activeCarts.delete(cleanPhone);
+
+        const existing = ramStore.orders.get(orderId);
+        upsertOrderRAM(
+          {
+            order_id: orderId,
+            customer_phone: cleanPhone,
+            customer_name: existing?.customer_name || params.customerName,
+            delivery_address: existing?.delivery_address || params.deliveryAddress,
+            total_amount: existing?.total_amount || params.totalAmount,
+            payment_mode: 'ONLINE',
+            payment_status: 'PAID',
+            order_status: 'CONFIRMED',
+            source: existing?.source || 'whatsapp',
+          },
+          true
+        );
+        upsertCustomerRAM({
+          wa_number: cleanPhone,
+          current_state: 'ORDER_CONFIRMED',
+          payment_status: 'PAID',
+          current_order_id: '',
+          last_order_details: `Order #${orderId} (₹${params.totalAmount.toFixed(2)} • CONFIRMED & PAID)`,
+        });
+
+        if (markOrderPaidNotifiedOnce(orderId)) {
+          const txnId = String(data.txn_id || data.txnid || data.transaction_id || data.utr || '').trim();
+          sendPaidOrderConfirmationPreview({
+            orderId,
+            customerPhone: cleanPhone,
+            customerName: params.customerName,
+            totalAmount: params.totalAmount,
+            txnId,
+            deliveryAddress: params.deliveryAddress,
+          });
+        }
+        return;
+      }
+
+      if (isCancelled) {
+        stopPaymentVerificationPoller(orderId);
+        upsertOrderRAM(
+          {
+            order_id: orderId,
+            customer_phone: cleanPhone,
+            payment_status: 'CANCELLED',
+            order_status: 'CANCELLED',
+          },
+          true
+        );
+      }
+    } catch (err: any) {
+      console.warn(`⚠️ [PaymentPoller] Verify tick error for Order #${orderId}: ${err?.message || String(err)} (retrying)`);
+    } finally {
+      inFlight = false;
+    }
+  };
+
+  const timer = setInterval(() => {
+    void tick();
+  }, intervalMs);
+
+  const timeout = setTimeout(() => {
+    if (!activePaymentPollers.has(orderId)) return;
+    stopPaymentVerificationPoller(orderId);
+    const timeoutMsg = `Payment verification window for Order #${orderId} timed out. If you already paid, please wait or contact the store with your payment screenshot.`;
+    appendChatRAM(cleanPhone, 'assistant', 'outgoing_ai', timeoutMsg);
+    pushLiveEvent(cleanPhone, timeoutMsg, 'outgoing_ai');
+  }, timeoutMs);
+
+  activePaymentPollers.set(orderId, { timer, timeout });
+  console.log(`🔄 [PaymentPoller] Started 3s payment verify loop for Order #${orderId} (interval=${intervalMs}ms, timeout=${timeoutMs}ms, endpoint=${verifyEndpoint})`);
+}
+
+async function submitWhatsAppOrderToCentral(phone: string, requestedMode: string): Promise<{ reply: string; order?: Order; qr_image_url?: string }> {
   const cleanPhone = normalizePhone(phone);
   const items = ramStore.activeCarts.get(cleanPhone) || [];
   if (items.length === 0) {
@@ -1559,9 +1863,13 @@ async function submitWhatsAppOrderToCentral(phone: string, requestedMode: string
   let centralOrderId = `ORD${Date.now()}`;
   let centralStatus = mode === 'ONLINE' ? 'PENDING_PAYMENT' : 'PENDING_CONFIRMATION';
   let centralPayStatus = mode === 'COD' ? 'COD_PENDING' : 'PENDING';
-  let paymentLink = '';
+  let centralTotal = subtotal;
   let paymentQrUrl = '';
-  let paymentInstructions = '';
+  let upiId = ramStore.payment.upi_id || ramStore.payment.merchant_vpa || '';
+  let payeeName = ramStore.payment.payee_name || ramStore.vendor.business_name || 'WaMart Store';
+  let paytmMid = ramStore.payment.paytm_mid || '';
+  let qrGeneratorUrl = ramStore.payment.qr_generator_url || DEFAULT_QR_GENERATOR_URL;
+  let qrCloudName = ramStore.payment.qr_cloud_name || ramStore.payment.cloudinary_cloud_name || DEFAULT_QR_CLOUD_NAME;
   let centralMsg = '';
 
   if (centralNodeURL && vendorApiKey) {
@@ -1571,20 +1879,40 @@ async function submitWhatsAppOrderToCentral(phone: string, requestedMode: string
       if (data.order_id) centralOrderId = String(data.order_id);
       if (data.order_status) centralStatus = String(data.order_status).toUpperCase();
       if (data.payment_status) centralPayStatus = String(data.payment_status).toUpperCase();
-      if (data.payment_link) paymentLink = String(data.payment_link);
+      if (data.total_amount !== undefined && data.total_amount !== null) {
+        const parsedTotal = parseFlexNumber(data.total_amount, subtotal);
+        if (parsedTotal > 0) centralTotal = parsedTotal;
+      }
       if (data.payment_qr_url) paymentQrUrl = String(data.payment_qr_url);
-      if (data.payment_instructions) paymentInstructions = String(data.payment_instructions);
+      if (data.upi_id) upiId = String(data.upi_id);
+      else if (data.merchant_vpa) upiId = String(data.merchant_vpa);
+      if (data.payee_name) payeeName = String(data.payee_name);
+      if (data.paytm_mid) paytmMid = String(data.paytm_mid);
+      if (data.qr_generator_url) qrGeneratorUrl = String(data.qr_generator_url);
+      if (data.qr_cloud_name) qrCloudName = String(data.qr_cloud_name);
       if (data.message) centralMsg = String(data.message);
       ramStore.sync.outbound_pushed += 1;
     } catch {
       void pushToCentralAsync('/api/vendor-bot/events/order', submission);
     }
-  } else {
-    // Preview mode demonstration when Central Node URL is not yet connected
-    const mallBase = (ramStore.vendor.mall_url || 'https://supermall.in').replace(/\/+$/, '');
-    if (mode === 'ONLINE') {
-      paymentLink = `${mallBase}/pay/${centralOrderId}`;
-      paymentInstructions = 'Complete online payment on Central Mall secure checkout page.';
+  }
+
+  let bannerQrUrl = paymentQrUrl;
+  if (mode === 'ONLINE') {
+    if (upiId) {
+      try {
+        bannerQrUrl = await generateBrandedBannerQR({
+          qrGeneratorUrl,
+          vpa: upiId,
+          payeeName,
+          orderId: centralOrderId,
+          amount: centralTotal,
+          cloudName: qrCloudName,
+        });
+      } catch (err: any) {
+        console.warn(`⚠️ [BrandedQR] Worker call failed for Order #${centralOrderId}: ${err?.message || String(err)} (falling back to payment_qr_url)`);
+        bannerQrUrl = paymentQrUrl;
+      }
     }
   }
 
@@ -1598,12 +1926,12 @@ async function submitWhatsAppOrderToCentral(phone: string, requestedMode: string
       items,
       subtotal,
       delivery_fee: 0,
-      total_amount: subtotal,
+      total_amount: centralTotal,
       payment_mode: mode,
       payment_status: centralPayStatus,
       order_status: centralStatus,
-      payment_link: paymentLink,
-      payment_qr_url: paymentQrUrl,
+      payment_link: '',
+      payment_qr_url: bannerQrUrl,
       estimated_delivery: ramStore.vendor.estimated_delivery_time,
       source: 'whatsapp',
     },
@@ -1617,37 +1945,380 @@ async function submitWhatsAppOrderToCentral(phone: string, requestedMode: string
     payment_status: centralPayStatus,
   });
 
+  if (mode === 'ONLINE') {
+    // STRICT RULE: Branded Banner QR ONLY — NEVER send any upi:// link or clickable payment URL.
+    startPaymentVerificationPoller({
+      orderId: centralOrderId,
+      customerPhone: cleanPhone,
+      customerName: submission.customer_name,
+      deliveryAddress: submission.delivery_address,
+      totalAmount: centralTotal,
+      paytmMid,
+    });
+
+    const storeName = ramStore.vendor.business_name || payeeName || 'WaMart Store';
+    const caption =
+      `🏪 *${storeName}*\n` +
+      `🧾 *Order ID:* #${centralOrderId}\n` +
+      `💰 *Total Amount:* ₹${centralTotal.toFixed(2)}\n\n` +
+      `Please scan & pay using this QR code. Your payment will be verified automatically in a few seconds.`;
+
+    return {
+      reply: caption,
+      order: saved || undefined,
+      qr_image_url: bannerQrUrl || undefined,
+    };
+  }
+
   const parts: string[] = [];
   if (centralMsg) {
     parts.push(centralMsg);
-  } else if (mode === 'ONLINE') {
-    parts.push(
-      `💳 *Order Reference #${centralOrderId} Submitted to Central System*\n\n• Payable Amount: *₹${subtotal.toFixed(2)}*\n• Payment Mode: *Online Payment*\n• Status: *${centralStatus}*`
-    );
   } else {
     parts.push(
-      `📦 *Order Request #${centralOrderId} Submitted to Central System*\n\n• Total Amount: *₹${subtotal.toFixed(2)}*\n• Payment Mode: *Cash on Delivery (COD)*\n• Status: *${centralStatus}*`
+      `📦 *Order Request #${centralOrderId} Submitted to Central System*\n\n• Total Amount: *₹${centralTotal.toFixed(2)}*\n• Payment Mode: *Cash on Delivery (COD)*\n• Status: *${centralStatus}*`
     );
   }
-  if (paymentLink) parts.push(`🔗 *Central Payment Link:*\n👉 ${paymentLink}`);
-  if (paymentInstructions) parts.push(`ℹ️ ${paymentInstructions}`);
-
-  if (mode === 'ONLINE') {
-    parts.push(
-      `✅ Online payment aur verification 100% Central Brain System handle karta hai. Payment verify hote hi aapko final order confirmation aur PDF receipt turant WhatsApp par bhej di jayegi!`
-    );
-  } else {
-    parts.push(
-      `✅ Central Brain System se order confirm hote hi aapko final WhatsApp confirmation aur PDF receipt turant mil jayegi!`
-    );
-  }
+  parts.push(
+    `✅ Central Brain System se order confirm hote hi aapko final WhatsApp confirmation aur PDF receipt turant mil jayegi!`
+  );
 
   return { reply: parts.join('\n\n'), order: saved || undefined };
 }
 
 // =============================================================================
-// 4. OCTOPUS AGENTIC AI ENGINE (Admin Gate + Store Hours + Multi-Key Fallback)
+// 4. OCTOPUS AGENTIC AI ENGINE (Groq 3-Model TPD/TPM Pool + Smart Token RAG)
 // =============================================================================
+
+const GROQ_ALLOWED_MODELS = [
+  'qwen/qwen3.8-27b',
+  'openai/gpt-oss-20b',
+  'openai/gpt-oss-120b',
+] as const;
+
+const MAX_LLM_HISTORY_MESSAGES = 6;
+
+interface GroqSlotState {
+  tpmCooldownUntil: number;
+  tpdCooldownUntil: number;
+  authDisabledUntil: number;
+  tokensUsedToday: number;
+  requestsToday: number;
+  dayUTC: string;
+}
+
+const groqSlotStates = new Map<string, GroqSlotState>();
+let groqPoolCursor = 0;
+
+function shortKeyHash(apiKey: string): string {
+  return crypto.createHash('sha256').update(apiKey.trim()).digest('hex').slice(0, 12);
+}
+
+function isGroqProvider(provider: string, apiKey: string): boolean {
+  const k = apiKey.trim();
+  if (k.startsWith('gsk_')) return true;
+  if (k.startsWith('AIzaSy') || k.startsWith('sk-or-') || k.startsWith('sk-')) return false;
+  const p = provider.trim().toLowerCase();
+  return p === '' || p === 'groq';
+}
+
+function getGroqSlot(kHash: string, model: string, now: number): GroqSlotState {
+  const dayUTC = new Date(now).toISOString().slice(0, 10);
+  const id = `${kHash}|${model}`;
+  let st = groqSlotStates.get(id);
+  if (!st) {
+    st = { tpmCooldownUntil: 0, tpdCooldownUntil: 0, authDisabledUntil: 0, tokensUsedToday: 0, requestsToday: 0, dayUTC };
+    groqSlotStates.set(id, st);
+    return st;
+  }
+  if (st.dayUTC !== dayUTC) {
+    st.dayUTC = dayUTC;
+    st.tokensUsedToday = 0;
+    st.requestsToday = 0;
+    st.tpdCooldownUntil = 0;
+  }
+  return st;
+}
+
+function parseGroqDurationMs(raw: string | null): number {
+  if (!raw) return 0;
+  const s = raw.trim();
+  if (!s) return 0;
+  const asNum = Number(s);
+  if (!Number.isNaN(asNum) && asNum > 0) return Math.round(asNum * 1000);
+  let total = 0;
+  const matches = s.matchAll(/(\d+(?:\.\d+)?)(ms|s|m|h)/gi);
+  for (const m of matches) {
+    const val = Number(m[1]);
+    const unit = m[2].toLowerCase();
+    if (unit === 'ms') total += val;
+    else if (unit === 's') total += val * 1000;
+    else if (unit === 'm') total += val * 60_000;
+    else if (unit === 'h') total += val * 3_600_000;
+  }
+  return Math.round(total);
+}
+
+function classifyGroq429(headers: Headers, bodyText: string): { isTPD: boolean; cooldownMs: number } {
+  const lower = bodyText.toLowerCase();
+  const retryAfter = parseGroqDurationMs(headers.get('retry-after'));
+  const resetTok = parseGroqDurationMs(headers.get('x-ratelimit-reset-tokens'));
+  const resetReq = parseGroqDurationMs(headers.get('x-ratelimit-reset-requests'));
+
+  if (
+    lower.includes('tokens per day') ||
+    lower.includes('requests per day') ||
+    lower.includes('(tpd)') ||
+    lower.includes(' tpd') ||
+    lower.includes('(rpd)') ||
+    lower.includes(' rpd') ||
+    lower.includes('daily') ||
+    retryAfter >= 300_000
+  ) {
+    return { isTPD: true, cooldownMs: Math.max(retryAfter, 2 * 3_600_000) };
+  }
+  const cd = retryAfter || (resetTok > 0 && resetTok < 300_000 ? resetTok : 0) || (resetReq > 0 && resetReq < 300_000 ? resetReq : 0) || 65_000;
+  return { isTPD: false, cooldownMs: cd + 2000 };
+}
+
+function stripThinkBlocks(text: string): string {
+  return text.replace(/<think>[\s\S]*?<\/think>/gi, '').trim();
+}
+
+function compactStr(s: string, maxLen: number): string {
+  const clean = s.replace(/\n{3,}/g, '\n').trim();
+  return clean.length > maxLen ? `${clean.slice(0, maxLen)}…` : clean;
+}
+
+function formatRupeeCompact(v: number): string {
+  return Number.isInteger(v) ? String(v) : String(Number(v.toFixed(2)));
+}
+
+const RAG_STOP_WORDS = new Set([
+  'the', 'and', 'for', 'with', 'hai', 'kya', 'karo', 'chahiye', 'dena', 'please',
+  'mera', 'meri', 'mere', 'bhai', 'aap', 'tum', 'order', 'mujhe', 'dijiye', 'bhejo',
+  'hoga', 'photos', 'photo', 'pic', 'image', 'dikhao', 'price', 'rate', 'kitna',
+  'kitne', 'menu', 'list', 'available', 'item', 'items', 'product', 'products',
+  'haan', 'han', 'yes', 'nahi', 'hello', 'namaste', 'confirm', 'address', 'delivery',
+]);
+
+function formatCompactProductLine(p: Product): string {
+  const cat = (p.category || 'General').trim();
+  const unit = p.unit_type && p.unit_type !== 'custom' && p.unit_type !== 'piece' ? `/${p.unit_type}` : '';
+  const vars = (p.variants || [])
+    .filter((v) => isVariantInStock(v))
+    .map((v) => `${v.name}=${formatRupeeCompact(effectivePrice(p, v))}`);
+  const varStr = vars.length > 0 ? `|v:${vars.join(',')}` : '';
+  const imgStr = p.thumb_url || p.image_url || (p.images && p.images.length > 0) ? '|img' : '';
+  return `${p.id}|${p.name}|${cat}|₹${formatRupeeCompact(effectivePrice(p))}${unit}${varStr}${imgStr}`;
+}
+
+function buildSmartCompactInventory(
+  inStockProducts: Product[],
+  query: string,
+  history: Array<{ role: string; content: string }>,
+  cartProductIDs: Set<string>
+): string {
+  if (inStockProducts.length === 0) return 'INV: No in-stock items loaded yet.';
+
+  const catBuckets = new Map<string, Product[]>();
+  for (const p of inStockProducts) {
+    const c = (p.category || 'General').trim();
+    const arr = catBuckets.get(c) || [];
+    arr.push(p);
+    catBuckets.set(c, arr);
+  }
+  const catSummary = Array.from(catBuckets.entries())
+    .map(([c, list]) => `${c}(${list.length})`)
+    .join(', ');
+
+  if (inStockProducts.length <= 18) {
+    return `CATS: ${catSummary}\nINV(id|name|cat|price|vars):\n${inStockProducts.map(formatCompactProductLine).join('\n')}`;
+  }
+
+  const prevUserMsgs = history.filter((m) => m.role === 'user').slice(-2).map((m) => m.content);
+  const combinedQuery = `${query} ${prevUserMsgs.join(' ')}`.toLowerCase();
+  const keywords = Array.from(
+    new Set(
+      combinedQuery
+        .split(/\s+/)
+        .map((t) => t.replace(/^[.,!?\-_" '#()[\]{}:;]+|[.,!?\-_" '#()[\]{}:;]+$/g, ''))
+        .filter((t) => t.length >= 3 && !RAG_STOP_WORDS.has(t))
+    )
+  );
+
+  const selectedIds = new Set<string>();
+  const selected: Product[] = [];
+  for (const p of inStockProducts) {
+    if (cartProductIDs.has(p.id) && !selectedIds.has(p.id)) {
+      selectedIds.add(p.id);
+      selected.push(p);
+    }
+  }
+
+  if (keywords.length > 0) {
+    const scored = inStockProducts
+      .filter((p) => !selectedIds.has(p.id))
+      .map((p) => {
+        const nameLow = p.name.toLowerCase();
+        const catLow = (p.category || '').toLowerCase();
+        const descLow = (p.description || '').toLowerCase();
+        let score = nameLow.length >= 3 && combinedQuery.includes(nameLow) ? 10 : 0;
+        for (const kw of keywords) {
+          if (nameLow.includes(kw)) score += 4;
+          else if (catLow.includes(kw)) score += 3;
+          else if (descLow.includes(kw)) score += 1;
+        }
+        return { p, score };
+      })
+      .filter((x) => x.score > 0)
+      .sort((a, b) => b.score - a.score);
+
+    for (const item of scored) {
+      if (selected.length >= 12) break;
+      selectedIds.add(item.p.id);
+      selected.push(item.p);
+    }
+  }
+
+  if (selected.length < 8) {
+    const cats = Array.from(catBuckets.values());
+    let round = 0;
+    while (selected.length < 10) {
+      let added = false;
+      for (const bucket of cats) {
+        if (round < bucket.length) {
+          const p = bucket[round];
+          if (!selectedIds.has(p.id)) {
+            selectedIds.add(p.id);
+            selected.push(p);
+            added = true;
+            if (selected.length >= 10) break;
+          }
+        }
+      }
+      if (!added) break;
+      round++;
+    }
+  }
+
+  return `CATS: ${catSummary}\nINV(showing ${selected.length}/${inStockProducts.length} relevant; id|name|cat|price|vars):\n${selected.map(formatCompactProductLine).join('\n')}`;
+}
+
+async function callGroqPool(
+  groqKeys: string[],
+  systemPrompt: string,
+  history: Array<{ role: string; content: string }>,
+  temperature: number
+): Promise<{ text: string; keyIdx: number; model: string } | null> {
+  const now = Date.now();
+  const matrix: Array<{ keyIdx: number; apiKey: string; kHash: string; model: string }> = [];
+  for (const model of GROQ_ALLOWED_MODELS) {
+    for (let kIdx = 0; kIdx < groqKeys.length; kIdx++) {
+      matrix.push({ keyIdx: kIdx, apiKey: groqKeys[kIdx], kHash: shortKeyHash(groqKeys[kIdx]), model });
+    }
+  }
+  if (matrix.length === 0) return null;
+
+  const start = groqPoolCursor % matrix.length;
+  groqPoolCursor++;
+  const rotated = [...matrix.slice(start), ...matrix.slice(0, start)];
+
+  const ready: Array<(typeof matrix)[number] & { tokensDay: number }> = [];
+  const tpmDelayed: Array<(typeof matrix)[number] & { tpmUntil: number }> = [];
+
+  for (const slot of rotated) {
+    const st = getGroqSlot(slot.kHash, slot.model, now);
+    if (now < st.authDisabledUntil || now < st.tpdCooldownUntil) continue;
+    if (now < st.tpmCooldownUntil) tpmDelayed.push({ ...slot, tpmUntil: st.tpmCooldownUntil });
+    else ready.push({ ...slot, tokensDay: st.tokensUsedToday });
+  }
+
+  ready.sort((a, b) => Math.floor(a.tokensDay / 5000) - Math.floor(b.tokensDay / 5000));
+  tpmDelayed.sort((a, b) => a.tpmUntil - b.tpmUntil);
+
+  const messages = [{ role: 'system', content: systemPrompt }, ...history];
+
+  const attemptSlot = async (slot: (typeof matrix)[number]) => {
+    const execReq = async (minimal: boolean) => {
+      const payload: Record<string, any> = {
+        model: slot.model,
+        temperature,
+        max_completion_tokens: 600,
+        messages,
+      };
+      if (!minimal) {
+        payload.response_format = { type: 'json_object' };
+        if (slot.model.startsWith('openai/gpt-oss')) {
+          payload.reasoning_effort = 'low';
+        }
+      }
+      return fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${slot.apiKey}` },
+        body: JSON.stringify(payload),
+        signal: AbortSignal.timeout(18000),
+      });
+    };
+
+    try {
+      let r = await execReq(false);
+      if (r.status === 400) {
+        r = await execReq(true);
+      }
+      const bodyText = await r.text();
+      const st = getGroqSlot(slot.kHash, slot.model, Date.now());
+      if (r.ok) {
+        const json: any = JSON.parse(bodyText);
+        const content = stripThinkBlocks(String(json?.choices?.[0]?.message?.content || ''));
+        if (content) {
+          st.tokensUsedToday += Number(json?.usage?.total_tokens || 0);
+          st.requestsToday += 1;
+          st.tpmCooldownUntil = 0;
+          const remTok = Number(r.headers.get('x-ratelimit-remaining-tokens') || '-1');
+          if (!Number.isNaN(remTok) && remTok >= 0 && remTok < 800) {
+            st.tpmCooldownUntil = Date.now() + Math.min(parseGroqDurationMs(r.headers.get('x-ratelimit-reset-tokens')) || 15_000, 75_000);
+          }
+          return { text: content, keyIdx: slot.keyIdx, model: slot.model };
+        }
+      } else if (r.status === 429) {
+        const { isTPD, cooldownMs } = classifyGroq429(r.headers, bodyText);
+        if (isTPD) {
+          const utcMidnight = new Date();
+          utcMidnight.setUTCHours(24, 1, 0, 0);
+          st.tpdCooldownUntil = Math.min(utcMidnight.getTime(), Date.now() + cooldownMs);
+          console.warn(`🚫 [Groq TPD Exhausted] Key #${slot.keyIdx + 1} | model=${slot.model} -> rotating`);
+        } else {
+          st.tpmCooldownUntil = Date.now() + cooldownMs;
+          console.warn(`⚡ [Groq TPM Limit] Key #${slot.keyIdx + 1} | model=${slot.model} -> switching model/key`);
+        }
+      } else if (r.status === 401 || r.status === 403) {
+        for (const m of GROQ_ALLOWED_MODELS) {
+          getGroqSlot(slot.kHash, m, Date.now()).authDisabledUntil = Date.now() + 30 * 60_000;
+        }
+      } else {
+        st.tpmCooldownUntil = Date.now() + 45_000;
+      }
+    } catch {
+      getGroqSlot(slot.kHash, slot.model, Date.now()).tpmCooldownUntil = Date.now() + 45_000;
+    }
+    return null;
+  };
+
+  for (const slot of ready) {
+    const res = await attemptSlot(slot);
+    if (res) return res;
+  }
+  if (tpmDelayed.length > 0) {
+    const best = tpmDelayed[0];
+    const waitMs = best.tpmUntil - Date.now();
+    if (waitMs > 0 && waitMs <= 3000) {
+      await new Promise((resolve) => setTimeout(resolve, waitMs));
+    }
+    const res = await attemptSlot(best);
+    if (res) return res;
+  }
+  return null;
+}
 
 async function runOctopusAI(
   phone: string,
@@ -1695,46 +2366,83 @@ async function runOctopusAI(
   const currentCart = ramStore.activeCarts.get(cleanPhone) || [];
   const cust = ramStore.customers.get(cleanPhone);
 
-  // 3. Multi-Key AI Fallback Loop (automatically rotates to next backup key on 429 / 5xx / timeout)
+  // 3. Compact 6-Message Sliding Window + Smart Single-Pass RAG + Groq 3-Model TPD/TPM Pool
   if (candidateKeys.length > 0) {
-    const inventoryText =
-      inStockProducts.length > 0
-        ? inStockProducts
-            .map((p) => {
-              const varSummary =
-                p.variants && p.variants.length > 0
-                  ? ` | Variants: ${p.variants
-                      .filter((v) => isVariantInStock(v))
-                      .map((v) => `${v.name} (Rs.${effectivePrice(p, v)}${v.stock_qty != null ? `, Stock:${v.stock_qty}` : ''})`)
-                      .join(', ')}`
-                  : p.stock_qty != null
-                    ? ` | Stock: ${p.stock_qty} ${p.unit_type}`
-                    : '';
-              return `• ${p.name} (ID: ${p.id}, Cat: ${p.category}, Price: Rs.${effectivePrice(p)}/${p.unit_type}${varSummary})`;
-            })
-            .join('\n')
-        : 'No in-stock products loaded in RAM yet.';
+    const rawHistory = (ramStore.chats.get(cleanPhone) || []).slice(-(MAX_LLM_HISTORY_MESSAGES - 1));
+    const llmHistory: Array<{ role: string; content: string }> = rawHistory.map((m) => {
+      const role = m.role === 'assistant' || m.direction.startsWith('outgoing') ? 'assistant' : 'user';
+      return { role, content: compactStr(m.text, role === 'assistant' ? 160 : 200) };
+    });
+    if (llmHistory.length === 0 || llmHistory[llmHistory.length - 1].content !== compactStr(query, 500)) {
+      llmHistory.push({ role: 'user', content: compactStr(query, 500) });
+    }
+    const finalHistory = llmHistory.slice(-MAX_LLM_HISTORY_MESSAGES);
 
-    const cartText =
+    const cartProductIDs = new Set(currentCart.map((c) => c.product_id));
+    const inventoryBlock = buildSmartCompactInventory(inStockProducts, query, finalHistory, cartProductIDs);
+    const cartTotal = currentCart.reduce((sum, it) => sum + it.line_total, 0);
+    const cartLine =
       currentCart.length > 0
-        ? currentCart
-            .map((c) => `${c.product_name}${c.selected_variant ? ` [${c.selected_variant}]` : ''} x${c.qty} = Rs.${c.line_total}`)
-            .join(', ')
-        : 'Empty';
+        ? `CART(₹${formatRupeeCompact(cartTotal)}): ${currentCart
+            .map((c) => `${c.product_id} ${c.product_name}${c.selected_variant ? `[${c.selected_variant}]` : ''} x${c.qty}=₹${formatRupeeCompact(c.line_total)}`)
+            .join('; ')}`
+        : 'CART:empty';
+    const profParts: string[] = [];
+    if (cust?.full_name) profParts.push(`Name=${cust.full_name}`);
+    if (cust?.delivery_address) profParts.push(`Addr=${compactStr(cust.delivery_address, 120)}`);
+    if (cust?.contact_phone) profParts.push(`Ph=${cust.contact_phone}`);
+    profParts.push(`WA=${cleanPhone}`);
 
-    const systemPrompt = `You are the automated WhatsApp sales & support agent for "${ramStore.vendor.business_name}" (${ramStore.vendor.business_type}).
-Language: ${ramStore.vendor.language}. Timings: ${ramStore.vendor.operating_hours}. ETA: ${ramStore.vendor.estimated_delivery_time}. Min Order: Rs.${ramStore.vendor.min_order_amount}.
-Store Policy: ${ramStore.vendor.store_policies}.
-${ramStore.ai.system_prompt ? `Vendor Instructions: ${ramStore.ai.system_prompt}\n` : ''}NEVER suggest or add out-of-stock products/variants.
-NEVER ask for UTR numbers or payment screenshots, NEVER scan/verify screenshots, and NEVER mark orders Paid locally.
-When customer confirms checkout (COD or Online Payment), trigger {"hand": "submit_order", "payload": {"payment_mode": "COD" | "ONLINE"}} so Central Brain controls payment links, verification, and final confirmation.
-Output ONLY raw JSON: {"ai_reply_text": "string", "actions": [{"hand": "update_cart|extract_profile|submit_order|generate_store_link|send_catalog_images|clear_cart|cancel_order|escalate_to_human|chat_only", "payload": {}}]}
-LIVE IN-STOCK RAM INVENTORY:\n${inventoryText}
-CURRENT CART: ${cartText}
-CUSTOMER PROFILE: Name=${cust?.full_name || 'Unknown'}, Address=${cust?.delivery_address || 'Unknown'}, Phone=${cleanPhone}`;
+    const payMode = ramStore.vendor.allow_cod ? 'COD+ONLINE' : 'ONLINE ONLY';
+    const systemPrompt = `You are the warm, lively, human-like WhatsApp shop assistant for "${ramStore.vendor.business_name}" (${ramStore.vendor.business_type}).
+Policy: ${compactStr(ramStore.vendor.store_policies || 'Standard delivery & returns.', 180)}
+Reply strictly in: ${ramStore.vendor.language || 'Hinglish'}.
 
-    for (let idx = 0; idx < candidateKeys.length; idx++) {
-      const apiKey = candidateKeys[idx];
+OUTPUT ONLY RAW JSON:
+{"ai_reply_text":"...","quote_reply":false,"actions":[{"hand":"...","payload":{}}]}
+
+TONE & WHATSAPP STYLE:
+• Sound like a friendly, warm, enthusiastic real shopkeeper — never robotic.
+• Use *bold* generously for *item names*, *₹prices*, *totals*, *variants*, and key actions.
+• Use expressive emojis naturally (✨🛍️🔥😋💰📦🙌💛) and clean "• " bullets.
+• Use WhatsApp blockquote (> ) ONLY sparingly for highlight boxes (> 🧾 *Total* / > 💳 *Payment*), never on every line.
+• Set "quote_reply":true ONLY when directly answering a specific question/price/item/complaint; false for normal greetings/chat flow.
+
+HANDS: send_catalog_images, update_cart, extract_profile, submit_order (payment_mode: COD|ONLINE), generate_store_link, clear_cart, cancel_order, escalate_to_human.
+RULES: NEVER suggest out-of-stock items. NEVER ask for UTR/screenshots or mark orders Paid locally — Central Brain verifies online payment & sends confirmation + PDF receipt. On a customer's FIRST message, politely request them to write their full message together in one message (not in small pieces).
+${ramStore.ai.system_prompt ? `VENDOR NOTE: ${compactStr(ramStore.ai.system_prompt, 280)}\n` : ''}STORE: Hrs:${ramStore.vendor.operating_hours} | ETA:${ramStore.vendor.estimated_delivery_time} | MinOrd:₹${formatRupeeCompact(ramStore.vendor.min_order_amount)} | Pay:${payMode}
+
+STATE:${currentCart.length > 0 ? 'CART_ACTIVE' : 'BROWSING'} | ${cartLine}
+CUST:${profParts.join(' | ')}
+
+${inventoryBlock}`;
+
+    const groqKeys = candidateKeys.filter((k) => isGroqProvider(provider, k));
+    const otherKeys = candidateKeys.filter((k) => !isGroqProvider(provider, k));
+
+    if (groqKeys.length > 0) {
+      const groqRes = await callGroqPool(groqKeys, systemPrompt, finalHistory, ramStore.ai.temperature || 0.72);
+      if (groqRes?.text) {
+        const match = groqRes.text.match(/\{[\s\S]*\}/);
+        if (match) {
+          try {
+            const parsed = JSON.parse(match[0]);
+            return {
+              ai_reply_text: String(parsed.ai_reply_text || parsed.reply_to_customer || '').trim(),
+              quote_reply: Boolean(parsed.quote_reply),
+              actions: Array.isArray(parsed.actions) ? parsed.actions : [],
+              engine: `groq:${groqRes.model} (key #${groqRes.keyIdx + 1}/${groqKeys.length})`,
+              key_used_index: groqRes.keyIdx,
+            };
+          } catch {
+            // Fall through to backup keys / deterministic responder
+          }
+        }
+      }
+    }
+
+    for (let idx = 0; idx < otherKeys.length; idx++) {
+      const apiKey = otherKeys[idx];
       try {
         let rawText = '';
         if (provider === 'gemini' || apiKey.startsWith('AIzaSy')) {
@@ -1744,40 +2452,42 @@ CUSTOMER PROFILE: Name=${cust?.full_name || 'Unknown'}, Address=${cust?.delivery
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               system_instruction: { parts: [{ text: systemPrompt }] },
-              contents: [{ role: 'user', parts: [{ text: query }] }],
-              generationConfig: { temperature: ramStore.ai.temperature, response_mime_type: 'application/json' },
+              contents: finalHistory.map((m) => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] })),
+              generationConfig: { temperature: ramStore.ai.temperature || 0.72, maxOutputTokens: 600, response_mime_type: 'application/json' },
             }),
-            signal: AbortSignal.timeout(10000),
+            signal: AbortSignal.timeout(15000),
           });
           if (!r.ok) throw new Error(`HTTP ${r.status}`);
           const json: any = await r.json();
           rawText = json?.candidates?.[0]?.content?.parts?.[0]?.text || '';
         } else {
           const endpoint =
-            provider === 'openai' || apiKey.startsWith('sk-')
-              ? 'https://api.openai.com/v1/chat/completions'
-              : provider === 'deepseek'
-                ? 'https://api.deepseek.com/chat/completions'
-                : 'https://api.groq.com/openai/v1/chat/completions';
+            provider === 'deepseek'
+              ? 'https://api.deepseek.com/chat/completions'
+              : provider === 'openrouter' || apiKey.startsWith('sk-or-')
+                ? 'https://openrouter.ai/api/v1/chat/completions'
+                : 'https://api.openai.com/v1/chat/completions';
           const model =
-            provider === 'openai' || apiKey.startsWith('sk-') ? 'gpt-4o-mini' : ramStore.ai.model || 'llama-3.3-70b-versatile';
+            provider === 'deepseek'
+              ? ramStore.ai.model || 'deepseek-chat'
+              : provider === 'openrouter' || apiKey.startsWith('sk-or-')
+                ? ramStore.ai.model || 'meta-llama/llama-3.1-8b-instruct:free'
+                : ramStore.ai.model || 'gpt-4o-mini';
           const r = await fetch(endpoint, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
             body: JSON.stringify({
               model,
-              temperature: ramStore.ai.temperature,
+              temperature: ramStore.ai.temperature || 0.72,
+              max_tokens: 600,
               response_format: { type: 'json_object' },
-              messages: [
-                { role: 'system', content: systemPrompt },
-                { role: 'user', content: query },
-              ],
+              messages: [{ role: 'system', content: systemPrompt }, ...finalHistory],
             }),
-            signal: AbortSignal.timeout(10000),
+            signal: AbortSignal.timeout(15000),
           });
           if (!r.ok) throw new Error(`HTTP ${r.status}`);
           const json: any = await r.json();
-          rawText = json?.choices?.[0]?.message?.content || '';
+          rawText = stripThinkBlocks(json?.choices?.[0]?.message?.content || '');
         }
 
         if (rawText) {
@@ -1786,14 +2496,15 @@ CUSTOMER PROFILE: Name=${cust?.full_name || 'Unknown'}, Address=${cust?.delivery
             const parsed = JSON.parse(match[0]);
             return {
               ai_reply_text: String(parsed.ai_reply_text || parsed.reply_to_customer || '').trim(),
+              quote_reply: Boolean(parsed.quote_reply),
               actions: Array.isArray(parsed.actions) ? parsed.actions : [],
-              engine: `${provider} (key #${idx + 1}/${candidateKeys.length})`,
+              engine: `${provider} (key #${idx + 1}/${otherKeys.length})`,
               key_used_index: idx,
             };
           }
         }
       } catch (err) {
-        console.warn(`⚠️ [Multi-Key AI Fallback] Key #${idx + 1}/${candidateKeys.length} failed, rotating...`, err);
+        console.warn(`⚠️ [Multi-Key AI Fallback] Key #${idx + 1}/${otherKeys.length} failed, rotating...`, err);
       }
     }
   }
@@ -2012,13 +2723,22 @@ app.get('/api/bot/overview', (_req: Request, res: Response) => {
     payment: {
       enabled:
         ramStore.payment.enabled ||
-        Boolean(ramStore.payment.paytm_mid || ramStore.payment.merchant_vpa || ramStore.payment.gateway),
+        Boolean(ramStore.payment.paytm_mid || ramStore.payment.upi_id || ramStore.payment.merchant_vpa || ramStore.payment.gateway),
       gateway: ramStore.payment.gateway,
-      merchant_vpa: ramStore.payment.merchant_vpa,
+      upi_id: ramStore.payment.upi_id || ramStore.payment.merchant_vpa,
+      merchant_vpa: ramStore.payment.merchant_vpa || ramStore.payment.upi_id,
       paytm_mid: ramStore.payment.paytm_mid,
-      payee_name: ramStore.payment.payee_name,
+      payee_name: ramStore.payment.payee_name || ramStore.vendor.business_name,
       merchant_phone: ramStore.payment.merchant_phone,
       cloudinary_cloud_name: ramStore.payment.cloudinary_cloud_name,
+      qr_worker_base_url: ramStore.payment.qr_worker_base_url || DEFAULT_QR_WORKER_BASE_URL,
+      qr_generator_url: ramStore.payment.qr_generator_url || DEFAULT_QR_GENERATOR_URL,
+      qr_cloud_name: ramStore.payment.qr_cloud_name || DEFAULT_QR_CLOUD_NAME,
+      qr_only_mode: ramStore.payment.qr_only_mode,
+      send_payment_link: ramStore.payment.send_payment_link,
+      verify_endpoint: ramStore.payment.verify_endpoint || DEFAULT_VERIFY_ENDPOINT,
+      verify_poll_interval_ms: ramStore.payment.verify_poll_interval_ms || DEFAULT_VERIFY_POLL_INTERVAL_MS,
+      verify_poll_timeout_ms: ramStore.payment.verify_poll_timeout_ms || DEFAULT_VERIFY_POLL_TIMEOUT_MS,
     },
     whatsapp: ramStore.whatsapp,
     media_cache_entries: mediaThumbCache.size,
@@ -2278,11 +2998,23 @@ app.post('/api/sync/order', verifyCentralWebhookAuth, (req: Request, res: Respon
   }
   const { order: saved, statusChanged } = upsertOrderRAM({ ...decodedOrder, source: decodedOrder.source || 'website' }, true);
   const ev = parseFlexString(req.body.event).toLowerCase();
+  const isPaidOrConfirmedEvent = ev === 'order.paid' || ev === 'order.confirmed';
   const isFinalConfirm =
-    ev === 'order.confirmed' ||
-    ev === 'order.paid' ||
+    isPaidOrConfirmedEvent ||
     ev === 'order.created' ||
     (statusChanged && (saved?.order_status === 'CONFIRMED' || saved?.payment_status === 'PAID'));
+
+  if (saved && saved.order_id) {
+    if (
+      isPaidOrConfirmedEvent ||
+      saved.payment_status === 'PAID' ||
+      saved.order_status === 'CONFIRMED' ||
+      saved.payment_status === 'CANCELLED' ||
+      saved.order_status === 'CANCELLED'
+    ) {
+      stopPaymentVerificationPoller(saved.order_id);
+    }
+  }
 
   if (saved && saved.customer_phone) {
     upsertCustomerRAM({
@@ -2299,14 +3031,33 @@ app.post('/api/sync/order', verifyCentralWebhookAuth, (req: Request, res: Respon
     if (isFinalConfirm) {
       ramStore.activeCarts.delete(saved.customer_phone);
     }
+
     const notifyOpt = parseFlexBoolOpt(req.body.notify_whatsapp);
-    const shouldNotify = notifyOpt !== undefined ? notifyOpt : statusChanged || isFinalConfirm;
-    if (shouldNotify) {
-      const msg = isFinalConfirm
-        ? `🎉 *Order Confirmed by Central Mall!* (#${saved.order_id})\n\n• Total: *₹${saved.total_amount.toFixed(2)}* (${saved.payment_mode} · ${saved.payment_status})\n• 80mm Thermal PDF Receipt generated and sent to customer on WhatsApp!`
-        : buildDeliveryStatusAlert(saved);
-      appendChatRAM(saved.customer_phone, 'assistant', 'outgoing_ai', msg);
-      pushLiveEvent(saved.customer_phone, msg, 'outgoing_ai');
+    if (isPaidOrConfirmedEvent || saved.payment_status === 'PAID') {
+      // STRICT DEDUPLICATION: Only notify if notify_whatsapp === true AND order_id not yet in notifiedPaidOrders.
+      if (notifyOpt === true && markOrderPaidNotifiedOnce(saved.order_id)) {
+        const txnId = parseFlexString(
+          firstDefined(req.body, 'txn_id', 'txnid', 'transaction_id', 'utr') ??
+            (isPlainObject(rawOrder) ? firstDefined(rawOrder, 'txn_id', 'txnid', 'transaction_id', 'utr') : undefined)
+        );
+        sendPaidOrderConfirmationPreview({
+          orderId: saved.order_id,
+          customerPhone: saved.customer_phone,
+          customerName: saved.customer_name,
+          totalAmount: saved.total_amount,
+          txnId,
+          deliveryAddress: saved.delivery_address,
+        });
+      }
+    } else {
+      const shouldNotify = notifyOpt !== undefined ? notifyOpt : statusChanged || isFinalConfirm;
+      if (shouldNotify) {
+        const msg = isFinalConfirm
+          ? `🎉 *Order Confirmed by Central Mall!* (#${saved.order_id})\n\n• Total: *₹${saved.total_amount.toFixed(2)}* (${saved.payment_mode} · ${saved.payment_status})\n• Order confirmed and ready for processing!`
+          : buildDeliveryStatusAlert(saved);
+        appendChatRAM(saved.customer_phone, 'assistant', 'outgoing_ai', msg);
+        pushLiveEvent(saved.customer_phone, msg, 'outgoing_ai');
+      }
     }
   }
   markInbound('order');
@@ -2434,6 +3185,32 @@ app.post('/api/ai/settings', (req: Request, res: Response) => {
   res.json({ status: 'success', api_key_count: allAIKeys().length, message: 'AI & Store settings updated in RAM.' });
 });
 
+const MESSAGE_READ_DELAY_MS = 1000;
+const SPLIT_MESSAGE_PEACEFUL_NOTICE =
+  '🙏 *Kripya dhyan dein ji!* 😊\n\nApni kisi bhi baat ko *ek sath likh kar bhejein*, unhe tukdo me karke na bhejein — taaki main aapko *fast aur behtar* reply de saku! ✨💛';
+const FIRST_TURN_SINGLE_MESSAGE_TIP =
+  '\n\n💡 _Ek chhoti si request:_ Koshish karein ki apni poori baat *ek sath ek hi message me* likh kar bhejein (tukdo me nahi), taaki main aapko aur jaldi & best help kar saku! 😊✨';
+
+const previewCustomerInFlight = new Set<string>();
+const previewSplitNoticeSent = new Set<string>();
+
+function hasPriorAssistantReplyPreview(phone: string): boolean {
+  const list = ramStore.chats.get(phone) || [];
+  return list.some((m) => m.role === 'assistant' || m.direction === 'outgoing_ai' || m.direction === 'outgoing_manual');
+}
+
+function replyHasSingleMsgTip(text: string): boolean {
+  const low = text.toLowerCase();
+  return (
+    low.includes('tukdo') ||
+    low.includes('ek sath') ||
+    low.includes('ek saath') ||
+    low.includes('ek hi message') ||
+    low.includes('one message') ||
+    low.includes('single message')
+  );
+}
+
 app.post('/api/ai/test', async (req: Request, res: Response) => {
   const query = String(req.body?.query || '').trim();
   const phone = normalizePhone(req.body?.customer_phone || '');
@@ -2443,24 +3220,51 @@ app.post('/api/ai/test', async (req: Request, res: Response) => {
     return;
   }
 
-  const { customer: cust, changed: custChanged } = upsertCustomerWithChangeCheckRAM({ wa_number: phone, source: 'whatsapp' });
-  if (cust && custChanged) {
-    void pushToCentralAsync('/api/vendor-bot/events/customer', { event: 'customer.upserted', source: 'whatsapp', customer: cust });
+  // If customer sends an extra message before bot finishes replying, IGNORE for AI & return hardcoded peaceful quoted notice
+  if (previewCustomerInFlight.has(phone)) {
+    const alreadyNotified = previewSplitNoticeSent.has(phone);
+    previewSplitNoticeSent.add(phone);
+    if (!alreadyNotified) {
+      pushLiveEvent(phone, SPLIT_MESSAGE_PEACEFUL_NOTICE, 'outgoing_ai');
+    }
+    res.json({
+      status: 'success',
+      ignored_split_message: true,
+      quote_reply: true,
+      reply: alreadyNotified ? '' : SPLIT_MESSAGE_PEACEFUL_NOTICE,
+      ai_reply_text: alreadyNotified ? '' : SPLIT_MESSAGE_PEACEFUL_NOTICE,
+      actions: [{ hand: 'split_message_ignored', payload: { quoted_reply: true } }],
+      engine: 'split-message-guard',
+      key_used_index: -1,
+    });
+    return;
   }
 
-  const displayIncoming =
-    mediaType === 'voice_note'
-      ? `🎙️ [Voice Note]: ${query}`
-      : mediaType === 'burst'
-        ? `⚡ [Debounced Burst]: ${query}`
-        : query;
+  previewCustomerInFlight.add(phone);
+  previewSplitNoticeSent.delete(phone);
 
-  appendChatRAM(phone, 'customer', 'incoming', displayIncoming);
-  pushLiveEvent(phone, displayIncoming, 'incoming');
+  try {
+    // 1-second deliberate read delay before reading & processing the message
+    await new Promise((resolve) => setTimeout(resolve, MESSAGE_READ_DELAY_MS));
 
-  const result = await runOctopusAI(phone, query, req.body?.provider, req.body?.api_key, mediaType);
-  let finalReply = result.ai_reply_text;
-  let stockRejections: string[] = [];
+    const { customer: cust, changed: custChanged } = upsertCustomerWithChangeCheckRAM({ wa_number: phone, source: 'whatsapp' });
+    if (cust && custChanged) {
+      void pushToCentralAsync('/api/vendor-bot/events/customer', { event: 'customer.upserted', source: 'whatsapp', customer: cust });
+    }
+
+    const isFirstTurn = !hasPriorAssistantReplyPreview(phone);
+
+    const displayIncoming = mediaType === 'voice_note' ? `🎙️ [Voice Note]: ${query}` : query;
+
+    appendChatRAM(phone, 'customer', 'incoming', displayIncoming);
+    pushLiveEvent(phone, displayIncoming, 'incoming');
+
+    const result = await runOctopusAI(phone, query, req.body?.provider, req.body?.api_key, mediaType);
+    let finalReply = result.ai_reply_text;
+    if (finalReply && isFirstTurn && !replyHasSingleMsgTip(finalReply)) {
+      finalReply += FIRST_TURN_SINGLE_MESSAGE_TIP;
+    }
+    let stockRejections: string[] = [];
 
   for (const act of result.actions) {
     if (act.hand === 'update_cart' && Array.isArray(act.payload?.cart_items)) {
@@ -2496,6 +3300,15 @@ app.post('/api/ai/test', async (req: Request, res: Response) => {
       const mode = String(act.payload?.payment_mode || 'ONLINE');
       const centralResp = await submitWhatsAppOrderToCentral(phone, mode);
       finalReply = centralResp.reply;
+      if (centralResp.qr_image_url) {
+        (act.payload as any).qr_image_url = centralResp.qr_image_url;
+      }
+    } else if (act.hand === 'cancel_order') {
+      const cust = ramStore.customers.get(phone);
+      const cancelId = String(act.payload?.order_id || cust?.current_order_id || '').trim();
+      if (cancelId) {
+        stopPaymentVerificationPoller(cancelId);
+      }
     } else if (act.hand === 'clear_cart') {
       const hadItems = (ramStore.activeCarts.get(phone) || []).length > 0;
       ramStore.activeCarts.delete(phone);
@@ -2518,14 +3331,18 @@ app.post('/api/ai/test', async (req: Request, res: Response) => {
   appendChatRAM(phone, 'assistant', 'outgoing_ai', finalReply);
   pushLiveEvent(phone, finalReply, 'outgoing_ai');
 
-  res.json({
-    status: 'success',
-    reply: finalReply,
-    actions: result.actions,
-    engine: result.engine,
-    stock_rejections: stockRejections,
-    cart: ramStore.activeCarts.get(phone) || [],
-  });
+    res.json({
+      status: 'success',
+      reply: finalReply,
+      actions: result.actions,
+      engine: result.engine,
+      stock_rejections: stockRejections,
+      cart: ramStore.activeCarts.get(phone) || [],
+    });
+  } finally {
+    previewCustomerInFlight.delete(phone);
+    previewSplitNoticeSent.delete(phone);
+  }
 });
 
 app.get('/api/chats', (_req, res) => {

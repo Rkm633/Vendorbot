@@ -116,13 +116,22 @@ func BotOverviewHandler(w http.ResponseWriter, r *http.Request) {
 			"system_prompt":        ai.SystemPrompt,
 		},
 		"payment": map[string]interface{}{
-			"enabled":               pay.Enabled || pay.PaytmMID != "" || pay.MerchantVPA != "" || pay.Gateway != "",
-			"gateway":               pay.Gateway,
-			"merchant_vpa":          pay.MerchantVPA,
-			"paytm_mid":             pay.PaytmMID,
-			"payee_name":            pay.PayeeName,
-			"merchant_phone":        pay.MerchantPhone,
-			"cloudinary_cloud_name": pay.CloudinaryCloudName,
+			"enabled":                 pay.Enabled || pay.PaytmMID != "" || pay.MerchantVPA != "" || pay.UPIID != "" || pay.Gateway != "",
+			"gateway":                 pay.Gateway,
+			"upi_id":                  pay.UPIID,
+			"merchant_vpa":            pay.MerchantVPA,
+			"paytm_mid":               pay.PaytmMID,
+			"payee_name":              pay.PayeeName,
+			"merchant_phone":          pay.MerchantPhone,
+			"cloudinary_cloud_name":   pay.CloudinaryCloudName,
+			"qr_worker_base_url":      pay.QRWorkerBaseURL,
+			"qr_generator_url":        pay.QRGeneratorURL,
+			"qr_cloud_name":           pay.QRCloudName,
+			"qr_only_mode":            pay.QROnlyMode,
+			"send_payment_link":       pay.SendPaymentLink,
+			"verify_endpoint":         pay.VerifyEndpoint,
+			"verify_poll_interval_ms": pay.VerifyPollIntervalMS,
+			"verify_poll_timeout_ms":  pay.VerifyPollTimeoutMS,
 		},
 		"whatsapp":            waSt,
 		"media_cache_entries": whatsapp.GetMediaCacheSize(),
@@ -635,30 +644,76 @@ func SyncOrderHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Notify customer on WhatsApp when Central Brain confirms an order / verifies payment OR updates delivery status
 	ev := strings.ToLower(strings.TrimSpace(eventName))
-	isFinalConfirmation := ev == "order.created" || ev == "order.confirmed" || ev == "order.paid" ||
-		(statusChanged && (strings.EqualFold(saved.OrderStatus, "CONFIRMED") || strings.EqualFold(saved.PaymentStatus, "PAID")))
+	isPaidOrConfirmedPush := ev == "order.paid" || ev == "order.confirmed" ||
+		(saved != nil && (strings.EqualFold(saved.PaymentStatus, "PAID") || strings.EqualFold(saved.OrderStatus, "CONFIRMED")))
+	isCancelledPush := ev == "order.cancelled" ||
+		(saved != nil && (strings.EqualFold(saved.OrderStatus, "CANCELLED") || strings.EqualFold(saved.PaymentStatus, "CANCELLED")))
 
-	shouldNotify := statusChanged || isFinalConfirmation
-	if notifyPtr != nil {
-		shouldNotify = *notifyPtr
+	// Stop any active 3-second payment polling loop when order.paid / order.confirmed / cancelled arrives
+	if saved != nil && (isPaidOrConfirmedPush || isCancelledPush) {
+		whatsapp.StopPaymentVerificationPoller(saved.OrderID)
 	}
 
-	if shouldNotify && saved != nil && saved.CustomerPhone != "" {
+	isFinalConfirmation := ev == "order.created" || isPaidOrConfirmedPush
+
+	// Extract optional txn_id from webhook body or nested order object
+	txnID := ramstore.ParseFlexString(rawMap["txn_id"])
+	if txnID == "" {
+		txnID = ramstore.ParseFlexString(rawMap["transaction_id"])
+	}
+	if txnID == "" {
+		if oRaw, ok := rawMap["order"]; ok && len(oRaw) > 0 {
+			var ordMap map[string]json.RawMessage
+			if json.Unmarshal(oRaw, &ordMap) == nil {
+				txnID = ramstore.ParseFlexString(ordMap["txn_id"])
+				if txnID == "" {
+					txnID = ramstore.ParseFlexString(ordMap["transaction_id"])
+				}
+			}
+		}
+	}
+
+	if saved != nil && saved.CustomerPhone != "" {
 		vendorUser := ramstore.Global.GetVendor().Username
-		if isFinalConfirmation {
+		if ev == "order.paid" || ev == "order.confirmed" {
 			_ = whatsapp.SetCustomerState(vendorUser, saved.CustomerPhone, "ORDER_CONFIRMED")
-			if strings.EqualFold(saved.PaymentStatus, "PAID") {
+			if strings.EqualFold(saved.PaymentStatus, "PAID") || ev == "order.paid" {
 				_ = whatsapp.SetCustomerPaymentStatus(vendorUser, saved.CustomerPhone, "PAID")
 			}
 			_ = whatsapp.SetCustomerCurrentOrderID(vendorUser, saved.CustomerPhone, "")
 			ramstore.Global.ClearCart(saved.CustomerPhone)
-			go func(o *ramstore.Order) {
-				_ = whatsapp.TriggerWebOrderConfirmationPush(vendorUser, o.CustomerPhone, o.OrderID, o.TotalAmount)
-			}(saved)
-		} else if saved.OrderStatus != "" {
-			go func(o *ramstore.Order) {
-				_ = whatsapp.SendOrderStatusUpdateWhatsApp(vendorUser, o.JID, o.CustomerPhone, o.OrderID, o.OrderStatus)
-			}(saved)
+
+			// Strict deduplication: only send WhatsApp confirmation if notify_whatsapp === true
+			// AND order_id is NOT already in notifiedPaidOrders
+			if notifyPtr != nil && *notifyPtr && whatsapp.MarkOrderPaidNotifiedOnce(saved.OrderID) {
+				go func(o *ramstore.Order, tx string) {
+					whatsapp.SendPaidOrderConfirmationWhatsApp(o.OrderID, o.CustomerPhone, o.CustomerName, o.DeliveryAddress, tx, o.TotalAmount)
+				}(saved, txnID)
+			}
+		} else {
+			shouldNotify := statusChanged || isFinalConfirmation
+			if notifyPtr != nil {
+				shouldNotify = *notifyPtr
+			}
+			if shouldNotify {
+				if isFinalConfirmation {
+					_ = whatsapp.SetCustomerState(vendorUser, saved.CustomerPhone, "ORDER_CONFIRMED")
+					if strings.EqualFold(saved.PaymentStatus, "PAID") {
+						_ = whatsapp.SetCustomerPaymentStatus(vendorUser, saved.CustomerPhone, "PAID")
+					}
+					_ = whatsapp.SetCustomerCurrentOrderID(vendorUser, saved.CustomerPhone, "")
+					ramstore.Global.ClearCart(saved.CustomerPhone)
+					if whatsapp.MarkOrderPaidNotifiedOnce(saved.OrderID) {
+						go func(o *ramstore.Order) {
+							_ = whatsapp.TriggerWebOrderConfirmationPush(vendorUser, o.CustomerPhone, o.OrderID, o.TotalAmount)
+						}(saved)
+					}
+				} else if saved.OrderStatus != "" {
+					go func(o *ramstore.Order) {
+						_ = whatsapp.SendOrderStatusUpdateWhatsApp(vendorUser, o.JID, o.CustomerPhone, o.OrderID, o.OrderStatus)
+					}(saved)
+				}
+			}
 		}
 	}
 

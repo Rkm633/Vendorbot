@@ -37,8 +37,9 @@ var (
 	phoneToJID   = make(map[string]types.JID)
 	lidCacheLock sync.RWMutex
 
-	// Per-Customer AI Concurrency Lock
+	// Per-Customer AI Concurrency Lock + Split-Message Interruption Guard
 	customerInFlightMap  = make(map[string]bool)
+	splitNoticeSentMap   = make(map[string]bool)
 	customerInFlightLock sync.Mutex
 
 	// Live Chat Listeners (Browser SSE channels)
@@ -48,10 +49,6 @@ var (
 	// Smart Human-Override: Tracks Message ID -> true when read by human store owner
 	MessageReadByHuman sync.Map
 
-	// Anti-Ban 2.5s Per-Customer Message Debouncer (combines rapid consecutive messages into 1 smart reply)
-	debounceMu      sync.Mutex
-	debounceBuffers = make(map[string]*customerDebounceState)
-
 	// Per-customer cooldown for Store Closed / Holiday notices so we don't spam repeated messages
 	closedNoticeMu   sync.Mutex
 	closedNoticeSent = make(map[string]time.Time)
@@ -60,14 +57,17 @@ var (
 	UniversalThumbnail []byte
 )
 
-type customerDebounceState struct {
-	Texts     []string
-	LastMsgID types.MessageID
-	ChatJID   types.JID
-	SenderJID types.JID
-	LastRaw   *waE2E.Message
-	Timer     *time.Timer
-}
+const (
+	// MessageReadDelay waits 1 second before reading (blue-ticking) and processing a customer message.
+	MessageReadDelay = 1 * time.Second
+
+	// SplitMessagePeacefulNotice is sent with WhatsApp's inbuilt reply-quote tag whenever a customer
+	// sends another message before the bot finishes replying to their previous message.
+	SplitMessagePeacefulNotice = "🙏 *Kripya dhyan dein ji!* 😊\n\nApni kisi bhi baat ko *ek sath likh kar bhejein*, unhe tukdo me karke na bhejein — taaki main aapko *fast aur behtar* reply de saku! ✨💛"
+
+	// FirstTurnSingleMessageTip is politely shown on a customer's very first conversation turn.
+	FirstTurnSingleMessageTip = "\n\n💡 _Ek chhoti si request:_ Koshish karein ki apni poori baat *ek sath ek hi message me* likh kar bhejein (tukdo me nahi), taaki main aapko aur jaldi & best help kar saku! 😊✨"
+)
 
 func init() {
 	const universalThumbnailBase64 = "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"
@@ -843,37 +843,23 @@ func handleWhatsAppEvents(username string, client *whatsmeow.Client, evt interfa
 			central.Client.PushCustomerAsync(saved)
 		}
 
-		// Anti-Ban Read Receipt (Blue Ticks)
-		go func(id types.MessageID, ts time.Time, chat, sender types.JID) {
-			ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
-			defer cancel()
-			_ = client.MarkRead(ctx, []types.MessageID{id}, ts, chat, sender)
-		}(v.Info.ID, v.Info.Timestamp, v.Info.Chat, v.Info.Sender)
-
-		// 1. Handle GPS Location Pin
+		// 1. Handle GPS Location Pin (read after 1s delay)
 		if lat, lng, isLoc := extractLocationCoords(v.Message); isLoc {
-			go handleIncomingLocationPin(username, client, senderPhone, lat, lng)
+			go func(id types.MessageID, ts time.Time, chat, sender types.JID, phone string, la, ln float64) {
+				time.Sleep(MessageReadDelay)
+				ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+				_ = client.MarkRead(ctx, []types.MessageID{id}, ts, chat, sender)
+				cancel()
+				handleIncomingLocationPin(username, client, phone, la, ln)
+			}(v.Info.ID, v.Info.Timestamp, v.Info.Chat, v.Info.Sender, senderPhone, lat, lng)
 			return
 		}
 
 		incomingText := extractMessageText(v.Message)
 
-		// 2. Handle Voice Note / Audio Message (transcribe via Groq Whisper or pass structured context)
+		// 2. Handle Voice Note / Audio Message (respects in-flight split guard + 1s read delay)
 		if audMsg := extractIncomingAudioMessage(v.Message); audMsg != nil {
-			go func(aud *waE2E.AudioMessage) {
-				audioBytes, dlErr := client.Download(context.Background(), aud)
-				transcript := ""
-				if dlErr == nil && len(audioBytes) > 0 {
-					transcript = transcribeVoiceNoteGroq(username, audioBytes)
-				}
-				voiceText := ""
-				if transcript != "" {
-					voiceText = fmt.Sprintf("[Customer Voice Note]: %s", transcript)
-				} else {
-					voiceText = fmt.Sprintf("[Customer sent a %ds Voice Note. Politely ask them to type the product name or order detail if anything is unclear.]", aud.GetSeconds())
-				}
-				enqueueDebouncedCustomerMessage(username, client, v.Info.ID, v.Info.Chat, v.Info.Sender, v.Message, senderPhone, voiceText)
-			}(audMsg)
+			handleIncomingCustomerTurn(username, client, v.Info.ID, v.Info.Timestamp, v.Info.Chat, v.Info.Sender, v.Message, senderPhone, "", audMsg)
 			return
 		}
 
@@ -890,15 +876,121 @@ func handleWhatsAppEvents(username string, client *whatsmeow.Client, evt interfa
 			return
 		}
 
-		enqueueDebouncedCustomerMessage(username, client, v.Info.ID, v.Info.Chat, v.Info.Sender, v.Message, senderPhone, incomingText)
+		handleIncomingCustomerTurn(username, client, v.Info.ID, v.Info.Timestamp, v.Info.Chat, v.Info.Sender, v.Message, senderPhone, incomingText, nil)
 	}
 }
 
-// enqueueDebouncedCustomerMessage buffers rapid consecutive customer messages for 2.5 seconds
-// and combines them into a single coherent AI turn for anti-ban safety & natural replies.
-func enqueueDebouncedCustomerMessage(username string, client *whatsmeow.Client, msgID types.MessageID, chatJID, senderJID types.JID, rawMsg *waE2E.Message, phone, text string) {
+// handleIncomingCustomerTurn enforces:
+//   - If the customer sends another message BEFORE the bot finishes replying to their previous message,
+//     we IGNORE it (zero AI/Whisper tokens) and reply once with a hardcoded peaceful WhatsApp reply-quoted notice.
+//   - Otherwise, we claim the customer's turn lock, wait 1 second before reading (blue ticks), and process the message.
+func handleIncomingCustomerTurn(username string, client *whatsmeow.Client, msgID types.MessageID, msgTime time.Time, chatJID, senderJID types.JID, rawMsg *waE2E.Message, phone, text string, audMsg *waE2E.AudioMessage) {
+	customerInFlightLock.Lock()
+	if customerInFlightMap[phone] {
+		alreadyNotified := splitNoticeSentMap[phone]
+		if !alreadyNotified {
+			splitNoticeSentMap[phone] = true
+		}
+		customerInFlightLock.Unlock()
+
+		log.Printf("🛑 [Split-Message Ignored] +%s sent an extra message before bot replied (notified=%v)", phone, !alreadyNotified)
+		if !alreadyNotified {
+			go func() {
+				time.Sleep(MessageReadDelay)
+				ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+				_ = client.MarkRead(ctx, []types.MessageID{msgID}, msgTime, chatJID, senderJID)
+				cancel()
+				if errSend := SendReplyMessage(client, phone, SplitMessagePeacefulNotice, msgID, senderJID, rawMsg); errSend != nil {
+					_ = SendMessage(client, phone, SplitMessagePeacefulNotice)
+				}
+				PushToLiveChat(username, phone, SplitMessagePeacefulNotice, "outgoing_ai")
+			}()
+		}
+		return
+	}
+	customerInFlightMap[phone] = true
+	splitNoticeSentMap[phone] = false
+	customerInFlightLock.Unlock()
+
+	go processSingleCustomerTurn(username, client, msgID, msgTime, chatJID, senderJID, rawMsg, phone, text, audMsg)
+}
+
+func hasPriorAssistantReplyInRAM(phone string) bool {
+	for _, rec := range ramstore.Global.GetChatMessages(FormatPhone(phone)) {
+		if rec.Role == "assistant" || rec.Direction == "outgoing_ai" || rec.Direction == "outgoing_manual" {
+			return true
+		}
+	}
+	return false
+}
+
+func replyAlreadyHasSingleMsgTip(reply string) bool {
+	low := strings.ToLower(reply)
+	return strings.Contains(low, "tukdo") ||
+		strings.Contains(low, "ek sath") ||
+		strings.Contains(low, "ek saath") ||
+		strings.Contains(low, "ek hi message") ||
+		strings.Contains(low, "one message") ||
+		strings.Contains(low, "single message")
+}
+
+func shouldUseWhatsAppQuote(octResp *OctopusAIResponse, incomingText string) bool {
+	if octResp != nil && octResp.QuoteReply {
+		return true
+	}
+	// Quote when customer asked a long specific multi-part question (>60 chars with '?')
+	if len([]rune(strings.TrimSpace(incomingText))) > 60 && strings.Contains(incomingText, "?") {
+		return true
+	}
+	return false
+}
+
+func processSingleCustomerTurn(username string, client *whatsmeow.Client, msgID types.MessageID, msgTime time.Time, chatJID, senderJID types.JID, rawMsg *waE2E.Message, phone, text string, audMsg *waE2E.AudioMessage) {
+	defer func() {
+		customerInFlightLock.Lock()
+		delete(customerInFlightMap, phone)
+		delete(splitNoticeSentMap, phone)
+		customerInFlightLock.Unlock()
+	}()
+
+	// 1-second deliberate read delay before reading (blue-ticking) the customer's message
+	time.Sleep(MessageReadDelay)
+
+	// Human override check (if vendor already read on phone during the 1s delay)
+	if _, readByHuman := MessageReadByHuman.Load(string(msgID)); readByHuman {
+		if text != "" {
+			SaveCustomerChatAndPrune(username, phone, "customer", text)
+		}
+		return
+	}
+
+	// Mark message read (Blue Ticks) strictly after the 1-second delay
+	ctxRead, cancelRead := context.WithTimeout(context.Background(), 4*time.Second)
+	_ = client.MarkRead(ctxRead, []types.MessageID{msgID}, msgTime, chatJID, senderJID)
+	cancelRead()
+
+	// Transcribe voice note only after turn lock & 1s delay
+	if audMsg != nil {
+		audioBytes, dlErr := client.Download(context.Background(), audMsg)
+		transcript := ""
+		if dlErr == nil && len(audioBytes) > 0 {
+			transcript = transcribeVoiceNoteGroq(username, audioBytes)
+		}
+		if transcript != "" {
+			text = fmt.Sprintf("[Customer Voice Note]: %s", transcript)
+		} else {
+			text = fmt.Sprintf("[Customer sent a %ds Voice Note. Politely ask them to type the product name or order detail if anything is unclear.]", audMsg.GetSeconds())
+		}
+	}
+
+	if strings.TrimSpace(text) == "" {
+		return
+	}
+
+	// Check whether this is the customer's very first bot interaction so we share the single-message tip at the start
+	isFirstTurn := !hasPriorAssistantReplyInRAM(phone)
+
 	// Persist incoming customer message immediately into RAM (last 10 msgs/customer) BEFORE SSE push
-	// so Live Chats always displays it right away even if AI is paused or errors.
 	SaveCustomerChatAndPrune(username, phone, "customer", text)
 	PushToLiveChat(username, phone, text, "incoming")
 	go ExtractAndPersistCustomerDetails(username, phone, text)
@@ -930,62 +1022,10 @@ func enqueueDebouncedCustomerMessage(username string, client *whatsmeow.Client, 
 			}
 			sb.WriteString("\n\nAap apna message chhod sakte hain — store khulte hi hum aapko turant reply karenge! 🙏")
 			reply := sb.String()
-			go func() {
-				_ = SendMessage(client, phone, reply)
-				SaveCustomerChatAndPrune(username, phone, "assistant", reply)
-				PushToLiveChat(username, phone, reply, "outgoing_ai")
-			}()
+			_ = SendMessage(client, phone, reply)
+			SaveCustomerChatAndPrune(username, phone, "assistant", reply)
+			PushToLiveChat(username, phone, reply, "outgoing_ai")
 		}
-		return
-	}
-
-	debounceMu.Lock()
-	buf, exists := debounceBuffers[phone]
-	if !exists || buf == nil {
-		buf = &customerDebounceState{}
-		debounceBuffers[phone] = buf
-	}
-	buf.Texts = append(buf.Texts, text)
-	buf.LastMsgID = msgID
-	buf.ChatJID = chatJID
-	buf.SenderJID = senderJID
-	buf.LastRaw = rawMsg
-	if buf.Timer != nil {
-		buf.Timer.Stop()
-	}
-	buf.Timer = time.AfterFunc(2500*time.Millisecond, func() {
-		debounceMu.Lock()
-		b := debounceBuffers[phone]
-		delete(debounceBuffers, phone)
-		debounceMu.Unlock()
-		if b == nil || len(b.Texts) == 0 {
-			return
-		}
-		combined := strings.Join(b.Texts, "\n")
-		processCombinedCustomerTurn(username, client, b.LastMsgID, b.ChatJID, b.SenderJID, b.LastRaw, phone, combined)
-	})
-	debounceMu.Unlock()
-}
-
-func processCombinedCustomerTurn(username string, client *whatsmeow.Client, msgID types.MessageID, chatJID, senderJID types.JID, rawMsg *waE2E.Message, phone, combinedText string) {
-	// Per-customer concurrency lock
-	customerInFlightLock.Lock()
-	if customerInFlightMap[phone] {
-		customerInFlightLock.Unlock()
-		return
-	}
-	customerInFlightMap[phone] = true
-	customerInFlightLock.Unlock()
-
-	defer func() {
-		customerInFlightLock.Lock()
-		delete(customerInFlightMap, phone)
-		customerInFlightLock.Unlock()
-	}()
-
-	// Human override check (if vendor already read on phone during debounce window)
-	if _, readByHuman := MessageReadByHuman.Load(string(msgID)); readByHuman {
-		go SaveCustomerChatAndPrune(username, phone, "customer", combinedText)
 		return
 	}
 
@@ -1008,7 +1048,7 @@ func processCombinedCustomerTurn(username string, client *whatsmeow.Client, msgI
 		}
 	}()
 
-	octResp, err := GenerateOctopusAIReply(username, phone, combinedText, cfg)
+	octResp, err := GenerateOctopusAIReply(username, phone, text, cfg)
 	// Slight natural human typing pause (450ms) before stopping typing & delivering message
 	time.Sleep(450 * time.Millisecond)
 	close(stopTyping)
@@ -1021,13 +1061,23 @@ func processCombinedCustomerTurn(username string, client *whatsmeow.Client, msgI
 	// Execute Octopus Actions (cart variants/stock, QR, PDF, magic links, owner escalation)
 	executeOctopusActions(username, client, phone, chatJID, octResp, cfg)
 
-	// Deliver AI reply text (chat kept strictly in bot RAM max 10; no per-message session upload)
-	if strings.TrimSpace(octResp.AIReplyText) != "" {
-		if errSend := SendReplyMessage(client, phone, octResp.AIReplyText, msgID, senderJID, rawMsg); errSend != nil {
-			_ = SendMessage(client, phone, octResp.AIReplyText)
+	// Guarantee polite single-message guidance on the very first reply to this customer
+	replyText := strings.TrimSpace(octResp.AIReplyText)
+	if replyText != "" && isFirstTurn && !replyAlreadyHasSingleMsgTip(replyText) {
+		replyText += FirstTurnSingleMessageTip
+	}
+
+	// Deliver AI reply text using WhatsApp inbuilt quote ONLY when needed (humanoid flow)
+	if replyText != "" {
+		if shouldUseWhatsAppQuote(octResp, text) {
+			if errSend := SendReplyMessage(client, phone, replyText, msgID, senderJID, rawMsg); errSend != nil {
+				_ = SendMessage(client, phone, replyText)
+			}
+		} else {
+			_ = SendMessage(client, phone, replyText)
 		}
-		SaveCustomerChatAndPrune(username, phone, "assistant", octResp.AIReplyText)
-		PushToLiveChat(username, phone, octResp.AIReplyText, "outgoing_ai")
+		SaveCustomerChatAndPrune(username, phone, "assistant", replyText)
+		PushToLiveChat(username, phone, replyText, "outgoing_ai")
 	}
 }
 
@@ -1099,7 +1149,10 @@ func executeOctopusActions(username string, client *whatsmeow.Client, phone stri
 				mode = strings.TrimSpace(act.Payload.PaymentMode)
 			}
 			replyFromCentral, _, _ := SubmitWhatsAppOrderToCentral(client, username, phone, mode)
-			if strings.TrimSpace(replyFromCentral) != "" {
+			if replyFromCentral == "__QR_IMAGE_SENT__" {
+				// Strict QR-only rule: ONLY the Branded Banner QR image is sent (no follow-up text or payment link)
+				octResp.AIReplyText = ""
+			} else if strings.TrimSpace(replyFromCentral) != "" {
 				octResp.AIReplyText = replyFromCentral
 			}
 
@@ -1115,6 +1168,9 @@ func executeOctopusActions(username string, client *whatsmeow.Client, phone stri
 
 		case "cancel_order":
 			ordID := GetCustomerCurrentOrderID(username, phone)
+			if ordID != "" {
+				StopPaymentVerificationPoller(ordID)
+			}
 			if ord := ramstore.Global.GetOrder(ordID); ord != nil {
 				ord.OrderStatus = "CANCELLED"
 				ord.PaymentStatus = "CANCELLED"

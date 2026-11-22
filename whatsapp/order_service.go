@@ -493,6 +493,10 @@ func SubmitWhatsAppOrderToCentral(client *whatsmeow.Client, username, customerPh
 	if ordID == "" {
 		ordID = GenerateStandardOrderID()
 	}
+	finalAmount := resp.TotalAmount
+	if finalAmount <= 0 {
+		finalAmount = totalAmount
+	}
 	ordStatus := strings.ToUpper(strings.TrimSpace(resp.OrderStatus))
 	if ordStatus == "" {
 		if mode == "ONLINE" {
@@ -510,7 +514,70 @@ func SubmitWhatsAppOrderToCentral(client *whatsmeow.Client, username, customerPh
 		}
 	}
 
-	// Cache Central's returned order reference in RAM (Central remains 100% authoritative for confirmation & payment)
+	payCfg := ramstore.Global.GetPayment()
+	storeName := strings.TrimSpace(vendor.BusinessName)
+	if storeName == "" {
+		storeName = "Our Store"
+	}
+
+	resolvedQRURL := strings.TrimSpace(resp.PaymentQRURL)
+	resolvedPaytmMID := strings.TrimSpace(resp.PaytmMID)
+	if resolvedPaytmMID == "" {
+		resolvedPaytmMID = strings.TrimSpace(payCfg.PaytmMID)
+	}
+
+	// ONLINE / UPI Checkout: Generate Branded Banner QR & send ONLY the QR image (NO payment link!)
+	if mode == "ONLINE" {
+		upiID := strings.TrimSpace(resp.UPIID)
+		if upiID == "" {
+			upiID = strings.TrimSpace(resp.MerchantVPA)
+		}
+		if upiID == "" {
+			upiID = strings.TrimSpace(payCfg.UPIID)
+		}
+		if upiID == "" {
+			upiID = strings.TrimSpace(payCfg.MerchantVPA)
+		}
+
+		payeeName := strings.TrimSpace(resp.PayeeName)
+		if payeeName == "" {
+			payeeName = strings.TrimSpace(payCfg.PayeeName)
+		}
+		if payeeName == "" {
+			payeeName = storeName
+		}
+
+		qrGenURL := strings.TrimSpace(resp.QRGeneratorURL)
+		if qrGenURL == "" {
+			qrGenURL = strings.TrimSpace(payCfg.QRGeneratorURL)
+		}
+		if qrGenURL == "" {
+			qrGenURL = ramstore.DefaultQRGeneratorURL
+		}
+
+		qrCloudName := strings.TrimSpace(resp.QRCloudName)
+		if qrCloudName == "" {
+			qrCloudName = strings.TrimSpace(payCfg.QRCloudName)
+		}
+		if qrCloudName == "" {
+			qrCloudName = strings.TrimSpace(payCfg.CloudinaryCloudName)
+		}
+		if qrCloudName == "" {
+			qrCloudName = ramstore.DefaultQRCloudName
+		}
+
+		if upiID != "" {
+			bannerURL, qrErr := GenerateBrandedBannerQR(qrGenURL, upiID, payeeName, ordID, finalAmount, qrCloudName)
+			if qrErr == nil && strings.TrimSpace(bannerURL) != "" {
+				resolvedQRURL = strings.TrimSpace(bannerURL)
+				log.Printf("🎨 [Banner QR Generated] Order #%s -> %s", ordID, resolvedQRURL)
+			} else {
+				log.Printf("⚠️ [Banner QR Worker] Failed for Order #%s (%v) — falling back to Central payment_qr_url", ordID, qrErr)
+			}
+		}
+	}
+
+	// Cache Central's returned order reference in RAM
 	ramstore.Global.UpsertOrderFromCentral(&ramstore.Order{
 		OrderID:         ordID,
 		CustomerPhone:   cleanPhone,
@@ -521,12 +588,12 @@ func SubmitWhatsAppOrderToCentral(client *whatsmeow.Client, username, customerPh
 		Items:           cartItems,
 		Subtotal:        subtotal,
 		DeliveryFee:     deliveryFee,
-		TotalAmount:     resp.TotalAmount,
+		TotalAmount:     finalAmount,
 		PaymentMode:     mode,
 		PaymentStatus:   payStatus,
 		OrderStatus:     ordStatus,
-		PaymentLink:     resp.PaymentLink,
-		PaymentQRURL:    resp.PaymentQRURL,
+		PaymentLink:     "",
+		PaymentQRURL:    resolvedQRURL,
 		Source:          "whatsapp",
 		StatusUpdatedBy: "central",
 	})
@@ -535,48 +602,61 @@ func SubmitWhatsAppOrderToCentral(client *whatsmeow.Client, username, customerPh
 	if mode == "ONLINE" {
 		_ = SetCustomerState(username, cleanPhone, "PAYMENT_PENDING")
 		_ = SetCustomerPaymentStatus(username, cleanPhone, "PENDING")
-	} else {
-		_ = SetCustomerState(username, cleanPhone, "ORDER_SUBMITTED")
-		_ = SetCustomerPaymentStatus(username, cleanPhone, payStatus)
+
+		// Clean QR-only caption (STRICT RULE: NO upi:// link, NO checkout URL, NO clickable payment link!)
+		qrCaption := fmt.Sprintf(
+			"🏪 *%s*\n🧾 *Order ID:* #%s\n💰 *Total Amount:* ₹%.2f\n\nPlease scan & pay using this QR code. Your payment will be verified automatically in a few seconds.",
+			storeName, ordID, finalAmount,
+		)
+
+		qrSent := false
+		if resolvedQRURL != "" && client != nil && client.IsLoggedIn() {
+			if sendErr := SendImageFromURL(client, cleanPhone, resolvedQRURL, qrCaption); sendErr == nil {
+				qrSent = true
+				SaveCustomerChatAndPrune(username, cleanPhone, "assistant", qrCaption)
+				PushToLiveChat(username, cleanPhone, qrCaption, "outgoing_ai")
+			} else {
+				log.Printf("⚠️ [Banner QR Image Send] Failed downloading/sending %s for Order #%s: %v", resolvedQRURL, ordID, sendErr)
+			}
+		}
+
+		// Start non-blocking 3-second payment verification loop immediately after sending QR
+		StartPaymentVerificationPoller(PaymentPollParams{
+			OrderID:         ordID,
+			CustomerPhone:   cleanPhone,
+			CustomerName:    custName,
+			DeliveryAddress: custAddr,
+			TotalAmount:     finalAmount,
+			PaytmMID:        resolvedPaytmMID,
+			VerifyEndpoint:  payCfg.VerifyEndpoint,
+			PollInterval:    time.Duration(payCfg.VerifyPollIntervalMS) * time.Millisecond,
+			PollTimeout:     time.Duration(payCfg.VerifyPollTimeoutMS) * time.Millisecond,
+		})
+
+		if qrSent {
+			// Return special sentinel so caller sends NO follow-up text message (ONLY the Branded Banner QR image)
+			return "__QR_IMAGE_SENT__", resp, nil
+		}
+
+		// Fallback text only if QR image download/send failed (still ZERO payment links!)
+		return fmt.Sprintf(
+			"🏪 *%s*\n🧾 *Order ID:* #%s\n💰 *Total Amount:* ₹%.2f\n\nQR image load hone me thodi dikkat aayi — kripya store se sampark karein ya dobara try karein. 🙏",
+			storeName, ordID, finalAmount,
+		), resp, nil
 	}
 
-	// If Central returned an Online Payment QR image URL, dispatch it directly via WhatsApp
-	if mode == "ONLINE" && strings.TrimSpace(resp.PaymentQRURL) != "" && client != nil && client.IsLoggedIn() {
-		qrCaption := fmt.Sprintf("💳 *Online Payment QR — Order #%s*\n• Payable Amount: *₹%.2f*", ordID, resp.TotalAmount)
-		if strings.TrimSpace(resp.PaymentLink) != "" {
-			qrCaption += "\n• Payment Link: " + strings.TrimSpace(resp.PaymentLink)
-		}
-		if strings.TrimSpace(resp.PaymentInstructions) != "" {
-			qrCaption += "\n\n" + strings.TrimSpace(resp.PaymentInstructions)
-		}
-		qrCaption += "\n\n_Payment verify hote hi Central System se aapko final order confirmation aur PDF receipt turant mil jayegi!_ 🙏"
-		go func(u, capTxt string) {
-			_ = SendImageFromURL(client, cleanPhone, u, capTxt)
-		}(strings.TrimSpace(resp.PaymentQRURL), qrCaption)
-	}
+	// COD order flow
+	_ = SetCustomerState(username, cleanPhone, "ORDER_SUBMITTED")
+	_ = SetCustomerPaymentStatus(username, cleanPhone, payStatus)
 
-	// Build concise customer message strictly from Central Brain's response
 	var sb strings.Builder
 	if strings.TrimSpace(resp.Message) != "" {
 		sb.WriteString(strings.TrimSpace(resp.Message))
 		sb.WriteString("\n\n")
-	} else if mode == "ONLINE" {
-		sb.WriteString(fmt.Sprintf("💳 *Order Reference #%s Created*\n\n• Payable Amount: *₹%.2f*\n• Payment Mode: *Online Payment*\n", ordID, resp.TotalAmount))
 	} else {
-		sb.WriteString(fmt.Sprintf("📦 *Order Request #%s Submitted*\n\n• Total Amount: *₹%.2f*\n• Payment Mode: *Cash on Delivery (COD)*\n", ordID, resp.TotalAmount))
+		sb.WriteString(fmt.Sprintf("📦 *Order Request #%s Submitted*\n\n• Total Amount: *₹%.2f*\n• Payment Mode: *Cash on Delivery (COD)*\n", ordID, finalAmount))
 	}
-
-	if strings.TrimSpace(resp.PaymentLink) != "" {
-		sb.WriteString(fmt.Sprintf("\n🔗 *Pay Online Here:*\n👉 %s\n", strings.TrimSpace(resp.PaymentLink)))
-	}
-	if strings.TrimSpace(resp.PaymentInstructions) != "" {
-		sb.WriteString("\nℹ️ " + strings.TrimSpace(resp.PaymentInstructions) + "\n")
-	}
-	if mode == "ONLINE" {
-		sb.WriteString("\n✅ Payment complete hote hi humara Central System automatically verify karke aapko final confirmation aur PDF bill bhej dega. Kripya screenshot ya UTR bhejne ki zaroorat nahi hai!")
-	} else {
-		sb.WriteString("\n✅ Central Mall System se confirm hote hi aapko final order confirmation aur PDF receipt turant bhej di jayegi!")
-	}
+	sb.WriteString("✅ Central Mall System se confirm hote hi aapko final order confirmation aur PDF receipt turant bhej di jayegi!")
 
 	return strings.TrimSpace(sb.String()), resp, nil
 }

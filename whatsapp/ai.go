@@ -2,6 +2,8 @@ package whatsapp
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -81,6 +84,276 @@ type AIResponseStateJSON struct {
 }
 
 // -----------------------------------------------------------------------------
+// GROQ-ONLY 3-MODEL POOL & FULL TPD/TPM SCHEDULER ACROSS ALL KEYS × MODELS
+// -----------------------------------------------------------------------------
+
+// Strictly active Groq models ONLY (condition applies exclusively to Groq API).
+var groqAllowedModels = []string{
+	"qwen/qwen3.8-27b",
+	"openai/gpt-oss-20b",
+	"openai/gpt-oss-120b",
+}
+
+// MaxLLMHistoryMessages caps the sliding window sent to the LLM to total 6 recent
+// messages (user + assistant combined) to slash input tokens while RAM still keeps
+// ramstore.MaxChatsPerCustomer (10) messages for the Live Chat dashboard.
+const MaxLLMHistoryMessages = 6
+
+type groqSlotState struct {
+	tpmCooldownUntil  time.Time
+	tpdCooldownUntil  time.Time
+	authDisabledUntil time.Time
+	tokensUsedToday   int64
+	requestsToday     int64
+	dayUTC            string
+}
+
+type groqCandidateSlot struct {
+	keyIndex  int
+	apiKey    string
+	keyHash   string
+	model     string
+	tokensDay int64
+	tpmUntil  time.Time
+}
+
+type groqPoolManager struct {
+	mu     sync.Mutex
+	slots  map[string]*groqSlotState
+	cursor uint64
+}
+
+var groqPool = &groqPoolManager{
+	slots: make(map[string]*groqSlotState),
+}
+
+func shortKeyHash(apiKey string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(apiKey)))
+	return hex.EncodeToString(sum[:6])
+}
+
+func isGroqModelAllowed(m string) bool {
+	m = strings.ToLower(strings.TrimSpace(m))
+	for _, allowed := range groqAllowedModels {
+		if m == allowed {
+			return true
+		}
+	}
+	return false
+}
+
+// isGroqProvider strictly detects whether a provider/key pair targets Groq API.
+func isGroqProvider(provider, apiKey string) bool {
+	k := strings.TrimSpace(apiKey)
+	if strings.HasPrefix(k, "gsk_") {
+		return true
+	}
+	if strings.HasPrefix(k, "AIzaSy") || strings.HasPrefix(k, "sk-or-") || strings.HasPrefix(k, "sk-") {
+		return false
+	}
+	p := strings.ToLower(strings.TrimSpace(provider))
+	return p == "" || p == "groq"
+}
+
+func (pm *groqPoolManager) getSlotLocked(kHash, model string, now time.Time) *groqSlotState {
+	day := now.UTC().Format("2006-01-02")
+	id := kHash + "|" + model
+	st, ok := pm.slots[id]
+	if !ok || st == nil {
+		st = &groqSlotState{dayUTC: day}
+		pm.slots[id] = st
+		return st
+	}
+	// Reset daily TPD usage & TPD cooldown cleanly at UTC midnight
+	if st.dayUTC != day {
+		st.dayUTC = day
+		st.tokensUsedToday = 0
+		st.requestsToday = 0
+		st.tpdCooldownUntil = time.Time{}
+	}
+	return st
+}
+
+// buildCandidates builds the full (active Groq keys × 3 Groq models) matrix split into:
+//   - ready: immediately usable slots balanced across all keys & all 3 models for full TPD utilization
+//   - tpmDelayed: non-TPD slots temporarily on short TPM cooldown (sorted by soonest expiry)
+func (pm *groqPoolManager) buildCandidates(groqKeys []string) (ready []groqCandidateSlot, tpmDelayed []groqCandidateSlot) {
+	now := time.Now()
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
+	total := len(groqKeys) * len(groqAllowedModels)
+	if total == 0 {
+		return nil, nil
+	}
+
+	// Build interleaved matrix: iterate models across all keys so every key × every model gets TPD coverage
+	matrix := make([]groqCandidateSlot, 0, total)
+	for mIdx, model := range groqAllowedModels {
+		_ = mIdx
+		for kIdx, key := range groqKeys {
+			matrix = append(matrix, groqCandidateSlot{
+				keyIndex: kIdx,
+				apiKey:   key,
+				keyHash:  shortKeyHash(key),
+				model:    model,
+			})
+		}
+	}
+
+	// Round-robin offset across the K × 3 matrix so consecutive requests spread across all models & keys
+	start := int(pm.cursor % uint64(total))
+	pm.cursor++
+
+	rotated := make([]groqCandidateSlot, 0, total)
+	rotated = append(rotated, matrix[start:]...)
+	rotated = append(rotated, matrix[:start]...)
+
+	for _, slot := range rotated {
+		st := pm.getSlotLocked(slot.keyHash, slot.model, now)
+		if now.Before(st.authDisabledUntil) {
+			continue
+		}
+		if now.Before(st.tpdCooldownUntil) {
+			continue
+		}
+		slot.tokensDay = st.tokensUsedToday
+		slot.tpmUntil = st.tpmCooldownUntil
+		if now.Before(st.tpmCooldownUntil) {
+			tpmDelayed = append(tpmDelayed, slot)
+		} else {
+			ready = append(ready, slot)
+		}
+	}
+
+	// Sort ready slots gently by lowest daily token usage (keeping round-robin tie-break)
+	// so every model on every active key drains its full TPD evenly!
+	sort.SliceStable(ready, func(i, j int) bool {
+		// Bucket by 5k tokens so round-robin rotation still spreads burst TPM cleanly
+		return (ready[i].tokensDay / 5000) < (ready[j].tokensDay / 5000)
+	})
+
+	sort.SliceStable(tpmDelayed, func(i, j int) bool {
+		return tpmDelayed[i].tpmUntil.Before(tpmDelayed[j].tpmUntil)
+	})
+
+	return ready, tpmDelayed
+}
+
+func (pm *groqPoolManager) recordSuccess(kHash, model string, totalTokens int64, remainingTokens int, resetTokensDur time.Duration) {
+	now := time.Now()
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	st := pm.getSlotLocked(kHash, model, now)
+	st.tokensUsedToday += totalTokens
+	st.requestsToday++
+	st.tpmCooldownUntil = time.Time{}
+	// Proactively pace if Groq header reports near-zero remaining TPM tokens (< 800)
+	if remainingTokens >= 0 && remainingTokens < 800 {
+		wait := resetTokensDur
+		if wait <= 0 || wait > 75*time.Second {
+			wait = 15 * time.Second
+		}
+		st.tpmCooldownUntil = now.Add(wait)
+	}
+}
+
+func (pm *groqPoolManager) markTPMCooldown(kHash, model string, dur time.Duration) {
+	if dur <= 0 {
+		dur = 65 * time.Second
+	}
+	now := time.Now()
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	st := pm.getSlotLocked(kHash, model, now)
+	st.tpmCooldownUntil = now.Add(dur)
+}
+
+func (pm *groqPoolManager) markTPDExhausted(kHash, model string, dur time.Duration) {
+	now := time.Now()
+	nextMidnightUTC := time.Date(now.UTC().Year(), now.UTC().Month(), now.UTC().Day()+1, 0, 1, 0, 0, time.UTC)
+	until := nextMidnightUTC
+	if dur > 0 {
+		cand := now.Add(dur)
+		if cand.After(now.Add(10*time.Minute)) && cand.Before(until) {
+			until = cand
+		}
+	}
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	st := pm.getSlotLocked(kHash, model, now)
+	st.tpdCooldownUntil = until
+}
+
+func (pm *groqPoolManager) markAuthDisabledForKey(kHash string, dur time.Duration) {
+	if dur <= 0 {
+		dur = 30 * time.Minute
+	}
+	now := time.Now()
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	for _, mdl := range groqAllowedModels {
+		st := pm.getSlotLocked(kHash, mdl, now)
+		st.authDisabledUntil = now.Add(dur)
+	}
+}
+
+// parseResetDuration parses Groq headers like "12", "45.2s", "1m20s", "2h15m3s", or "500ms".
+func parseResetDuration(raw string) time.Duration {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return 0
+	}
+	if secs, err := strconv.ParseFloat(s, 64); err == nil && secs > 0 {
+		return time.Duration(secs * float64(time.Second))
+	}
+	if d, err := time.ParseDuration(s); err == nil && d > 0 {
+		return d
+	}
+	return 0
+}
+
+// classifyGroq429 distinguishes daily TPD/RPD exhaustion vs short-term TPM/RPM throttling.
+func classifyGroq429(headers http.Header, body []byte) (isTPD bool, cooldown time.Duration) {
+	lower := strings.ToLower(string(body))
+	retryAfter := parseResetDuration(headers.Get("Retry-After"))
+	resetTok := parseResetDuration(headers.Get("x-ratelimit-reset-tokens"))
+	resetReq := parseResetDuration(headers.Get("x-ratelimit-reset-requests"))
+
+	// Check explicit daily quota markers in Groq error payload
+	if strings.Contains(lower, "tokens per day") ||
+		strings.Contains(lower, "requests per day") ||
+		strings.Contains(lower, "(tpd)") ||
+		strings.Contains(lower, " tpd") ||
+		strings.Contains(lower, "(rpd)") ||
+		strings.Contains(lower, " rpd") ||
+		strings.Contains(lower, "daily") ||
+		retryAfter >= 5*time.Minute {
+		cd := retryAfter
+		if cd < 30*time.Minute {
+			cd = 2 * time.Hour
+		}
+		return true, cd
+	}
+
+	// Short-term TPM / RPM cooldown
+	cd := retryAfter
+	if cd <= 0 {
+		if resetTok > 0 && resetTok < 5*time.Minute {
+			cd = resetTok
+		} else if resetReq > 0 && resetReq < 5*time.Minute {
+			cd = resetReq
+		}
+	}
+	if cd <= 0 {
+		cd = 65 * time.Second
+	} else {
+		cd += 2 * time.Second
+	}
+	return false, cd
+}
+
+// -----------------------------------------------------------------------------
 // OCTOPUS AGENTIC ARCHITECTURE: MULTI-ACTION ROUTING JSON SCHEMA
 // -----------------------------------------------------------------------------
 
@@ -142,6 +415,7 @@ type AIActionItem struct {
 
 type OctopusAIResponse struct {
 	AIReplyText string         `json:"ai_reply_text"`
+	QuoteReply  bool           `json:"quote_reply,omitempty"`
 	Actions     []AIActionItem `json:"actions,omitempty"`
 
 	ExecuteHand     string           `json:"execute_hand,omitempty"`
@@ -152,52 +426,47 @@ type OctopusAIResponse struct {
 	ProfileData     *AIProfileData   `json:"profile_data,omitempty"`
 }
 
-const SafeAIFallbackReply = "> ✨ *NAMASTE JI* 🙏\n> _Aapki sahayata ke liye hum hamesha hazir hain!_\n\nMaaf kijiye, main aapka sandesh theek se samajh nahi paya. Kripya apna sawal ya item ka naam dobara batayein! 😊🍕"
+const SafeAIFallbackReply = "Namaste ji! 🙏✨\nMaaf kijiye, main aapka message theek se samajh nahi paya 😅 Kripya apna *item ka naam* ya *sawal* ek baar aur batayein — main turant help karta hoon! 😊🛍️"
 
-var jsonExtractorRegex = regexp.MustCompile(`(?s)\{.*\}`)
+var (
+	jsonExtractorRegex = regexp.MustCompile(`(?s)\{.*\}`)
+	thinkTagRegex      = regexp.MustCompile(`(?is)<think>.*?</think>`)
+	whitespaceCollapse = regexp.MustCompile(`\n{3,}`)
+	nonDigitRegex      = regexp.MustCompile(`\D`)
+	keySplitRegex      = regexp.MustCompile(`[\n,\s]+`)
+)
 
-const octopusSystemPromptJSON = `You are the brain of the automated store sales & support agent for "%s" (a %s).
-Store Policy: %s
-Your output language MUST BE strictly: %s.
+// Ultra-lean, token-optimized system prompt (~60% smaller than legacy prompt) with
+// warm humanoid tone, rich WhatsApp *bold* + emoji guidance, and smart conditional quote_reply.
+const octopusSystemPromptJSON = `You are the warm, lively, human-like WhatsApp shop assistant for "%s" (%s).
+Policy: %s
+Reply strictly in: %s.
 
-CRITICAL INSTRUCTION: You MUST output ONLY a valid, raw JSON object. Do NOT wrap the JSON in markdown code blocks (like ` + "```json" + `), asterisks, or any explanatory text. NEVER write asterisks around key names (NEVER write *ai_reply_text*: or *actions*:). Your response MUST strictly start with '{' and end with '}'.
+OUTPUT ONLY RAW JSON (no markdown fences, no text outside {}):
+{"ai_reply_text":"...","quote_reply":false,"actions":[{"hand":"...","payload":{}}]}
 
-You are the brain. You must understand the user's intent, write a beautifully designed, polite, human-like reply, and command the backend to execute one or more physical actions using this strict JSON schema:
+TONE & WHATSAPP STYLE (HUMANOID + ENGAGING):
+• Sound like a friendly, caring real shopkeeper — natural, warm, enthusiastic, never robotic or stiff.
+• Use *bold* generously for *item names*, *₹prices*, *totals*, *variants*, and key call-to-actions.
+• Use rich, expressive emojis naturally across greetings, bullets, and sign-offs (✨🛍️🔥😋💰📦🙌💛).
+• Keep replies crisp, scannable, and mobile-friendly with clean "• " bullets and _short italics_ where nice.
+• Use WhatsApp blockquote (> ) ONLY sparingly for a highlight box (like > 🧾 *Total: ₹...* or > 💳 *Payment Note*), NEVER on ordinary lines.
+• Set "quote_reply":true ONLY when directly answering a specific question/price/item/address/complaint so WhatsApp swipe-quote adds clarity; keep "quote_reply":false for normal greetings, simple replies, and smooth chat flow.
 
-{
-  "ai_reply_text": "String (Your beautifully designed reply in %s with clean headings, rich emojis, and bold styling)",
-  "actions": [
-    {
-      "hand": "String (Choose from: send_catalog_images, update_cart, extract_profile, submit_order, generate_store_link, clear_cart, cancel_order, escalate_to_human, chat_only)",
-      "payload": {
-        "category": "String (Optional product name or category, e.g. 'all' or 'Kaju Katli' or 'Snacks')",
-        "payment_mode": "String (Required for submit_order: 'COD' or 'ONLINE')",
-        "cart_items": [{"id": "String", "variant": "String (Optional exact variant label e.g. '500g')", "qty": 1}],
-        "profile": {"name": "", "address": "", "contact": ""}
-      }
-    }
-  ]
-}
+HANDS (include only needed actions; empty [] for pure chat):
+• send_catalog_images: {"category":"item name|category|all"} — when user asks for photos/pics.
+• update_cart: {"cart_items":[{"id":"EXACT_ID","variant":"exact variant if any","qty":1}]} — ONLY from IN-STOCK INV below.
+• extract_profile: {"profile":{"name":"","address":"","contact":""}} — save customer name/address/10-digit phone.
+• submit_order: {"payment_mode":"COD"|"ONLINE"} — when cart has items + address is known + customer chooses COD or Online.
+• generate_store_link: {} — when user asks for website/store/mall link.
+• clear_cart: {} | cancel_order: {} | escalate_to_human: {} (notify owner & keep helping warmly).
 
-VISUAL DESIGN & BEAUTIFUL FORMATTING GUIDELINES (WHATSAPP AESTHETICS):
-1. Do NOT place WhatsApp blockquote markers (>) on every line or on ordinary sentences. Use bold headings with friendly emojis and clean bullet points (• ).
-2. When greeting or when the customer asks what is available, clearly list categories and key IN-STOCK products with prices from the live inventory provided below, and offer to send product photos.
-3. If the customer asks for photos/images of any product or category, trigger: {"hand": "send_catalog_images", "payload": {"category": "<product name or category or all>"}}.
-4. If the customer asks to speak with the store owner/malik, trigger {"hand": "escalate_to_human", "payload": {}} AND keep assisting them warmly without locking the chat.
-
-MASTER WORKFLOW - CENTRAL BRAIN CONTROLLED CHECKOUT:
-- PHASE 1 (Greeting & Browsing): Show available categories & IN-STOCK items from LIVE INVENTORY and offer product photos.
-- PHASE 2 (Adding to Cart): Match items with live catalog IDs & trigger {"hand": "update_cart", "payload": {"cart_items": [{"id": "...", "variant": "...", "qty": 1}]}}.
-- PHASE 3 (Profile Extraction & Summary): Save name/address/contact via {"hand": "extract_profile", "payload": {"profile": {"name": "", "address": "", "contact": ""}}}, show full order summary, and ask whether they prefer Online Payment or Cash on Delivery (COD).
-- PHASE 4 (Submit Order to Central Brain): Once customer has items in cart + delivery address + chooses Online Payment or COD, trigger {"hand": "submit_order", "payload": {"payment_mode": "ONLINE"}} or {"hand": "submit_order", "payload": {"payment_mode": "COD"}}. Central Brain Node controls 100% of payment links/QR, payment verification, and final order confirmation + PDF receipt.
-- PHASE 5 (Owner Escalation): Trigger {"hand": "escalate_to_human"} while continuing to assist.
-- PHASE 6 (Omnichannel Storefront & Mall Magic Link): When user asks for website/store/mall link, trigger {"hand": "generate_store_link"}.
-
-STRICT PAYMENT & SECURITY RULES:
-1. NEVER ask customers for UTR numbers or payment screenshots, NEVER scan/verify any payment screenshot or UTR number, and NEVER mark an order as Paid or Confirmed on your own.
-2. If a customer says they paid or sends a payment screenshot, politely inform them that online payments are verified automatically by our Central Payment System and final order confirmation + receipt will arrive automatically once verified.
-3. Use ONLY the REAL-TIME RAM STORE STATE (current_state, shopping_cart, customer_profile, rag_results) injected below.
-4. OUTPUT ONLY THE RAW JSON OBJECT. NO PRETEXT, NO POSTTEXT, NO MARKDOWN OUTSIDE JSON.`
+RULES:
+1. NEVER suggest/add out-of-stock items. Only quote items/prices/IDs present in INV. If user asks for a category not expanded in INV, politely name matching categories from CATS & ask which item they want.
+2. NEVER ask for UTR or payment screenshots, NEVER verify screenshots, NEVER mark orders Paid. If user says they paid, warmly reassure that our Central Payment System verifies online payments automatically and sends confirmation + PDF receipt right away.
+3. On greeting/menu ask, warmly welcome & highlight top categories/popular items with *₹prices* and offer photos!
+4. Before submit_order, show a crisp *Order Summary* (items, total, address) and ask *Online Payment* 💳 or *COD* 💵 (if COD allowed).
+5. On a customer's FIRST message (new chat), warmly ask them to write their full message together in one message instead of sending small pieces.`
 
 // BuildUniversalSystemPrompt builds the Octopus system prompt dynamically from RAM vendor settings.
 func BuildUniversalSystemPrompt(businessName, businessType, language, storePolicies, catalogContext string) string {
@@ -207,18 +476,18 @@ func BuildUniversalSystemPrompt(businessName, businessType, language, storePolic
 	}
 	bType := strings.TrimSpace(businessType)
 	if bType == "" {
-		bType = "Retail / Mall Store"
+		bType = "Retail Store"
 	}
 	lang := strings.TrimSpace(language)
 	if lang == "" {
 		lang = "Hinglish"
 	}
-	policies := strings.TrimSpace(storePolicies)
+	policies := compactText(storePolicies, 180)
 	if policies == "" {
-		policies = "Standard delivery and returns applicable."
+		policies = "Standard delivery & returns."
 	}
 
-	finalPrompt := fmt.Sprintf(octopusSystemPromptJSON, bName, bType, policies, lang, lang)
+	finalPrompt := fmt.Sprintf(octopusSystemPromptJSON, bName, bType, policies, lang)
 	if strings.TrimSpace(catalogContext) != "" {
 		finalPrompt += "\n\n" + strings.TrimSpace(catalogContext)
 	}
@@ -258,17 +527,22 @@ func GetUserConfigRAM(_ string) *UserConfigRAM {
 	a := ramstore.Global.GetAI()
 	p := ramstore.Global.GetPayment()
 
-	model := strings.TrimSpace(a.Model)
-	if model == "" {
-		model = "llama-3.3-70b-versatile"
-	}
 	provider := strings.TrimSpace(a.Provider)
 	if provider == "" {
 		provider = "groq"
 	}
+	model := strings.TrimSpace(a.Model)
+	if strings.EqualFold(provider, "groq") {
+		if !isGroqModelAllowed(model) {
+			model = groqAllowedModels[0]
+		}
+	} else if model == "" {
+		model = groqAllowedModels[0]
+	}
+
 	temp := a.Temperature
 	if temp <= 0 {
-		temp = 0.7
+		temp = 0.72
 	}
 	payee := strings.TrimSpace(p.PayeeName)
 	if payee == "" {
@@ -288,7 +562,7 @@ func GetUserConfigRAM(_ string) *UserConfigRAM {
 		Temperature:             temp,
 		AutoReply:               a.AutoReply,
 		ImportCatalog:           true,
-		CatalogText:             GetCatalogContext(""),
+		CatalogText:             "", // Built lazily & compactly per-turn by GetSmartCompactInventory
 		StorePolicies:           v.StorePolicies,
 		HasOnlinePayment:        p.Enabled || (p.PaytmMID != "" && p.MerchantVPA != ""),
 		PaytmMid:                strings.TrimSpace(p.PaytmMID),
@@ -310,7 +584,7 @@ func GetUserConfigRAM(_ string) *UserConfigRAM {
 	}
 }
 
-// collectCandidateAPIKeys builds a rotated, deduplicated fallback pool across vendor primary + backup keys + env fallbacks.
+// collectCandidateAPIKeys builds a deduplicated pool across vendor primary + backup keys + env fallbacks.
 func collectCandidateAPIKeys(username string, cfg *UserConfigRAM) []string {
 	seen := make(map[string]bool)
 	var keys []string
@@ -319,8 +593,7 @@ func collectCandidateAPIKeys(username string, cfg *UserConfigRAM) []string {
 		if raw == "" {
 			return
 		}
-		re := regexp.MustCompile(`[\n,\s]+`)
-		for _, t := range re.Split(raw, -1) {
+		for _, t := range keySplitRegex.Split(raw, -1) {
 			t = strings.TrimSpace(t)
 			if t != "" && !seen[t] {
 				seen[t] = true
@@ -341,6 +614,12 @@ func collectCandidateAPIKeys(username string, cfg *UserConfigRAM) []string {
 		return keys
 	}
 
+	// Preserve deterministic order for GroqPool (which runs its own K × 3 round-robin TPD matrix);
+	// for non-Groq providers, rotate start index per request.
+	if cfg != nil && strings.EqualFold(strings.TrimSpace(cfg.Provider), "groq") {
+		return keys
+	}
+
 	keyRotationLock.Lock()
 	start := keyRotationIndex[username] % len(keys)
 	keyRotationIndex[username] = (start + 1) % len(keys)
@@ -352,24 +631,55 @@ func collectCandidateAPIKeys(username string, cfg *UserConfigRAM) []string {
 	return rotated
 }
 
-// callAIWithKeyFallback automatically switches to the next backup API key on 429 rate limits, 401, or network errors.
-func callAIWithKeyFallback(username string, cfg *UserConfigRAM, sysPrompt string, history []ChatMessage) (string, error) {
+// callAIWithKeyFallback routes Groq keys through the strict 3-model × multi-key TPD/TPM pool,
+// while keeping Gemini/OpenAI/DeepSeek/OpenRouter on their own standard provider failover.
+func callAIWithKeyFallback(username string, cfg *UserConfigRAM, sysPrompt string, history []ChatMessage, jsonMode bool) (string, error) {
 	keys := collectCandidateAPIKeys(username, cfg)
 	if len(keys) == 0 {
 		return "", fmt.Errorf("no AI API key configured in vendor AI settings or environment")
 	}
+
+	var groqKeys []string
+	var otherKeys []string
+	for _, k := range keys {
+		if isGroqProvider(cfg.Provider, k) {
+			groqKeys = append(groqKeys, k)
+		} else {
+			otherKeys = append(otherKeys, k)
+		}
+	}
+
 	var lastErr error
-	for idx, key := range keys {
-		res, err := CallAIModelWithHistory(cfg.Provider, cfg.Model, cfg.Temperature, key, sysPrompt, history)
+
+	// 1. Groq Pool: strictly 3 models (qwen/qwen3.8-27b, openai/gpt-oss-20b, openai/gpt-oss-120b)
+	// across ALL active Groq keys for full combined TPD utilization + instant TPM model-switch!
+	if len(groqKeys) > 0 {
+		res, err := callGroqPoolWithHistory(groqKeys, cfg.Temperature, sysPrompt, history, jsonMode)
 		if err == nil && strings.TrimSpace(res) != "" {
 			return res, nil
 		}
 		lastErr = err
-		if idx < len(keys)-1 {
+		if len(otherKeys) > 0 {
+			log.Printf("🔄 [AI Fallback] All Groq key×model slots unavailable (%v) — falling back to non-Groq backup key...", err)
+		}
+	}
+
+	// 2. Non-Groq Providers (Gemini / OpenAI / DeepSeek / OpenRouter — unaffected by Groq-only rule)
+	for idx, key := range otherKeys {
+		res, err := callNonGroqModelWithHistory(cfg.Provider, cfg.Model, cfg.Temperature, key, sysPrompt, history, jsonMode)
+		if err == nil && strings.TrimSpace(res) != "" {
+			return res, nil
+		}
+		lastErr = err
+		if idx < len(otherKeys)-1 {
 			log.Printf("🔄 [AI Multi-Key Fallback] Key #%d failed (%v) — switching automatically to backup key #%d...", idx+1, err, idx+2)
 		}
 	}
-	return "", lastErr
+
+	if lastErr != nil {
+		return "", lastErr
+	}
+	return "", fmt.Errorf("all AI keys failed to return a reply")
 }
 
 func resolveAPIKey(username, cfgKey string) string {
@@ -382,11 +692,22 @@ func resolveAPIKey(username, cfgKey string) string {
 
 func compactText(s string, maxRunes int) string {
 	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	s = whitespaceCollapse.ReplaceAllString(s, "\n")
 	r := []rune(s)
 	if len(r) > maxRunes {
-		return string(r[:maxRunes]) + "..."
+		return string(r[:maxRunes]) + "…"
 	}
 	return s
+}
+
+func formatRupeeCompact(v float64) string {
+	if v == float64(int64(v)) {
+		return strconv.FormatInt(int64(v), 10)
+	}
+	return strings.TrimRight(strings.TrimRight(fmt.Sprintf("%.2f", v), "0"), ".")
 }
 
 // updateSlidingWindowRAM keeps max 10 messages per customer in RAM, re-hydrating from ramstore.Global if evicted.
@@ -402,10 +723,12 @@ func updateSlidingWindowRAM(_, customerPhone, role, text string) []ChatMessage {
 		var seeded []ChatMessage
 		for _, rec := range ramstore.Global.GetChatMessages(cleanPhone) {
 			r := "user"
+			limit := 260
 			if rec.Role == "assistant" || rec.Direction == "outgoing_ai" || rec.Direction == "outgoing_manual" {
 				r = "assistant"
+				limit = 220
 			}
-			c := compactText(rec.Text, 400)
+			c := compactText(rec.Text, limit)
 			if c != "" {
 				seeded = append(seeded, ChatMessage{Role: r, Content: c})
 			}
@@ -419,12 +742,14 @@ func updateSlidingWindowRAM(_, customerPhone, role, text string) []ChatMessage {
 
 	if text != "" {
 		normalRole := role
+		limit := 400
 		if normalRole == "customer" || normalRole == "incoming" {
 			normalRole = "user"
-		} else if normalRole == "outgoing" || normalRole == "outgoing_ai" {
+		} else if normalRole == "outgoing" || normalRole == "outgoing_ai" || normalRole == "assistant" {
 			normalRole = "assistant"
+			limit = 240
 		}
-		cleanText := compactText(text, 400)
+		cleanText := compactText(text, limit)
 		dup := len(session.Messages) > 0 && session.Messages[len(session.Messages)-1].Role == normalRole && session.Messages[len(session.Messages)-1].Content == cleanText
 		if !dup && cleanText != "" {
 			session.Messages = append(session.Messages, ChatMessage{Role: normalRole, Content: cleanText})
@@ -459,163 +784,282 @@ func getSlidingWindowRAM(username, customerPhone string) []ChatMessage {
 	return copied
 }
 
-// GetCatalogContext formats all in-stock RAM products grouped by category.
+// buildCompactLLMHistory slices the sliding window to strictly MaxLLMHistoryMessages total
+// messages and compacts older bot replies so prompt history stays ultra-light on tokens.
+func buildCompactLLMHistory(full []ChatMessage, maxTotal int) []ChatMessage {
+	if maxTotal <= 0 {
+		maxTotal = MaxLLMHistoryMessages
+	}
+	start := 0
+	if len(full) > maxTotal {
+		start = len(full) - maxTotal
+	}
+	sliced := full[start:]
+	out := make([]ChatMessage, 0, len(sliced))
+	for idx, m := range sliced {
+		role := m.Role
+		if role == "customer" || role == "incoming" {
+			role = "user"
+		} else if role == "outgoing" || role == "outgoing_ai" {
+			role = "assistant"
+		}
+		isLatest := idx == len(sliced)-1
+		maxLen := 200
+		if role == "assistant" {
+			// Older bot replies contain formatted lists/emojis — compact aggressively!
+			maxLen = 160
+		} else if isLatest {
+			// Keep the customer's current turn full (up to 500 runes) so zero detail is lost
+			maxLen = 500
+		}
+		txt := compactText(strings.ReplaceAll(m.Content, "\n\n", "\n"), maxLen)
+		if txt != "" {
+			out = append(out, ChatMessage{Role: role, Content: txt})
+		}
+	}
+	return out
+}
+
+// GetCatalogContext formats all in-stock RAM products grouped by category (compact).
 func GetCatalogContext(_ string) string {
 	products := ramstore.Global.ListProducts(true)
 	if len(products) == 0 {
 		return ""
 	}
-	catMap := make(map[string][]ramstore.Product)
-	var catOrder []string
-	for _, p := range products {
-		cat := strings.TrimSpace(p.Category)
-		if cat == "" {
-			cat = "General"
-		}
-		if _, ok := catMap[cat]; !ok {
-			catOrder = append(catOrder, cat)
-		}
-		catMap[cat] = append(catMap[cat], p)
-	}
-
 	var sb strings.Builder
-	sb.WriteString("Product Catalog (In Stock Items):\n")
-	for _, cat := range catOrder {
-		sb.WriteString(fmt.Sprintf("\nCategory: %s\n", cat))
-		for _, p := range catMap[cat] {
-			line := fmt.Sprintf("- product_id: %s | %s: Rs. %.2f", p.ID, p.Name, p.EffectivePrice())
-			if unit := strings.TrimSpace(p.UnitType); unit != "" && unit != "custom" {
-				line += "/" + unit
-			}
-			if desc := strings.TrimSpace(p.Description); desc != "" {
-				line += " - " + desc
-			}
-			sb.WriteString(line + "\n")
-		}
+	sb.WriteString("INV (ID|Name|Cat|Price|Vars):\n")
+	for _, p := range products {
+		sb.WriteString(formatCompactProductLine(p) + "\n")
 	}
 	return strings.TrimSpace(sb.String())
 }
 
 // Clean10DigitPhone extracts strictly a 10-digit Indian phone number.
 func Clean10DigitPhone(raw string) string {
-	digits := regexp.MustCompile(`\D`).ReplaceAllString(raw, "")
+	digits := nonDigitRegex.ReplaceAllString(raw, "")
 	if len(digits) >= 10 {
 		return digits[len(digits)-10:]
 	}
 	return digits
 }
 
-// GetLiveInventoryRAG reads in-stock products directly from RAM for instant AI prompt injection.
-func GetLiveInventoryRAG(_ string) string {
-	products := ramstore.Global.ListProducts(true)
-	if len(products) == 0 {
-		return "Currently, all items are being updated in the inventory."
+// formatCompactProductLine serializes one product in ~12-18 tokens instead of ~45-55 tokens.
+func formatCompactProductLine(p ramstore.Product) string {
+	cat := strings.TrimSpace(p.Category)
+	if cat == "" {
+		cat = "General"
 	}
+	unitPart := ""
+	if u := strings.TrimSpace(p.UnitType); u != "" && u != "custom" && u != "piece" {
+		unitPart = "/" + u
+	}
+	var sb strings.Builder
+	sb.WriteString(p.ID)
+	sb.WriteString("|")
+	sb.WriteString(strings.TrimSpace(p.Name))
+	sb.WriteString("|")
+	sb.WriteString(cat)
+	sb.WriteString("|₹")
+	sb.WriteString(formatRupeeCompact(p.EffectivePrice()))
+	sb.WriteString(unitPart)
 
-	catMap := make(map[string][]ramstore.Product)
-	var catOrder []string
-	for _, p := range products {
-		cat := strings.TrimSpace(p.Category)
-		if cat == "" {
-			cat = "General"
+	if len(p.Variants) > 0 {
+		var vParts []string
+		for _, vr := range p.Variants {
+			if !vr.IsVariantAvailable(1) {
+				continue
+			}
+			vParts = append(vParts, vr.DisplayLabel()+"="+formatRupeeCompact(vr.EffectivePrice(p.EffectivePrice())))
 		}
-		if _, ok := catMap[cat]; !ok {
-			catOrder = append(catOrder, cat)
-		}
-		catMap[cat] = append(catMap[cat], p)
-	}
-
-	var b strings.Builder
-	b.WriteString("STORE CATEGORIES & PRODUCTS AVAILABLE (LIVE IN-STOCK RAM INVENTORY — NEVER SUGGEST OUT-OF-STOCK ITEMS):\n")
-	for _, c := range catOrder {
-		b.WriteString(fmt.Sprintf("\n📂 Category: %s\n", c))
-		for _, p := range catMap[c] {
-			unitPart := ""
-			if strings.TrimSpace(p.UnitType) != "" {
-				unitPart = "/" + strings.TrimSpace(p.UnitType)
-			}
-			stockPart := ""
-			if p.StockQty != nil {
-				stockPart = fmt.Sprintf(", Stock: %d", *p.StockQty)
-			}
-			line := fmt.Sprintf("  • %s - ₹%.2f%s (ID: %s%s)", p.Name, p.EffectivePrice(), unitPart, p.ID, stockPart)
-			if len(p.Variants) > 0 {
-				var vParts []string
-				for _, vr := range p.Variants {
-					if !vr.IsVariantAvailable(1) {
-						continue
-					}
-					vParts = append(vParts, fmt.Sprintf("%s: ₹%.2f", vr.DisplayLabel(), vr.EffectivePrice(p.EffectivePrice())))
-				}
-				if len(vParts) > 0 {
-					line += " | Variants: [" + strings.Join(vParts, ", ") + "]"
-				}
-			}
-			b.WriteString(line + "\n")
+		if len(vParts) > 0 {
+			sb.WriteString("|v:")
+			sb.WriteString(strings.Join(vParts, ","))
 		}
 	}
-	return b.String()
+	if strings.TrimSpace(p.ThumbURL) != "" || strings.TrimSpace(p.ImageURL) != "" || len(p.Images) > 0 {
+		sb.WriteString("|img")
+	}
+	return sb.String()
 }
 
-// GetRAGCatalogResults searches in-stock RAM products matching customer keywords.
-func GetRAGCatalogResults(_, userMsg string) string {
+var ragStopWords = map[string]bool{
+	"the": true, "and": true, "for": true, "with": true, "hai": true, "kya": true,
+	"karo": true, "chahiye": true, "dena": true, "please": true, "mera": true,
+	"meri": true, "mere": true, "bhai": true, "aap": true, "tum": true, "order": true,
+	"mujhe": true, "dijiye": true, "bhejo": true, "hoga": true, "photos": true,
+	"photo": true, "pic": true, "image": true, "dikhao": true, "price": true,
+	"rate": true, "kitna": true, "kitne": true, "menu": true, "list": true,
+	"available": true, "item": true, "items": true, "product": true, "products": true,
+	"haan": true, "han": true, "yes": true, "nahi": true, "hello": true, "namaste": true,
+	"confirm": true, "address": true, "delivery": true, "online": true, "payment": true,
+}
+
+// GetSmartCompactInventory injects ONLY relevant in-stock products + 1-line category summary +
+// active cart products, eliminating the 500-product full-catalog dump while keeping 100% accuracy.
+func GetSmartCompactInventory(userMsg string, history []ChatMessage, cartProductIDs map[string]bool) string {
 	products := ramstore.Global.ListProducts(true)
 	if len(products) == 0 {
-		return "No products available in catalog."
+		return "INV: No in-stock items loaded yet."
 	}
 
-	stopWords := map[string]bool{
-		"the": true, "and": true, "for": true, "with": true, "hai": true, "kya": true,
-		"karo": true, "chahiye": true, "dena": true, "please": true, "mera": true,
-		"meri": true, "mere": true, "bhai": true, "aap": true, "tum": true, "order": true,
-		"mujhe": true, "dijiye": true, "bhejo": true, "hoga": true, "photos": true,
+	// Build 1-line category overview (~20 tokens even for 500 products!)
+	catCounts := make(map[string]int)
+	var catOrder []string
+	catBuckets := make(map[string][]ramstore.Product)
+	for _, p := range products {
+		c := strings.TrimSpace(p.Category)
+		if c == "" {
+			c = "General"
+		}
+		if _, exists := catCounts[c]; !exists {
+			catOrder = append(catOrder, c)
+		}
+		catCounts[c]++
+		catBuckets[c] = append(catBuckets[c], p)
 	}
 
-	var keywords []string
-	for _, t := range strings.Fields(strings.ToLower(userMsg)) {
-		t = strings.Trim(t, ".,!?-_\"'#")
-		if len(t) >= 3 && !stopWords[t] {
-			keywords = append(keywords, t)
-		}
-	}
-
-	var matched []ramstore.Product
-	if len(keywords) > 0 {
-		for _, p := range products {
-			haystack := strings.ToLower(p.Name + " " + p.Category + " " + p.Description)
-			for _, kw := range keywords {
-				if strings.Contains(haystack, kw) {
-					matched = append(matched, p)
-					break
-				}
-			}
-			if len(matched) >= 10 {
-				break
-			}
-		}
-	}
-	if len(matched) == 0 {
-		limit := len(products)
-		if limit > 12 {
-			limit = 12
-		}
-		matched = products[:limit]
+	var catSummary []string
+	for _, c := range catOrder {
+		catSummary = append(catSummary, fmt.Sprintf("%s(%d)", c, catCounts[c]))
 	}
 
 	var sb strings.Builder
-	for _, p := range matched {
-		hasImg := "No photo"
-		if strings.TrimSpace(p.ThumbURL) != "" || strings.TrimSpace(p.ImageURL) != "" {
-			hasImg = "Photo available"
+	sb.WriteString("CATS: " + strings.Join(catSummary, ", ") + "\n")
+
+	// Small catalog (<= 18 items): send all in ultra-compact format (~250 tokens total)
+	if len(products) <= 18 {
+		sb.WriteString("INV(id|name|cat|price|vars):\n")
+		for _, p := range products {
+			sb.WriteString(formatCompactProductLine(p) + "\n")
 		}
-		sb.WriteString(fmt.Sprintf("- Product [id: \"%s\"]: %s (Category: %s, Price: Rs. %.2f, %s)\n",
-			p.ID, p.Name, p.Category, p.EffectivePrice(), hasImg))
+		return strings.TrimSpace(sb.String())
+	}
+
+	// Large catalog (> 18 items, up to 500+): Smart Top-N RAG using current + last 2 user turns
+	var queryParts []string
+	queryParts = append(queryParts, userMsg)
+	addedPrev := 0
+	for i := len(history) - 2; i >= 0 && addedPrev < 2; i-- {
+		if history[i].Role == "user" {
+			queryParts = append(queryParts, history[i].Content)
+			addedPrev++
+		}
+	}
+	combinedQuery := strings.ToLower(strings.Join(queryParts, " "))
+
+	var keywords []string
+	seenKW := make(map[string]bool)
+	for _, tok := range strings.Fields(combinedQuery) {
+		tok = strings.Trim(tok, ".,!?-_\"'#()[]{}:;")
+		if len(tok) >= 3 && !ragStopWords[tok] && !seenKW[tok] {
+			seenKW[tok] = true
+			keywords = append(keywords, tok)
+		}
+	}
+
+	selectedIDs := make(map[string]bool)
+	var selected []ramstore.Product
+
+	// Always include products already in the customer's active cart
+	if len(cartProductIDs) > 0 {
+		for _, p := range products {
+			if cartProductIDs[p.ID] && !selectedIDs[p.ID] {
+				selectedIDs[p.ID] = true
+				selected = append(selected, p)
+			}
+		}
+	}
+
+	type scoredProd struct {
+		prod  ramstore.Product
+		score int
+	}
+	var scored []scoredProd
+	if len(keywords) > 0 {
+		for _, p := range products {
+			if selectedIDs[p.ID] {
+				continue
+			}
+			nameLow := strings.ToLower(p.Name)
+			catLow := strings.ToLower(p.Category)
+			descLow := strings.ToLower(p.Description)
+			s := 0
+			if strings.Contains(combinedQuery, nameLow) && len(nameLow) >= 3 {
+				s += 10
+			}
+			for _, kw := range keywords {
+				if strings.Contains(nameLow, kw) {
+					s += 4
+				} else if strings.Contains(catLow, kw) {
+					s += 3
+				} else if strings.Contains(descLow, kw) {
+					s += 1
+				}
+			}
+			if s > 0 {
+				scored = append(scored, scoredProd{prod: p, score: s})
+			}
+		}
+		sort.SliceStable(scored, func(i, j int) bool {
+			return scored[i].score > scored[j].score
+		})
+	}
+
+	const maxRAGItems = 12
+	for _, sp := range scored {
+		if len(selected) >= maxRAGItems {
+			break
+		}
+		selectedIDs[sp.prod.ID] = true
+		selected = append(selected, sp.prod)
+	}
+
+	// If few or zero keyword matches (e.g. greeting / "menu dikhao"), pick diverse items across categories
+	if len(selected) < 8 {
+		maxShow := 10
+		round := 0
+		for len(selected) < maxShow {
+			addedAny := false
+			for _, c := range catOrder {
+				bucket := catBuckets[c]
+				if round < len(bucket) {
+					p := bucket[round]
+					if !selectedIDs[p.ID] {
+						selectedIDs[p.ID] = true
+						selected = append(selected, p)
+						addedAny = true
+						if len(selected) >= maxShow {
+							break
+						}
+					}
+				}
+			}
+			if !addedAny {
+				break
+			}
+			round++
+		}
+	}
+
+	sb.WriteString(fmt.Sprintf("INV(showing %d/%d relevant in-stock; id|name|cat|price|vars):\n", len(selected), len(products)))
+	for _, p := range selected {
+		sb.WriteString(formatCompactProductLine(p) + "\n")
 	}
 	return strings.TrimSpace(sb.String())
 }
 
-// BuildOctopusContext builds real-time RAM state context string for the AI Brain.
-func BuildOctopusContext(username, customerPhone, userMsg string) string {
+// GetLiveInventoryRAG kept for backwards compatibility, returning the compact inventory format.
+func GetLiveInventoryRAG(_ string) string {
+	return GetSmartCompactInventory("", nil, nil)
+}
+
+// GetRAGCatalogResults kept for backwards compatibility, returning compact keyword-matched items.
+func GetRAGCatalogResults(_, userMsg string) string {
+	return GetSmartCompactInventory(userMsg, nil, nil)
+}
+
+// BuildOctopusContext builds a compact real-time RAM state block (zero wasted boilerplate tokens).
+func BuildOctopusContext(username, customerPhone, _ string) string {
 	cleanPhone := FormatPhone(customerPhone)
 	payStatus := GetCustomerPaymentStatus(username, cleanPhone)
 	custState := GetCustomerState(username, cleanPhone)
@@ -628,60 +1072,60 @@ func BuildOctopusContext(username, customerPhone, userMsg string) string {
 		currentState = "CART_ACTIVE"
 	}
 
-	var cartItemsDesc []string
+	var cartParts []string
 	var cartTotal float64
 	if calcRes != nil {
 		cartTotal = calcRes.TotalAmount
 		for _, it := range calcRes.Items {
-			varStr := ""
+			vPart := ""
 			if it.SelectedVariant != "" {
-				varStr = ", Variant: " + it.SelectedVariant
+				vPart = "[" + it.SelectedVariant + "]"
 			}
-			cartItemsDesc = append(cartItemsDesc, fmt.Sprintf("    * %s (ID: %s%s, Qty: %d, Price: Rs. %.2f, Subtotal: Rs. %.2f)",
-				it.ProductName, it.ProductID, varStr, it.Qty, it.UnitPrice, it.LineTotal))
+			cartParts = append(cartParts, fmt.Sprintf("%s %s%s x%d=₹%s",
+				it.ProductID, it.ProductName, vPart, it.Qty, formatRupeeCompact(it.LineTotal)))
 		}
 	}
-	cartStr := "Empty (Total: Rs. 0.00)"
-	if len(cartItemsDesc) > 0 {
-		cartStr = fmt.Sprintf("Total Amount: Rs. %.2f\n  Items:\n%s", cartTotal, strings.Join(cartItemsDesc, "\n"))
+
+	cartLine := "CART:empty"
+	if len(cartParts) > 0 {
+		cartLine = fmt.Sprintf("CART(₹%s): %s", formatRupeeCompact(cartTotal), strings.Join(cartParts, "; "))
 	}
 
 	custProfile, _ := GetCustomerProfile(username, cleanPhone)
-	cName, cAddr, cPhone := "Not provided", "Not provided", "Not provided"
+	var profParts []string
 	if custProfile != nil {
-		if custProfile.FullName != "" {
-			cName = custProfile.FullName
+		if strings.TrimSpace(custProfile.FullName) != "" {
+			profParts = append(profParts, "Name="+strings.TrimSpace(custProfile.FullName))
 		}
-		if custProfile.DeliveryAddress != "" {
-			cAddr = custProfile.DeliveryAddress
+		if strings.TrimSpace(custProfile.DeliveryAddress) != "" {
+			profParts = append(profParts, "Addr="+compactText(custProfile.DeliveryAddress, 120))
 		}
-		if custProfile.ContactPhone != "" {
-			cPhone = custProfile.ContactPhone
+		if strings.TrimSpace(custProfile.ContactPhone) != "" {
+			profParts = append(profParts, "Ph="+strings.TrimSpace(custProfile.ContactPhone))
 		}
 	}
+	profParts = append(profParts, "WA="+cleanPhone)
 
-	ragStr := GetRAGCatalogResults(username, userMsg)
-	savedOrdID := GetCustomerCurrentOrderID(username, cleanPhone)
+	var sb strings.Builder
+	sb.WriteString("STATE:" + currentState + " | " + cartLine)
+	if ordID := strings.TrimSpace(GetCustomerCurrentOrderID(username, cleanPhone)); ordID != "" {
+		sb.WriteString(" | ORD:" + ordID)
+	}
+	sb.WriteString("\nCUST:" + strings.Join(profParts, " | "))
+	return sb.String()
+}
 
-	return fmt.Sprintf(`REAL-TIME RAM STORE STATE (SYNCED WITH CENTRAL MALL BRAIN):
-- current_state: %s
-- shopping_cart: %s
-- customer_profile:
-    * Name: %s
-    * WhatsApp Number: %s
-    * Delivery Address: %s
-    * Delivery Contact Number: %s
-- saved_order_id: %s
-- rag_results (Matching products/catalog):
-%s`, currentState, cartStr, cName, cleanPhone, cAddr, cPhone, savedOrdID, ragStr)
+func stripThinkBlocks(raw string) string {
+	return strings.TrimSpace(thinkTagRegex.ReplaceAllString(raw, ""))
 }
 
 func ExtractJSONSubstring(raw string) string {
-	return strings.TrimSpace(jsonExtractorRegex.FindString(strings.TrimSpace(raw)))
+	cleaned := stripThinkBlocks(raw)
+	return strings.TrimSpace(jsonExtractorRegex.FindString(cleaned))
 }
 
 func SanitizeAIReplyText(s string) string {
-	res := strings.TrimSpace(s)
+	res := stripThinkBlocks(s)
 	if res == "" {
 		return ""
 	}
@@ -720,7 +1164,11 @@ func SanitizeAIReplyText(s string) string {
 		}
 		if strings.HasPrefix(trimL, "> ") {
 			after := strings.TrimSpace(trimL[2:])
-			if strings.HasPrefix(after, "💳") || strings.HasPrefix(after, "🚨") || strings.HasPrefix(after, "🧾") {
+			// Keep WhatsApp text blockquote ONLY on highlight callouts (totals, payment, urgent alerts)
+			if strings.HasPrefix(after, "💳") || strings.HasPrefix(after, "🚨") ||
+				strings.HasPrefix(after, "🧾") || strings.HasPrefix(after, "📦") ||
+				strings.HasPrefix(after, "🛒") || strings.HasPrefix(after, "💰") ||
+				strings.HasPrefix(after, "🎉") || strings.HasPrefix(after, "✨") {
 				cleanedLines = append(cleanedLines, trimL)
 			} else {
 				cleanedLines = append(cleanedLines, after)
@@ -730,7 +1178,8 @@ func SanitizeAIReplyText(s string) string {
 		}
 	}
 	res = strings.Join(cleanedLines, "\n")
-	res = strings.Trim(res, " ,\"'}{][\n\r*`")
+	// Preserve valid WhatsApp *bold* markers at start/end (do NOT trim '*')
+	res = strings.Trim(res, " ,\"'}{][\n\r`")
 	if res == "" || strings.HasPrefix(res, "{") || strings.HasPrefix(res, "[") {
 		return ""
 	}
@@ -738,7 +1187,7 @@ func SanitizeAIReplyText(s string) string {
 }
 
 func tryExtractPseudoAIReply(raw string) string {
-	lines := strings.Split(raw, "\n")
+	lines := strings.Split(stripThinkBlocks(raw), "\n")
 	var replyLines []string
 	collecting := false
 	for _, line := range lines {
@@ -749,7 +1198,7 @@ func tryExtractPseudoAIReply(raw string) string {
 		}
 		if strings.Contains(lower, "ai_reply_text") || strings.Contains(lower, "reply_to_customer") {
 			if idx := strings.Index(trimmedLine, ":"); idx != -1 {
-				val := strings.Trim(strings.TrimSpace(trimmedLine[idx+1:]), "\"* ")
+				val := strings.Trim(strings.TrimSpace(trimmedLine[idx+1:]), "\" ")
 				if val != "" {
 					replyLines = append(replyLines, val)
 				}
@@ -768,7 +1217,7 @@ func tryExtractPseudoAIReply(raw string) string {
 }
 
 func parsePseudoMarkdownOutput(raw string) *OctopusAIResponse {
-	trimmed := strings.TrimSpace(raw)
+	trimmed := stripThinkBlocks(raw)
 	if trimmed == "" {
 		return nil
 	}
@@ -834,7 +1283,7 @@ func parsePseudoMarkdownOutput(raw string) *OctopusAIResponse {
 
 // ParseOctopusAIResponse parses the Octopus Agentic JSON response schema.
 func ParseOctopusAIResponse(rawResponse string) (*OctopusAIResponse, error) {
-	trimmed := strings.TrimSpace(rawResponse)
+	trimmed := stripThinkBlocks(rawResponse)
 	if trimmed == "" {
 		return &OctopusAIResponse{AIReplyText: SafeAIFallbackReply, Actions: []AIActionItem{}, ExecuteHand: "chat_only"}, fmt.Errorf("empty raw response")
 	}
@@ -959,11 +1408,6 @@ func GenerateAIFeedbackApology(username, _, failedAction, errorDetail string, cf
 	if cfg == nil {
 		cfg = GetUserConfigRAM(username)
 	}
-	selectedApiKey := resolveAPIKey(username, cfg.APIKey)
-	if selectedApiKey == "" {
-		return "", fmt.Errorf("no API key available")
-	}
-
 	lang := cfg.Language
 	if lang == "" {
 		lang = "Hinglish"
@@ -973,12 +1417,9 @@ func GenerateAIFeedbackApology(username, _, failedAction, errorDetail string, cf
 		bizName = "Our Store"
 	}
 
-	hiddenPrompt := fmt.Sprintf(`You are the polite store assistant for "%s".
-SYSTEM INTERNAL ERROR: The action [%s] failed because [%s].
-Apologize to the user contextually and offer an alternative in polite %s.
-Do not mention system errors, code, databases, or technical terms. Return ONLY your apologetic message.`, bizName, failedAction, errorDetail, lang)
+	hiddenPrompt := fmt.Sprintf(`Warm shop assistant for "%s". Action [%s] failed (%s). Apologize warmly in %s with helpful next step, *bold* key words & friendly emojis. Never mention tech errors. Output ONLY the message text.`, bizName, failedAction, compactText(errorDetail, 120), lang)
 
-	apology, err := CallAIModelWithHistory(cfg.Provider, cfg.Model, 0.7, selectedApiKey, hiddenPrompt, []ChatMessage{{Role: "user", Content: "Please assist with my request."}})
+	apology, err := callAIWithKeyFallback(username, cfg, hiddenPrompt, []ChatMessage{{Role: "user", Content: "Please help."}}, false)
 	if err != nil {
 		return "", err
 	}
@@ -990,11 +1431,6 @@ func GenerateAIContextualReply(username, customerPhone, situationContext string,
 	if cfg == nil {
 		cfg = GetUserConfigRAM(username)
 	}
-	selectedApiKey := resolveAPIKey(username, cfg.APIKey)
-	if selectedApiKey == "" {
-		return "", fmt.Errorf("no API key available")
-	}
-
 	bName := cfg.BusinessName
 	if bName == "" {
 		bName = "Our Store"
@@ -1004,24 +1440,22 @@ func GenerateAIContextualReply(username, customerPhone, situationContext string,
 		lang = "Hinglish"
 	}
 
-	systemInstruction := fmt.Sprintf(`You are the polite store assistant for "%s" (%s).
-Output language MUST BE strictly: %s.
-SITUATION UPDATE: %s
-Write a clean, warm WhatsApp message using *bold* for key details and bullet points (• ). Output ONLY the raw message text.`, bName, cfg.BusinessType, lang, situationContext)
+	systemInstruction := fmt.Sprintf(`Warm shop assistant for "%s" (%s). Language: %s. Update: %s. Write a short, engaging WhatsApp message using *bold* & friendly emojis. Output ONLY the message text.`, bName, cfg.BusinessType, lang, compactText(situationContext, 240))
 
-	history := getSlidingWindowRAM(username, customerPhone)
+	history := buildCompactLLMHistory(getSlidingWindowRAM(username, customerPhone), 4)
 	if len(history) == 0 {
-		history = []ChatMessage{{Role: "user", Content: "Please provide an update."}}
+		history = []ChatMessage{{Role: "user", Content: "Please update me."}}
 	}
 
-	reply, err := CallAIModelWithHistory(cfg.Provider, cfg.Model, 0.7, selectedApiKey, systemInstruction, history)
+	reply, err := callAIWithKeyFallback(username, cfg, systemInstruction, history, false)
 	if err != nil {
 		return "", err
 	}
 	return SanitizeAIReplyText(reply), nil
 }
 
-// GenerateOctopusAIReply runs the Master Octopus Agentic Brain strictly from RAM state with multi-key failover.
+// GenerateOctopusAIReply runs the Master Octopus Agentic Brain strictly from RAM state
+// with token-optimized single-pass smart RAG & Groq 3-model × multi-key TPD failover.
 func GenerateOctopusAIReply(username, customerPhone, incomingText string, cfg *UserConfigRAM) (*OctopusAIResponse, error) {
 	cleanPhone := FormatPhone(customerPhone)
 	if cfg == nil {
@@ -1032,53 +1466,77 @@ func GenerateOctopusAIReply(username, customerPhone, incomingText string, cfg *U
 		return nil, fmt.Errorf("no AI API key configured in vendor AI settings or environment")
 	}
 
-	history := getSlidingWindowRAM(username, cleanPhone)
-	if len(history) == 0 || history[len(history)-1].Content != incomingText {
-		history = updateSlidingWindowRAM(username, cleanPhone, "user", incomingText)
+	fullHistory := getSlidingWindowRAM(username, cleanPhone)
+	if len(fullHistory) == 0 || fullHistory[len(fullHistory)-1].Content != compactText(incomingText, 400) {
+		fullHistory = updateSlidingWindowRAM(username, cleanPhone, "user", incomingText)
 	}
 
-	bName := cfg.BusinessName
+	// Strictly limit LLM sliding window to MaxLLMHistoryMessages (6 total messages)
+	llmHistory := buildCompactLLMHistory(fullHistory, MaxLLMHistoryMessages)
+
+	bName := strings.TrimSpace(cfg.BusinessName)
 	if bName == "" {
 		bName = "Vendor Store"
 	}
-	bType := cfg.BusinessType
+	bType := strings.TrimSpace(cfg.BusinessType)
 	if bType == "" {
-		bType = "Retail / Mall Store"
+		bType = "Retail Store"
 	}
-	lang := cfg.Language
+	lang := strings.TrimSpace(cfg.Language)
 	if lang == "" {
 		lang = "Hinglish"
 	}
+	policies := compactText(cfg.StorePolicies, 180)
+	if policies == "" {
+		policies = "Standard delivery & returns."
+	}
 
-	liveInventory := GetLiveInventoryRAG(username)
-	inventoryBlock := fmt.Sprintf("Here is the LIVE IN-STOCK inventory you MUST use to answer the customer:\n%s\nNever suggest or add out-of-stock items. When a product has variants (e.g. 500g, 1kg), pass the chosen variant in cart_items[].variant.", liveInventory)
+	// Collect active cart product IDs so smart inventory ALWAYS keeps cart items in context
+	cartProductIDs := make(map[string]bool)
+	if calcRes, _ := CalculateCartTotalAndFetchCredentials(username, cleanPhone); calcRes != nil {
+		for _, it := range calcRes.Items {
+			if it.ProductID != "" {
+				cartProductIDs[it.ProductID] = true
+			}
+		}
+	}
 
-	var deliveryRuleBlock string
+	// Compact store delivery & payment rule line (~35 tokens instead of ~150 tokens)
+	locMode := "Text addr OK"
 	if cfg.RequireCustomerLocation {
-		deliveryRuleBlock = fmt.Sprintf("HYPERLOCAL DELIVERY LOCATION RULE (STRICT): Customer must attach their WhatsApp location pin before checkout. Max Radius = %.1f km, Free up to %.1f km, Delivery Charge = ₹%.2f, Estimated Delivery = %s.", cfg.MaxDeliveryRadiusKM, cfg.FreeDeliveryRadiusKM, cfg.DeliveryChargeAmount, cfg.EstimatedDeliveryTime)
-	} else {
-		deliveryRuleBlock = fmt.Sprintf("HYPERLOCAL DELIVERY RULE: Typed text address accepted. Max Radius = %.1f km, Free up to %.1f km, Delivery Charge = ₹%.2f, Estimated Delivery = %s.", cfg.MaxDeliveryRadiusKM, cfg.FreeDeliveryRadiusKM, cfg.DeliveryChargeAmount, cfg.EstimatedDeliveryTime)
+		locMode = "WhatsApp location pin required"
+	}
+	payMode := "COD+ONLINE"
+	if !cfg.AllowCOD {
+		payMode = "ONLINE ONLY (no COD)"
+	}
+	var ruleParts []string
+	ruleParts = append(ruleParts, locMode)
+	if cfg.MaxDeliveryRadiusKM > 0 {
+		ruleParts = append(ruleParts, fmt.Sprintf("Max%.0fkm/Free%.0fkm/Fee₹%s", cfg.MaxDeliveryRadiusKM, cfg.FreeDeliveryRadiusKM, formatRupeeCompact(cfg.DeliveryChargeAmount)))
 	}
 	if cfg.MinOrderAmount > 0 {
-		deliveryRuleBlock += fmt.Sprintf(" MINIMUM ORDER AMOUNT: ₹%.2f (politely ask customer to add more items if cart is below minimum).", cfg.MinOrderAmount)
+		ruleParts = append(ruleParts, "MinOrd₹"+formatRupeeCompact(cfg.MinOrderAmount))
 	}
-	if cfg.OperatingHours != "" {
-		deliveryRuleBlock += fmt.Sprintf(" OPERATING HOURS: %s.", cfg.OperatingHours)
+	if strings.TrimSpace(cfg.EstimatedDeliveryTime) != "" {
+		ruleParts = append(ruleParts, "ETA:"+strings.TrimSpace(cfg.EstimatedDeliveryTime))
 	}
+	if strings.TrimSpace(cfg.OperatingHours) != "" {
+		ruleParts = append(ruleParts, "Hrs:"+strings.TrimSpace(cfg.OperatingHours))
+	}
+	ruleParts = append(ruleParts, "Pay:"+payMode)
 
-	paymentPolicyBlock := "PAYMENT METHOD POLICY: Cash on Delivery (COD) and Online Payment are available. Online payment link/QR, payment verification, and final order confirmation are 100% handled by Central Brain Node. Trigger submit_order with payment_mode 'COD' or 'ONLINE'."
-	if !cfg.AllowCOD {
-		paymentPolicyBlock = "PAYMENT METHOD POLICY: Cash on Delivery is NOT available; customer must choose Online Payment. Trigger submit_order with payment_mode 'ONLINE' so Central Brain Node provides the payment link/QR and verifies payment."
+	// Static prefix first (prompt-cache friendly!), dynamic per-customer state + smart RAG at the end!
+	var promptBuilder strings.Builder
+	promptBuilder.WriteString(fmt.Sprintf(octopusSystemPromptJSON, bName, bType, policies, lang))
+	if extra := compactText(cfg.SystemPrompt, 280); extra != "" {
+		promptBuilder.WriteString("\nVENDOR NOTE: " + extra)
 	}
+	promptBuilder.WriteString("\nSTORE: " + strings.Join(ruleParts, " | "))
+	promptBuilder.WriteString("\n\n" + BuildOctopusContext(username, cleanPhone, incomingText))
+	promptBuilder.WriteString("\n\n" + GetSmartCompactInventory(incomingText, llmHistory, cartProductIDs))
 
-	contextStr := BuildOctopusContext(username, cleanPhone, incomingText)
-	masterPrompt := fmt.Sprintf(octopusSystemPromptJSON, bName, bType, cfg.StorePolicies, lang, lang)
-	if strings.TrimSpace(cfg.SystemPrompt) != "" {
-		masterPrompt += "\n\nADDITIONAL VENDOR INSTRUCTIONS:\n" + strings.TrimSpace(cfg.SystemPrompt)
-	}
-	masterPrompt += "\n\n" + deliveryRuleBlock + "\n" + paymentPolicyBlock + "\n\n" + inventoryBlock + "\n\n" + contextStr
-
-	aiResponse, err := callAIWithKeyFallback(username, cfg, masterPrompt, history)
+	aiResponse, err := callAIWithKeyFallback(username, cfg, promptBuilder.String(), llmHistory, true)
 	if err != nil || aiResponse == "" {
 		log.Printf("⚠️ GenerateOctopusAIReply error for +%s: %v", cleanPhone, err)
 		return &OctopusAIResponse{AIReplyText: SafeAIFallbackReply, Actions: []AIActionItem{}, ExecuteHand: "chat_only"}, err
@@ -1122,26 +1580,203 @@ func AsyncCentralSync(username, customerPhone, incomingText, aiReplyText string)
 	}()
 }
 
-// CallAIModelWithHistory calls Groq, Gemini, OpenAI, DeepSeek, or OpenRouter with structured chat history.
+// CallAIModelWithHistory calls Groq (strictly 3-model TPD/TPM rotation), Gemini, OpenAI, DeepSeek, or OpenRouter.
 func CallAIModelWithHistory(provider, model string, temperature float64, rawApiKey, sysPrompt string, history []ChatMessage) (string, error) {
 	apiKey := strings.TrimSpace(rawApiKey)
 	if apiKey == "" {
 		return "", fmt.Errorf("empty API key")
 	}
 
+	if isGroqProvider(provider, apiKey) {
+		return callGroqPoolWithHistory([]string{apiKey}, temperature, sysPrompt, history, true)
+	}
+	return callNonGroqModelWithHistory(provider, model, temperature, apiKey, sysPrompt, history, true)
+}
+
+func isNumericOrPhone(s string) bool {
+	if s == "" {
+		return false
+	}
+	clean := nonDigitRegex.ReplaceAllString(s, "")
+	return len(clean) >= 8 && (len(clean) == len(s) || strings.HasPrefix(clean, "117") || strings.HasPrefix(clean, "223") || strings.HasPrefix(clean, "91"))
+}
+
+func buildOpenAIMessages(sysPrompt string, history []ChatMessage) []ChatMessage {
+	messages := make([]ChatMessage, 0, len(history)+1)
+	messages = append(messages, ChatMessage{Role: "system", Content: sysPrompt})
+	for _, m := range history {
+		role := m.Role
+		if role == "customer" || role == "incoming" {
+			role = "user"
+		} else if role == "outgoing" || role == "outgoing_ai" {
+			role = "assistant"
+		}
+		if strings.TrimSpace(m.Content) != "" {
+			messages = append(messages, ChatMessage{Role: role, Content: m.Content})
+		}
+	}
+	return messages
+}
+
+// callGroqPoolWithHistory strictly uses ONLY the 3 active Groq models across ALL active Groq keys,
+// immediately switching models/keys on TPM 429 and tracking TPD exhaustion so every key × model's
+// daily TPD is utilized to the fullest!
+func callGroqPoolWithHistory(groqKeys []string, temperature float64, sysPrompt string, history []ChatMessage, jsonMode bool) (string, error) {
+	if len(groqKeys) == 0 {
+		return "", fmt.Errorf("no Groq API keys available")
+	}
+	messages := buildOpenAIMessages(sysPrompt, history)
+	ready, tpmDelayed := groqPool.buildCandidates(groqKeys)
+
+	var lastErr error
+	trySlot := func(slot groqCandidateSlot) (string, bool, error) {
+		text, tokens, status, headers, body, err := callGroqSingleModel(slot.apiKey, slot.model, temperature, messages, jsonMode)
+		if err == nil && strings.TrimSpace(text) != "" {
+			remTok := -1
+			if rawRem := strings.TrimSpace(headers.Get("x-ratelimit-remaining-tokens")); rawRem != "" {
+				if parsedRem, pErr := strconv.Atoi(rawRem); pErr == nil {
+					remTok = parsedRem
+				}
+			}
+			resetTok := parseResetDuration(headers.Get("x-ratelimit-reset-tokens"))
+			groqPool.recordSuccess(slot.keyHash, slot.model, tokens, remTok, resetTok)
+			return text, true, nil
+		}
+
+		// Classify HTTP error to update TPM vs TPD cooldown cleanly
+		switch status {
+		case http.StatusTooManyRequests:
+			isTPD, cd := classifyGroq429(headers, body)
+			if isTPD {
+				groqPool.markTPDExhausted(slot.keyHash, slot.model, cd)
+				log.Printf("🚫 [Groq TPD Exhausted] Key #%d | model=%s (cooldown %v) -> switching to next model/key", slot.keyIndex+1, slot.model, cd.Round(time.Minute))
+			} else {
+				groqPool.markTPMCooldown(slot.keyHash, slot.model, cd)
+				log.Printf("⚡ [Groq TPM Limit] Key #%d | model=%s (cooldown %v) -> switching model/key immediately", slot.keyIndex+1, slot.model, cd.Round(time.Second))
+			}
+		case http.StatusUnauthorized, http.StatusForbidden:
+			groqPool.markAuthDisabledForKey(slot.keyHash, 30*time.Minute)
+			log.Printf("🔑 [Groq Auth Error %d] Key #%d disabled 30m -> switching to next key", status, slot.keyIndex+1)
+		default:
+			// Transient 5xx / timeout / 404: brief 45s cooldown so we immediately switch model/key
+			groqPool.markTPMCooldown(slot.keyHash, slot.model, 45*time.Second)
+			log.Printf("⚠️ [Groq Error] Key #%d | model=%s (%v) -> switching model/key", slot.keyIndex+1, slot.model, err)
+		}
+		return "", false, err
+	}
+
+	for _, slot := range ready {
+		if text, ok, err := trySlot(slot); ok {
+			return text, nil
+		} else {
+			lastErr = err
+		}
+	}
+
+	// If every active slot was temporarily in short TPM cooldown (not TPD-exhausted),
+	// try the soonest-expiring slot (waiting briefly up to 3s if cooldown is almost over).
+	if len(tpmDelayed) > 0 {
+		best := tpmDelayed[0]
+		wait := time.Until(best.tpmUntil)
+		if wait > 0 && wait <= 3*time.Second {
+			time.Sleep(wait)
+		}
+		if text, ok, err := trySlot(best); ok {
+			return text, nil
+		} else {
+			lastErr = err
+		}
+	}
+
+	if lastErr != nil {
+		return "", lastErr
+	}
+	return "", fmt.Errorf("all Groq keys and models (qwen/qwen3.8-27b, openai/gpt-oss-20b, openai/gpt-oss-120b) are currently rate-limited or exhausted for today")
+}
+
+func callGroqSingleModel(apiKey, model string, temperature float64, messages []ChatMessage, jsonMode bool) (string, int64, int, http.Header, []byte, error) {
+	const endpoint = "https://api.groq.com/openai/v1/chat/completions"
+
+	maxTokens := 600
+	if !jsonMode {
+		maxTokens = 320
+	}
+
+	doRequest := func(minimal bool) (string, int64, int, http.Header, []byte, error) {
+		payload := map[string]interface{}{
+			"model":                 model,
+			"messages":              messages,
+			"temperature":           temperature,
+			"max_completion_tokens": maxTokens,
+		}
+		if !minimal {
+			if jsonMode {
+				payload["response_format"] = map[string]string{"type": "json_object"}
+			}
+			// Keep reasoning overhead minimal on gpt-oss models so TPD lasts 3x-5x longer!
+			if strings.HasPrefix(model, "openai/gpt-oss") {
+				payload["reasoning_effort"] = "low"
+			}
+		}
+
+		bodyBytes, _ := json.Marshal(payload)
+		req, err := http.NewRequest("POST", endpoint, bytes.NewBuffer(bodyBytes))
+		if err != nil {
+			return "", 0, 0, nil, nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		req.Header.Set("User-Agent", "VendorWhatsAppBotNode/2.3")
+
+		client := &http.Client{Timeout: 18 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			return "", 0, 0, nil, nil, err
+		}
+		respBytes, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode == http.StatusOK {
+			var result struct {
+				Choices []struct {
+					Message struct {
+						Content string `json:"content"`
+					} `json:"message"`
+				} `json:"choices"`
+				Usage struct {
+					TotalTokens int64 `json:"total_tokens"`
+				} `json:"usage"`
+			}
+			if err := json.Unmarshal(respBytes, &result); err == nil && len(result.Choices) > 0 {
+				content := stripThinkBlocks(result.Choices[0].Message.Content)
+				if content != "" {
+					return content, result.Usage.TotalTokens, resp.StatusCode, resp.Header, respBytes, nil
+				}
+			}
+			return "", result.Usage.TotalTokens, resp.StatusCode, resp.Header, respBytes, fmt.Errorf("empty content from groq model %s", model)
+		}
+		return "", 0, resp.StatusCode, resp.Header, respBytes, fmt.Errorf("groq model %s returned status %d", model, resp.StatusCode)
+	}
+
+	text, tokens, status, headers, body, err := doRequest(false)
+	// If a specific Groq model rejects json_object or reasoning_effort with HTTP 400, retry once with clean payload
+	if err != nil && status == http.StatusBadRequest {
+		return doRequest(true)
+	}
+	return text, tokens, status, headers, body, err
+}
+
+func callNonGroqModelWithHistory(provider, model string, temperature float64, apiKey, sysPrompt string, history []ChatMessage, jsonMode bool) (string, error) {
 	prov := strings.ToLower(strings.TrimSpace(provider))
 	if prov == "chatgpt" {
 		prov = "openai"
 	}
-	if strings.HasPrefix(apiKey, "gsk_") {
-		prov = "groq"
-	} else if strings.HasPrefix(apiKey, "sk-") {
+	if strings.HasPrefix(apiKey, "sk-or-") {
+		prov = "openrouter"
+	} else if strings.HasPrefix(apiKey, "sk-") && prov != "deepseek" {
 		prov = "openai"
 	} else if strings.HasPrefix(apiKey, "AIzaSy") {
 		prov = "gemini"
-	}
-	if prov == "" {
-		prov = "groq"
 	}
 
 	cleanModel := strings.TrimSpace(model)
@@ -1150,25 +1785,13 @@ func CallAIModelWithHistory(provider, model string, temperature float64, rawApiK
 	}
 
 	if prov == "gemini" {
-		res, err := callGeminiAPIWithHistory(apiKey, cleanModel, temperature, sysPrompt, history)
-		if err == nil && res != "" {
-			return res, nil
-		}
-		return "", err
+		return callGeminiAPIWithHistory(apiKey, cleanModel, temperature, sysPrompt, history, jsonMode)
 	}
-	return callOpenAIFormatWithHistory(prov, cleanModel, temperature, apiKey, sysPrompt, history)
+	return callOpenAIFormatWithHistory(prov, cleanModel, temperature, apiKey, sysPrompt, history, jsonMode)
 }
 
-func isNumericOrPhone(s string) bool {
-	if s == "" {
-		return false
-	}
-	clean := regexp.MustCompile(`\D`).ReplaceAllString(s, "")
-	return len(clean) >= 8 && (len(clean) == len(s) || strings.HasPrefix(clean, "117") || strings.HasPrefix(clean, "223") || strings.HasPrefix(clean, "91"))
-}
-
-func callOpenAIFormatWithHistory(provider, model string, temperature float64, apiKey, sysPrompt string, history []ChatMessage) (string, error) {
-	endpoint := "https://api.groq.com/openai/v1/chat/completions"
+func callOpenAIFormatWithHistory(provider, model string, temperature float64, apiKey, sysPrompt string, history []ChatMessage, jsonMode bool) (string, error) {
+	endpoint := "https://api.openai.com/v1/chat/completions"
 	var candidateModels []string
 
 	switch provider {
@@ -1182,26 +1805,15 @@ func callOpenAIFormatWithHistory(provider, model string, temperature float64, ap
 		endpoint = "https://openrouter.ai/api/v1/chat/completions"
 		candidateModels = []string{"meta-llama/llama-3.1-8b-instruct:free"}
 	default:
-		endpoint = "https://api.groq.com/openai/v1/chat/completions"
-		candidateModels = []string{"llama-3.3-70b-versatile", "llama-3.1-8b-instant"}
+		endpoint = "https://api.openai.com/v1/chat/completions"
+		candidateModels = []string{"gpt-4o-mini"}
 	}
 
 	if model != "" && !isNumericOrPhone(model) {
 		candidateModels = append([]string{model}, candidateModels...)
 	}
 
-	messages := []ChatMessage{{Role: "system", Content: sysPrompt}}
-	for _, m := range history {
-		role := m.Role
-		if role == "customer" {
-			role = "user"
-		} else if role == "outgoing" || role == "outgoing_ai" {
-			role = "assistant"
-		}
-		if strings.TrimSpace(m.Content) != "" {
-			messages = append(messages, ChatMessage{Role: role, Content: m.Content})
-		}
-	}
+	messages := buildOpenAIMessages(sysPrompt, history)
 
 	var lastErr error
 	for _, m := range candidateModels {
@@ -1209,8 +1821,9 @@ func callOpenAIFormatWithHistory(provider, model string, temperature float64, ap
 			"model":       m,
 			"messages":    messages,
 			"temperature": temperature,
+			"max_tokens":  600,
 		}
-		if provider == "groq" || provider == "openai" || provider == "deepseek" {
+		if jsonMode && (provider == "openai" || provider == "deepseek") {
 			payload["response_format"] = map[string]string{"type": "json_object"}
 		}
 		body, _ := json.Marshal(payload)
@@ -1222,9 +1835,9 @@ func callOpenAIFormatWithHistory(provider, model string, temperature float64, ap
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+apiKey)
-		req.Header.Set("User-Agent", "VendorWhatsAppBotNode/2.0")
+		req.Header.Set("User-Agent", "VendorWhatsAppBotNode/2.3")
 
-		client := &http.Client{Timeout: 8 * time.Second}
+		client := &http.Client{Timeout: 15 * time.Second}
 		resp, err := client.Do(req)
 		if err != nil {
 			lastErr = err
@@ -1242,7 +1855,7 @@ func callOpenAIFormatWithHistory(provider, model string, temperature float64, ap
 				} `json:"choices"`
 			}
 			if err := json.Unmarshal(respBytes, &result); err == nil && len(result.Choices) > 0 && result.Choices[0].Message.Content != "" {
-				return strings.TrimSpace(result.Choices[0].Message.Content), nil
+				return stripThinkBlocks(result.Choices[0].Message.Content), nil
 			}
 		}
 		lastErr = fmt.Errorf("model %s returned status %d", m, resp.StatusCode)
@@ -1254,7 +1867,7 @@ func callOpenAIFormatWithHistory(provider, model string, temperature float64, ap
 	return "", fmt.Errorf("empty AI reply received")
 }
 
-func callGeminiAPIWithHistory(apiKey, model string, temperature float64, sysPrompt string, history []ChatMessage) (string, error) {
+func callGeminiAPIWithHistory(apiKey, model string, temperature float64, sysPrompt string, history []ChatMessage, jsonMode bool) (string, error) {
 	candidateModels := []string{"gemini-2.0-flash", "gemini-1.5-flash"}
 	reqModel := strings.TrimSpace(model)
 	if reqModel != "" && !isNumericOrPhone(reqModel) && !strings.Contains(reqModel, "gemini-1.0") {
@@ -1281,19 +1894,23 @@ func callGeminiAPIWithHistory(apiKey, model string, temperature float64, sysProm
 	var lastErr error
 	for _, mdl := range candidateModels {
 		endpoint := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s", mdl, apiKey)
+		genCfg := map[string]interface{}{
+			"temperature":     temperature,
+			"maxOutputTokens": 600,
+		}
+		if jsonMode {
+			genCfg["response_mime_type"] = "application/json"
+		}
 		payload := map[string]interface{}{
 			"system_instruction": map[string]interface{}{
 				"parts": []map[string]string{{"text": sysPrompt}},
 			},
-			"contents": contents,
-			"generationConfig": map[string]interface{}{
-				"temperature":        temperature,
-				"response_mime_type": "application/json",
-			},
+			"contents":         contents,
+			"generationConfig": genCfg,
 		}
 		body, _ := json.Marshal(payload)
 
-		client := &http.Client{Timeout: 10 * time.Second}
+		client := &http.Client{Timeout: 15 * time.Second}
 		resp, err := client.Post(endpoint, "application/json", bytes.NewBuffer(body))
 		if err != nil {
 			lastErr = err

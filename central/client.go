@@ -44,7 +44,7 @@ type CentralOrderSubmission struct {
 	Timestamp       string              `json:"timestamp"`
 }
 
-// CentralOrderResponse models Central Brain Node's authoritative response with order reference and online payment link/QR/instructions.
+// CentralOrderResponse models Central Brain Node's authoritative response with order reference and Banner QR payment fields.
 type CentralOrderResponse struct {
 	Status              string  `json:"status"`
 	OrderID             string  `json:"order_id"`
@@ -55,7 +55,38 @@ type CentralOrderResponse struct {
 	PaymentLink         string  `json:"payment_link,omitempty"`
 	PaymentQRURL        string  `json:"payment_qr_url,omitempty"`
 	PaymentInstructions string  `json:"payment_instructions,omitempty"`
+	UPIID               string  `json:"upi_id,omitempty"`
+	MerchantVPA         string  `json:"merchant_vpa,omitempty"`
+	PayeeName           string  `json:"payee_name,omitempty"`
+	PaytmMID            string  `json:"paytm_mid,omitempty"`
+	QRGeneratorURL      string  `json:"qr_generator_url,omitempty"`
+	QRCloudName         string  `json:"qr_cloud_name,omitempty"`
 	Message             string  `json:"message,omitempty"`
+}
+
+// VerifyPaymentRequest is sent every 3 seconds to Central Brain's verify endpoint during an active ONLINE/UPI order.
+type VerifyPaymentRequest struct {
+	OrderID  string `json:"order_id"`
+	ORDERID  string `json:"ORDERID"`
+	Username string `json:"username"`
+	TenantID string `json:"tenant_id"`
+	PaytmMID string `json:"paytm_mid"`
+	Source   string `json:"source"`
+}
+
+// VerifyPaymentResponse models Central Brain's payment verification status response.
+type VerifyPaymentResponse struct {
+	IsPaid        bool    `json:"is_paid"`
+	Verified      bool    `json:"verified"`
+	Cancelled     bool    `json:"cancelled"`
+	PaymentStatus string  `json:"payment_status"`
+	OrderStatus   string  `json:"order_status"`
+	TxnID         string  `json:"txn_id"`
+	TransactionID string  `json:"transaction_id"`
+	TXNIDUpper    string  `json:"TXNID"`
+	TotalAmount   float64 `json:"total_amount"`
+	Amount        float64 `json:"amount"`
+	Message       string  `json:"message"`
 }
 
 // SyncClient manages event-driven bi-directional HTTP communication, bounded retry queue, platform URL auto-detection,
@@ -476,7 +507,10 @@ func (c *SyncClient) Bootstrap() (*BootstrapWhatsAppSession, error) {
 	var respBytes []byte
 	var err error
 	for attempt := 1; attempt <= 3; attempt++ {
-		respBytes, _, err = c.doRequest("POST", "/api/vendor-bot/bootstrap", reqBody)
+		respBytes, _, err = c.doRequest("POST", "/api/node/bootstrap", reqBody)
+		if err != nil {
+			respBytes, _, err = c.doRequest("POST", "/api/vendor-bot/bootstrap", reqBody)
+		}
 		if err != nil {
 			respBytes, _, err = c.doRequest("GET", "/api/vendor-bot/bootstrap", nil)
 		}
@@ -705,6 +739,119 @@ func (c *SyncClient) SubmitOrderToCentral(req CentralOrderSubmission) (*CentralO
 		st.LastSyncAt = time.Now()
 	})
 	return &result, nil
+}
+
+// VerifyPayment calls Central Brain's payment verification endpoint (default POST /api/payments/verify).
+func (c *SyncClient) VerifyPayment(endpoint string, req VerifyPaymentRequest) (*VerifyPaymentResponse, error) {
+	if !c.IsConfigured() {
+		return nil, fmt.Errorf("central brain node is not configured")
+	}
+	path := strings.TrimSpace(endpoint)
+	if path == "" {
+		path = ramstore.DefaultVerifyEndpoint
+	}
+	if !strings.HasPrefix(path, "/") && !strings.HasPrefix(path, "http") {
+		path = "/" + path
+	}
+	if req.ORDERID == "" {
+		req.ORDERID = req.OrderID
+	}
+	if req.Source == "" {
+		req.Source = "vendor_bot"
+	}
+
+	var respBytes []byte
+	var err error
+	if strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://") {
+		c.mu.RLock()
+		apiKey := c.apiKey
+		c.mu.RUnlock()
+		b, mErr := json.Marshal(req)
+		if mErr != nil {
+			return nil, mErr
+		}
+		httpReq, rErr := http.NewRequest("POST", path, bytes.NewReader(b))
+		if rErr != nil {
+			return nil, rErr
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
+		httpReq.Header.Set("X-Vendor-API-Key", apiKey)
+		httpReq.Header.Set("User-Agent", "VendorWhatsAppBotNode/2.3")
+		resp, dErr := c.httpClient.Do(httpReq)
+		if dErr != nil {
+			return nil, dErr
+		}
+		defer resp.Body.Close()
+		respBytes, err = io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return nil, fmt.Errorf("verify payment HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(respBytes)))
+		}
+	} else {
+		respBytes, _, err = c.doRequest("POST", path, req)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	var envelope struct {
+		VerifyPaymentResponse
+		Data *VerifyPaymentResponse `json:"data"`
+	}
+	if err := json.Unmarshal(respBytes, &envelope); err != nil {
+		return nil, fmt.Errorf("invalid verify payment JSON: %w", err)
+	}
+	res := envelope.VerifyPaymentResponse
+	if envelope.Data != nil {
+		d := *envelope.Data
+		if d.IsPaid {
+			res.IsPaid = true
+		}
+		if d.Verified {
+			res.Verified = true
+		}
+		if d.Cancelled {
+			res.Cancelled = true
+		}
+		if d.PaymentStatus != "" {
+			res.PaymentStatus = d.PaymentStatus
+		}
+		if d.OrderStatus != "" {
+			res.OrderStatus = d.OrderStatus
+		}
+		if d.TxnID != "" {
+			res.TxnID = d.TxnID
+		}
+		if d.TransactionID != "" {
+			res.TransactionID = d.TransactionID
+		}
+		if d.TXNIDUpper != "" {
+			res.TXNIDUpper = d.TXNIDUpper
+		}
+		if d.TotalAmount > 0 {
+			res.TotalAmount = d.TotalAmount
+		}
+		if d.Amount > 0 {
+			res.Amount = d.Amount
+		}
+		if d.Message != "" {
+			res.Message = d.Message
+		}
+	}
+	if res.TxnID == "" {
+		if res.TransactionID != "" {
+			res.TxnID = res.TransactionID
+		} else if res.TXNIDUpper != "" {
+			res.TxnID = res.TXNIDUpper
+		}
+	}
+	if res.TotalAmount <= 0 && res.Amount > 0 {
+		res.TotalAmount = res.Amount
+	}
+	return &res, nil
 }
 
 func (c *SyncClient) enqueue(method, path string, payload interface{}) {

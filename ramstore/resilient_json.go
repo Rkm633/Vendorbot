@@ -420,7 +420,7 @@ func DecodeAIConfig(raw json.RawMessage) (*AIConfig, error) {
 	return a, nil
 }
 
-// DecodePaymentConfig resiliently decodes a PaymentConfig JSON object.
+// DecodePaymentConfig resiliently decodes a PaymentConfig JSON object with WaMart Banner QR & verify defaults.
 func DecodePaymentConfig(raw json.RawMessage) (*PaymentConfig, error) {
 	if isNullOrEmpty(raw) {
 		return nil, nil
@@ -429,15 +429,26 @@ func DecodePaymentConfig(raw json.RawMessage) (*PaymentConfig, error) {
 	if err := json.Unmarshal(raw, &m); err != nil {
 		return nil, fmt.Errorf("payment section is not a JSON object: %w", err)
 	}
-	p := &PaymentConfig{}
+	def := DefaultPaymentConfig()
+	p := &def
 	if r, ok := firstRaw(m, "enabled", "online_payment_enabled", "is_enabled", "active"); ok {
 		p.Enabled = ParseFlexBool(r, false)
 	}
 	if r, ok := firstRaw(m, "merchant_phone", "phone"); ok {
 		p.MerchantPhone = ParseFlexString(r)
 	}
-	if r, ok := firstRaw(m, "merchant_vpa", "paytm_vpa", "upi_id", "vpa"); ok {
-		p.MerchantVPA = ParseFlexString(r)
+	if r, ok := firstRaw(m, "upi_id", "merchant_vpa", "paytm_vpa", "vpa"); ok {
+		vpa := ParseFlexString(r)
+		p.UPIID = vpa
+		p.MerchantVPA = vpa
+	}
+	if r, ok := firstRaw(m, "merchant_vpa"); ok {
+		if v := ParseFlexString(r); v != "" {
+			p.MerchantVPA = v
+			if p.UPIID == "" {
+				p.UPIID = v
+			}
+		}
 	}
 	if r, ok := firstRaw(m, "paytm_mid", "mid", "merchant_id"); ok {
 		p.PaytmMID = ParseFlexString(r)
@@ -445,15 +456,51 @@ func DecodePaymentConfig(raw json.RawMessage) (*PaymentConfig, error) {
 	if r, ok := firstRaw(m, "payee_name", "merchant_name", "upi_name"); ok {
 		p.PayeeName = ParseFlexString(r)
 	}
-	if r, ok := firstRaw(m, "cloudinary_cloud_name"); ok {
-		p.CloudinaryCloudName = ParseFlexString(r)
+	if r, ok := firstRaw(m, "qr_worker_base_url"); ok {
+		if v := ParseFlexString(r); v != "" {
+			p.QRWorkerBaseURL = v
+		}
+	}
+	if r, ok := firstRaw(m, "qr_generator_url"); ok {
+		if v := ParseFlexString(r); v != "" {
+			p.QRGeneratorURL = v
+		}
+	} else if rBase, ok := firstRaw(m, "qr_worker_base_url"); ok {
+		if base := ParseFlexString(rBase); base != "" {
+			p.QRGeneratorURL = strings.TrimRight(base, "/") + "/generate"
+		}
+	}
+	if r, ok := firstRaw(m, "qr_cloud_name", "cloudinary_cloud_name"); ok {
+		if v := ParseFlexString(r); v != "" {
+			p.QRCloudName = v
+			p.CloudinaryCloudName = v
+		}
+	}
+	if r, ok := firstRaw(m, "qr_only_mode"); ok {
+		p.QROnlyMode = ParseFlexBool(r, true)
+	}
+	if r, ok := firstRaw(m, "send_payment_link"); ok {
+		p.SendPaymentLink = ParseFlexBool(r, false)
+	}
+	if r, ok := firstRaw(m, "verify_endpoint"); ok {
+		if v := ParseFlexString(r); v != "" {
+			p.VerifyEndpoint = v
+		}
+	}
+	if r, ok := firstRaw(m, "verify_poll_interval_ms"); ok {
+		if v := ParseFlexInt(r, DefaultVerifyPollIntervalMS); v > 0 {
+			p.VerifyPollIntervalMS = v
+		}
+	}
+	if r, ok := firstRaw(m, "verify_poll_timeout_ms"); ok {
+		if v := ParseFlexInt(r, DefaultVerifyPollTimeoutMS); v > 0 {
+			p.VerifyPollTimeoutMS = v
+		}
 	}
 	if r, ok := firstRaw(m, "gateway", "provider", "payment_gateway"); ok {
 		p.Gateway = ParseFlexString(r)
 	}
-	if !p.Enabled && (p.PaytmMID != "" || p.MerchantVPA != "" || p.Gateway != "") {
-		p.Enabled = true
-	}
+	p.ApplyDefaults("")
 	return p, nil
 }
 
