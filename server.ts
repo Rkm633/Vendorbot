@@ -2337,11 +2337,10 @@ const GROQ_ALLOWED_MODELS = [
   'openai/gpt-oss-120b',
 ] as const;
 
-// Strictly ONLY these 4 Gemini/Gemma models are used for Gemini text generation.
 const GEMINI_ALLOWED_MODELS = [
-  'gemma-4-31b-it',
-  'gemma-4-26b-a4b-it',
   'gemini-3.1-flash-lite',
+  'gemma-4-26b-a4b-it',
+  'gemma-4-31b-it',
   'gemini-3.5-flash-lite',
 ] as const;
 
@@ -3387,7 +3386,7 @@ async function runGeminiDecisionSmartRoute(
         input: inputText,
         questions,
       }),
-      new Promise((_, reject) => setTimeout(() => reject(new Error('decision_timeout')), 6000)),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('decision_timeout')), 1800)),
     ]);
 
     const st = getDecisionKeyState(chosenHash, Date.now());
@@ -3455,6 +3454,8 @@ async function runGeminiDecisionSmartRoute(
       console.warn(`⚡ [Gemini Decision 1 Quota Guard] Cooling down key for smart router, falling back cleanly`);
     } else if (status === 401 || status === 403) {
       st.authDisabledUntil = Date.now() + 30 * 60_000;
+    } else if (status === 404 || msg.includes('404')) {
+      st.rpmCooldownUntil = Date.now() + 15 * 60_000;
     } else {
       st.rpmCooldownUntil = Date.now() + 60_000;
     }
@@ -3501,6 +3502,9 @@ async function callGeminiSingleSlot(
     };
     if (!isGemma && !minimal) {
       genConfig.response_mime_type = 'application/json';
+      if (slot.model.toLowerCase().includes('flash-lite')) {
+        genConfig.thinkingConfig = { thinkingBudget: 0 };
+      }
     }
 
     const payload: Record<string, any> = {
@@ -3517,7 +3521,7 @@ async function callGeminiSingleSlot(
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(20000),
+        signal: AbortSignal.timeout(8000),
       }
     );
   };
@@ -4138,16 +4142,37 @@ async function callGeminiLiveVoiceSlot(
     let outputTr = '';
     let textParts = '';
     let settled = false;
+    let activeSession: any = null;
+    let settleTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const finishWithTranscript = (resolve: (v: string) => void, timer: ReturnType<typeof setTimeout>) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (settleTimer) clearTimeout(settleTimer);
+      try {
+        activeSession?.close();
+      } catch {
+        // ignore
+      }
+      resolve((inputTr || textParts || outputTr).trim());
+    };
 
     const transcript = await new Promise<string>((resolve, reject) => {
       const timer = setTimeout(() => {
         if (!settled) {
           settled = true;
+          if (settleTimer) clearTimeout(settleTimer);
+          try {
+            activeSession?.close();
+          } catch {
+            // ignore
+          }
           const combined = (inputTr || textParts || outputTr).trim();
           if (combined) resolve(combined);
           else reject(new Error('gemini_live_timeout'));
         }
-      }, 15000);
+      }, 5500);
 
       void liveAi.live
         .connect({
@@ -4156,26 +4181,34 @@ async function callGeminiLiveVoiceSlot(
             responseModalities: [Modality.AUDIO],
             inputAudioTranscription: {},
             outputAudioTranscription: {},
-            systemInstruction: `Listen to the customer WhatsApp voice note for shop "${bizContext}" and help capture every spoken word accurately.`,
+            systemInstruction: `Customer WhatsApp voice note for shop "${bizContext}". Reply with one word 'OK' only.`,
           },
           callbacks: {
             onmessage: (msg: any) => {
               const sc = msg?.serverContent;
-              if (sc?.inputTranscription?.text) inputTr += sc.inputTranscription.text;
+              if (sc?.inputTranscription?.text) {
+                inputTr += sc.inputTranscription.text;
+                if (settleTimer) clearTimeout(settleTimer);
+                settleTimer = setTimeout(() => finishWithTranscript(resolve, timer), 320);
+              }
               if (sc?.outputTranscription?.text) outputTr += sc.outputTranscription.text;
               for (const pt of sc?.modelTurn?.parts ?? []) {
                 if (pt?.text) textParts += pt.text;
               }
+              // Once modelTurn arrives after inputTranscription, input STT is 100% done -> finish immediately!
+              if (sc?.modelTurn && inputTr.trim() && !settled) {
+                finishWithTranscript(resolve, timer);
+                return;
+              }
               if (sc?.turnComplete && !settled) {
-                settled = true;
-                clearTimeout(timer);
-                resolve((inputTr || textParts || outputTr).trim());
+                finishWithTranscript(resolve, timer);
               }
             },
             onerror: (err: any) => {
               if (!settled) {
                 settled = true;
                 clearTimeout(timer);
+                if (settleTimer) clearTimeout(settleTimer);
                 reject(err);
               }
             },
@@ -4183,6 +4216,7 @@ async function callGeminiLiveVoiceSlot(
               if (!settled) {
                 settled = true;
                 clearTimeout(timer);
+                if (settleTimer) clearTimeout(settleTimer);
                 const combined = (inputTr || textParts || outputTr).trim();
                 if (combined) resolve(combined);
                 else reject(new Error('gemini_live_closed_empty'));
@@ -4191,26 +4225,26 @@ async function callGeminiLiveVoiceSlot(
           },
         })
         .then((session) => {
-          const chunkSize = 16000;
+          activeSession = session;
+          const chunkSize = 32000;
           for (let off = 0; off < pcm16k.length; off += chunkSize) {
             const chunk = pcm16k.subarray(off, Math.min(off + chunkSize, pcm16k.length));
             session.sendRealtimeInput({
               audio: { data: chunk.toString('base64'), mimeType: 'audio/pcm;rate=16000' },
             });
           }
+          // 250ms trailing silence pad so server VAD flushes inputTranscription immediately
+          const silencePad = Buffer.alloc(8000);
+          session.sendRealtimeInput({
+            audio: { data: silencePad.toString('base64'), mimeType: 'audio/pcm;rate=16000' },
+          });
           session.sendRealtimeInput({ audioStreamEnd: true });
-          setTimeout(() => {
-            try {
-              session.close();
-            } catch {
-              // ignore
-            }
-          }, 14500);
         })
         .catch((err) => {
           if (!settled) {
             settled = true;
             clearTimeout(timer);
+            if (settleTimer) clearTimeout(settleTimer);
             reject(err);
           }
         });
@@ -4343,7 +4377,7 @@ async function executeVoiceNoteHand(
     }
   }
 
-  if (geminiKeys.length > 0 && !pcm16k) {
+  if (geminiKeys.length > 0) {
     const cleanMime = mimeType.toLowerCase().split(';')[0].trim() || 'audio/ogg';
     for (let i = 0; i < geminiKeys.length; i++) {
       try {

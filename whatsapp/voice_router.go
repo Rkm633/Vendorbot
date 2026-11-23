@@ -276,8 +276,7 @@ func callGroqWhisperSlot(apiKey, model, bizContext string, audioBytes []byte, mi
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 
-	httpClient := &http.Client{Timeout: 16 * time.Second}
-	resp, err := httpClient.Do(req)
+	resp, err := voiceHTTPClient.Do(req)
 	if err != nil {
 		return "", 0, nil, nil, err
 	}
@@ -296,11 +295,15 @@ func callGroqWhisperSlot(apiKey, model, bizContext string, audioBytes []byte, mi
 	return "", resp.StatusCode, resp.Header, respBytes, fmt.Errorf("groq whisper %s HTTP %d", model, resp.StatusCode)
 }
 
+var voiceHTTPClient = &http.Client{Timeout: 8 * time.Second}
+
 // callGeminiLiveVoiceModel connects to Gemini Live API (BidiGenerateContent WebSocket)
 // using gemini-3.1-flash-live-preview or gemini-2.5-flash-native-audio-preview-12-2025
 // with AUDIO responseModality + inputAudioTranscription enabled to extract an exact transcript.
+// Optimized for sub-1.5s latency: appends 250ms silence pad for instant VAD endpointing and
+// closes immediately (~350ms idle) once inputTranscription arrives instead of waiting for model audio generation.
 func callGeminiLiveVoiceModel(apiKey, model, bizContext string, audioBytes, pcm16k []byte, cleanMime string) (string, int, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 5500*time.Millisecond)
 	defer cancel()
 
 	wsURL := fmt.Sprintf(
@@ -332,7 +335,7 @@ func callGeminiLiveVoiceModel(apiKey, model, bizContext string, audioBytes, pcm1
 			"outputAudioTranscription": map[string]interface{}{},
 			"systemInstruction": map[string]interface{}{
 				"parts": []map[string]string{{
-					"text": fmt.Sprintf("You are listening to a customer WhatsApp voice note for shop \"%s\". Acknowledge briefly so your input transcription captures every spoken Hindi/Hinglish/English word accurately.", bizContext),
+					"text": fmt.Sprintf("Customer WhatsApp voice note for shop \"%s\". Reply with one word 'OK' only.", bizContext),
 				}},
 			},
 		},
@@ -354,7 +357,7 @@ func callGeminiLiveVoiceModel(apiKey, model, bizContext string, audioBytes, pcm1
 	}
 
 	if len(pcm16k) > 0 {
-		const chunkSize = 16000 // ~0.5s of 16kHz 16-bit mono PCM
+		const chunkSize = 32000 // 1s chunks of 16kHz 16-bit mono PCM for faster upload
 		for off := 0; off < len(pcm16k); off += chunkSize {
 			end := off + chunkSize
 			if end > len(pcm16k) {
@@ -373,6 +376,16 @@ func callGeminiLiveVoiceModel(apiKey, model, bizContext string, audioBytes, pcm1
 				return "", 0, err
 			}
 		}
+		// Send 250ms of trailing zero-PCM silence (8000 bytes) + audioStreamEnd so server VAD flushes inputTranscription immediately
+		silenceB64 := base64.StdEncoding.EncodeToString(make([]byte, 8000))
+		_ = wsjson.Write(ctx, conn, map[string]interface{}{
+			"realtimeInput": map[string]interface{}{
+				"audio": map[string]interface{}{
+					"mimeType": "audio/pcm;rate=16000",
+					"data":     silenceB64,
+				},
+			},
+		})
 		if err := wsjson.Write(ctx, conn, map[string]interface{}{
 			"realtimeInput": map[string]interface{}{
 				"audioStreamEnd": true,
@@ -410,11 +423,17 @@ func callGeminiLiveVoiceModel(apiKey, model, bizContext string, audioBytes, pcm1
 	var inputTranscript strings.Builder
 	var outputTranscript strings.Builder
 	var textParts strings.Builder
+	var settleTimer *time.Timer
+	defer func() {
+		if settleTimer != nil {
+			settleTimer.Stop()
+		}
+	}()
 
 	for {
 		var msg map[string]interface{}
 		if err := wsjson.Read(ctx, conn, &msg); err != nil {
-			// If we already captured transcription before socket closed, return it
+			// If we already captured transcription before socket closed or settle timer fired, return it immediately!
 			if strings.TrimSpace(inputTranscript.String()) != "" {
 				break
 			}
@@ -425,8 +444,15 @@ func callGeminiLiveVoiceModel(apiKey, model, bizContext string, audioBytes, pcm1
 			continue
 		}
 		if inTr, ok := sc["inputTranscription"].(map[string]interface{}); ok && inTr != nil {
-			if txt, ok := inTr["text"].(string); ok {
+			if txt, ok := inTr["text"].(string); ok && txt != "" {
 				inputTranscript.WriteString(txt)
+				// Reset 320ms debounce timer: as soon as inputTranscription stops arriving or model starts generating audio, we close & return!
+				if settleTimer != nil {
+					settleTimer.Stop()
+				}
+				settleTimer = time.AfterFunc(320*time.Millisecond, func() {
+					cancel()
+				})
 			}
 		}
 		if outTr, ok := sc["outputTranscription"].(map[string]interface{}); ok && outTr != nil {
@@ -434,6 +460,7 @@ func callGeminiLiveVoiceModel(apiKey, model, bizContext string, audioBytes, pcm1
 				outputTranscript.WriteString(txt)
 			}
 		}
+		// As soon as modelTurn starts (model begins speaking), inputTranscription is 100% finished -> exit immediately without waiting for audio!
 		if mt, ok := sc["modelTurn"].(map[string]interface{}); ok && mt != nil {
 			if parts, ok := mt["parts"].([]interface{}); ok {
 				for _, pRaw := range parts {
@@ -443,6 +470,9 @@ func callGeminiLiveVoiceModel(apiKey, model, bizContext string, audioBytes, pcm1
 						}
 					}
 				}
+			}
+			if strings.TrimSpace(inputTranscript.String()) != "" {
+				break
 			}
 		}
 		if tc, _ := sc["turnComplete"].(bool); tc {
@@ -497,7 +527,7 @@ func callGeminiAudioRESTSafetyFallback(apiKey, bizContext string, audioBytes []b
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "aistudio-build")
-	resp, err := (&http.Client{Timeout: 16 * time.Second}).Do(req)
+	resp, err := voiceHTTPClient.Do(req)
 	if err != nil {
 		return "", 0
 	}
@@ -761,8 +791,8 @@ func ExecuteVoiceNoteHand(username string, cfg *UserConfigRAM, audioBytes []byte
 		}
 	}
 
-	// Safety fallback if ALL Gemini Live slots could not process compressed OGG (e.g. Render bare container without ffmpeg)
-	if len(geminiKeys) > 0 && len(pcm16k) == 0 {
+	// Safety fallback if ALL Gemini Live slots timed out or could not process compressed OGG
+	if len(geminiKeys) > 0 {
 		if cleanMime == "" {
 			cleanMime = "audio/ogg"
 		}
@@ -773,7 +803,7 @@ func ExecuteVoiceNoteHand(username string, cfg *UserConfigRAM, audioBytes []byte
 				res.Provider = "gemini"
 				res.Model = "gemini-3.1-flash-lite"
 				res.KeyIndex = kIdx
-				log.Printf("🎙️ [Octopus Voice Hand | REST OGG Fallback] Transcribed via gemini-3.1-flash-lite (key #%d): %q",
+				log.Printf("🎙️ [Octopus Voice Hand | REST Audio Fallback] Transcribed via gemini-3.1-flash-lite (key #%d): %q",
 					kIdx+1, compactStrForLog(tr, 90))
 				return res
 			}

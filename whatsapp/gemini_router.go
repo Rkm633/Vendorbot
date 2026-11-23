@@ -32,9 +32,9 @@ import (
 // =============================================================================
 
 var geminiAllowedModels = []string{
-	"gemma-4-31b-it",
-	"gemma-4-26b-a4b-it",
 	"gemini-3.1-flash-lite",
+	"gemma-4-26b-a4b-it",
+	"gemma-4-31b-it",
 	"gemini-3.5-flash-lite",
 }
 
@@ -72,7 +72,8 @@ var (
 	decisionPoolMu    sync.Mutex
 	decisionKeyStates = make(map[string]*geminiSlotState)
 	decisionKeyCursor uint64
-	decisionHTTP      = &http.Client{Timeout: 6 * time.Second}
+	decisionHTTP      = &http.Client{Timeout: 1800 * time.Millisecond}
+	geminiHTTP        = &http.Client{Timeout: 8 * time.Second}
 )
 
 // isGeminiProvider detects whether a provider/key pair targets Google Gemini API.
@@ -330,6 +331,12 @@ func callGeminiSingleModel(apiKey, model string, temperature float64, sysPrompt 
 		if jsonMode && !minimal && !isGemma {
 			genCfg["response_mime_type"] = "application/json"
 		}
+		if !minimal && !isGemma && strings.Contains(strings.ToLower(model), "flash-lite") {
+			// Zero thinking overhead for instant sub-second WhatsApp reply latency
+			genCfg["thinkingConfig"] = map[string]interface{}{
+				"thinkingBudget": 0,
+			}
+		}
 		payload := map[string]interface{}{
 			"contents":         contents,
 			"generationConfig": genCfg,
@@ -346,10 +353,9 @@ func callGeminiSingleModel(apiKey, model string, temperature float64, sysPrompt 
 			return "", 0, 0, nil, nil, err
 		}
 		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("User-Agent", "VendorWhatsAppBotNode/2.6")
+		req.Header.Set("User-Agent", "aistudio-build")
 
-		client := &http.Client{Timeout: 18 * time.Second}
-		resp, err := client.Do(req)
+		resp, err := geminiHTTP.Do(req)
 		if err != nil {
 			return "", 0, 0, nil, nil, err
 		}
@@ -411,6 +417,10 @@ func tryExecuteGeminiSlot(slot geminiCandidateSlot, temperature float64, sysProm
 	case http.StatusUnauthorized, http.StatusForbidden:
 		geminiPool.markAuthDisabledForKey(slot.keyHash, 30*time.Minute)
 		log.Printf("🔑 [Gemini Auth Error %d] Key #%d disabled 30m -> switching to next key", status, slot.keyIndex+1)
+	case http.StatusNotFound:
+		// Cooldown unsupported/unreleased model slug for 15 minutes so subsequent messages skip it in 0ms
+		geminiPool.markRPMCooldown(slot.keyHash, slot.model, 15*time.Minute)
+		log.Printf("⚠️ [Gemini Model 404] Key #%d | model=%s not available (cooled down 15m) -> switching immediately", slot.keyIndex+1, slot.model)
 	default:
 		geminiPool.markRPMCooldown(slot.keyHash, slot.model, 45*time.Second)
 		log.Printf("⚠️ [Gemini Error] Key #%d | model=%s (%v) -> switching model/key", slot.keyIndex+1, slot.model, err)
@@ -795,6 +805,13 @@ func RunGeminiDecisionSmartRoute(geminiKeys []string, incomingText string, cartA
 			decisionPoolMu.Lock()
 			getDecisionKeyStateLocked(kHash, time.Now()).authDisabledUntil = time.Now().Add(30 * time.Minute)
 			decisionPoolMu.Unlock()
+			continue
+		}
+		if resp.StatusCode == http.StatusNotFound {
+			decisionPoolMu.Lock()
+			getDecisionKeyStateLocked(kHash, time.Now()).rpmCooldownUntil = time.Now().Add(15 * time.Minute)
+			decisionPoolMu.Unlock()
+			log.Printf("⚠️ [Gemini Decision 1] HTTP 404 — cooling down smart router 15m so text replies stay instant")
 			continue
 		}
 		if resp.StatusCode != http.StatusOK {
