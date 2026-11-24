@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"mime/multipart"
 	"net/http"
 	"os"
 	"regexp"
@@ -87,11 +88,34 @@ type AIResponseStateJSON struct {
 // GROQ-ONLY 3-MODEL POOL & FULL TPD/TPM SCHEDULER ACROSS ALL KEYS × MODELS
 // -----------------------------------------------------------------------------
 
-// Strictly active Groq models ONLY (condition applies exclusively to Groq API).
+// Strictly active Groq text models ONLY (condition applies exclusively to Groq API).
 var groqAllowedModels = []string{
 	"qwen/qwen3.8-27b",
 	"openai/gpt-oss-20b",
 	"openai/gpt-oss-120b",
+}
+
+// Strictly ordered Gemini API priority ladder (applied whenever a Gemini API key is used):
+// 1st: gemini-3.5-flash-lite | 2nd: gemini-3.1-flash-lite | 3rd: Gemma 4 26B | 4th: Gemma 4 31B
+var geminiPriorityModels = []string{
+	"gemini-3.5-flash-lite",
+	"gemini-3.1-flash-lite",
+	"gemma-4-26b-a4b-it",
+	"gemma-4-31b-it",
+}
+
+// Strictly active Groq Whisper audio models ONLY for voice note transcription.
+var groqAudioModels = []string{
+	"whisper-large-v3-turbo",
+	"whisper-large-v3",
+}
+
+// GetModelPoolConfig returns read-only copies of the active model routing pools.
+func GetModelPoolConfig() (geminiPriority []string, groqText []string, groqAudio []string) {
+	geminiPriority = append([]string(nil), geminiPriorityModels...)
+	groqText = append([]string(nil), groqAllowedModels...)
+	groqAudio = append([]string(nil), groqAudioModels...)
+	return
 }
 
 // MaxLLMHistoryMessages caps the sliding window sent to the LLM to total 6 recent
@@ -142,17 +166,39 @@ func isGroqModelAllowed(m string) bool {
 	return false
 }
 
+func isGeminiModelAllowed(m string) bool {
+	m = strings.ToLower(strings.TrimSpace(m))
+	for _, allowed := range geminiPriorityModels {
+		if m == allowed {
+			return true
+		}
+	}
+	return false
+}
+
 // isGroqProvider strictly detects whether a provider/key pair targets Groq API.
 func isGroqProvider(provider, apiKey string) bool {
 	k := strings.TrimSpace(apiKey)
 	if strings.HasPrefix(k, "gsk_") {
 		return true
 	}
-	if strings.HasPrefix(k, "AIza") || strings.HasPrefix(k, "sk-or-") || strings.HasPrefix(k, "sk-") {
+	if strings.HasPrefix(k, "AIzaSy") || strings.HasPrefix(k, "sk-or-") || strings.HasPrefix(k, "sk-") {
 		return false
 	}
 	p := strings.ToLower(strings.TrimSpace(provider))
 	return p == "" || p == "groq"
+}
+
+// isGeminiProvider strictly detects whether a provider/key pair targets Google Gemini API.
+func isGeminiProvider(provider, apiKey string) bool {
+	k := strings.TrimSpace(apiKey)
+	if strings.HasPrefix(k, "AIzaSy") {
+		return true
+	}
+	if strings.HasPrefix(k, "gsk_") || strings.HasPrefix(k, "sk-or-") || strings.HasPrefix(k, "sk-") {
+		return false
+	}
+	return strings.ToLower(strings.TrimSpace(provider)) == "gemini"
 }
 
 func (pm *groqPoolManager) getSlotLocked(kHash, model string, now time.Time) *groqSlotState {
@@ -320,20 +366,39 @@ func classifyGroq429(headers http.Header, body []byte) (isTPD bool, cooldown tim
 	resetTok := parseResetDuration(headers.Get("x-ratelimit-reset-tokens"))
 	resetReq := parseResetDuration(headers.Get("x-ratelimit-reset-requests"))
 
-	// Check explicit daily quota markers in Groq error payload
+	// Check explicit daily quota markers in Groq error payload (text TPD/RPD + audio ASPD)
 	if strings.Contains(lower, "tokens per day") ||
 		strings.Contains(lower, "requests per day") ||
+		strings.Contains(lower, "seconds per day") ||
+		strings.Contains(lower, "audio seconds per day") ||
 		strings.Contains(lower, "(tpd)") ||
 		strings.Contains(lower, " tpd") ||
 		strings.Contains(lower, "(rpd)") ||
 		strings.Contains(lower, " rpd") ||
+		strings.Contains(lower, "(aspd)") ||
+		strings.Contains(lower, " aspd") ||
 		strings.Contains(lower, "daily") ||
-		retryAfter >= 5*time.Minute {
+		retryAfter >= 2*time.Hour {
 		cd := retryAfter
 		if cd < 30*time.Minute {
 			cd = 2 * time.Hour
 		}
 		return true, cd
+	}
+
+	// Hourly audio-seconds limit (ASPH on Groq Whisper): cool down for Retry-After (or 20m) so slot recovers next hour
+	if strings.Contains(lower, "seconds per hour") ||
+		strings.Contains(lower, "audio seconds per hour") ||
+		strings.Contains(lower, "(asph)") ||
+		strings.Contains(lower, " asph") ||
+		retryAfter >= 5*time.Minute {
+		cd := retryAfter
+		if cd <= 0 {
+			cd = 20 * time.Minute
+		} else {
+			cd += 2 * time.Second
+		}
+		return false, cd
 	}
 
 	// Short-term TPM / RPM cooldown
@@ -351,6 +416,484 @@ func classifyGroq429(headers http.Header, body []byte) (isTPD bool, cooldown tim
 		cd += 2 * time.Second
 	}
 	return false, cd
+}
+
+// -----------------------------------------------------------------------------
+// GEMINI PRIORITY POOL (1: gemini-3.5-flash-lite, 2: gemini-3.1-flash-lite,
+// 3: gemma-4-26b-a4b-it, 4: gemma-4-31b-it) × ALL ACTIVE GEMINI KEYS
+// Enforces strict priority order while maximizing every model & key's RPM/RPD/TPD limits.
+// -----------------------------------------------------------------------------
+
+type geminiSlotState struct {
+	rpmCooldownUntil  time.Time
+	rpdCooldownUntil  time.Time
+	notFoundUntil     time.Time
+	authDisabledUntil time.Time
+	tokensUsedToday   int64
+	requestsToday     int64
+	dayUTC            string
+}
+
+type geminiCandidateSlot struct {
+	priority    int
+	keyIndex    int
+	apiKey      string
+	keyHash     string
+	model       string
+	requestsDay int64
+	rpmUntil    time.Time
+}
+
+type geminiPoolManager struct {
+	mu        sync.Mutex
+	slots     map[string]*geminiSlotState
+	keyCursor uint64
+}
+
+var geminiPool = &geminiPoolManager{
+	slots: make(map[string]*geminiSlotState),
+}
+
+func (pm *geminiPoolManager) getSlotLocked(kHash, model string, now time.Time) *geminiSlotState {
+	day := now.UTC().Format("2006-01-02")
+	id := kHash + "|" + model
+	st, ok := pm.slots[id]
+	if !ok || st == nil {
+		st = &geminiSlotState{dayUTC: day}
+		pm.slots[id] = st
+		return st
+	}
+	if st.dayUTC != day {
+		st.dayUTC = day
+		st.tokensUsedToday = 0
+		st.requestsToday = 0
+		st.rpdCooldownUntil = time.Time{}
+	}
+	return st
+}
+
+// buildCandidates returns candidate (key × model) slots in STRICT model priority order
+// (1st: gemini-3.5-flash-lite -> 2nd: gemini-3.1-flash-lite -> 3rd: gemma-4-26b-a4b-it -> 4th: gemma-4-31b-it),
+// while balancing across ALL active Gemini API keys within each priority tier so every key & model's full quota is used!
+func (pm *geminiPoolManager) buildCandidates(geminiKeys []string) (ready []geminiCandidateSlot, rpmDelayed []geminiCandidateSlot) {
+	if len(geminiKeys) == 0 {
+		return nil, nil
+	}
+	now := time.Now()
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
+	keyCount := len(geminiKeys)
+	keyStart := int(pm.keyCursor % uint64(keyCount))
+	pm.keyCursor++
+
+	for prio, model := range geminiPriorityModels {
+		var tierReady []geminiCandidateSlot
+		for offset := 0; offset < keyCount; offset++ {
+			kIdx := (keyStart + offset) % keyCount
+			apiKey := geminiKeys[kIdx]
+			kHash := shortKeyHash(apiKey)
+			st := pm.getSlotLocked(kHash, model, now)
+			if now.Before(st.authDisabledUntil) || now.Before(st.rpdCooldownUntil) || now.Before(st.notFoundUntil) {
+				continue
+			}
+			slot := geminiCandidateSlot{
+				priority:    prio,
+				keyIndex:    kIdx,
+				apiKey:      apiKey,
+				keyHash:     kHash,
+				model:       model,
+				requestsDay: st.requestsToday,
+				rpmUntil:    st.rpmCooldownUntil,
+			}
+			if now.Before(st.rpmCooldownUntil) {
+				rpmDelayed = append(rpmDelayed, slot)
+			} else {
+				tierReady = append(tierReady, slot)
+			}
+		}
+		// Balance multiple Gemini keys evenly within the same priority tier
+		sort.SliceStable(tierReady, func(i, j int) bool {
+			return (tierReady[i].requestsDay / 5) < (tierReady[j].requestsDay / 5)
+		})
+		ready = append(ready, tierReady...)
+	}
+
+	sort.SliceStable(rpmDelayed, func(i, j int) bool {
+		if !rpmDelayed[i].rpmUntil.Equal(rpmDelayed[j].rpmUntil) {
+			return rpmDelayed[i].rpmUntil.Before(rpmDelayed[j].rpmUntil)
+		}
+		return rpmDelayed[i].priority < rpmDelayed[j].priority
+	})
+
+	return ready, rpmDelayed
+}
+
+func (pm *geminiPoolManager) recordSuccess(kHash, model string, totalTokens int64) {
+	now := time.Now()
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	st := pm.getSlotLocked(kHash, model, now)
+	st.tokensUsedToday += totalTokens
+	st.requestsToday++
+	st.rpmCooldownUntil = time.Time{}
+}
+
+func (pm *geminiPoolManager) markRPMCooldown(kHash, model string, dur time.Duration) {
+	if dur <= 0 {
+		dur = 65 * time.Second
+	}
+	now := time.Now()
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	st := pm.getSlotLocked(kHash, model, now)
+	st.rpmCooldownUntil = now.Add(dur)
+}
+
+func (pm *geminiPoolManager) markRPDExhausted(kHash, model string, dur time.Duration) {
+	now := time.Now()
+	nextMidnightUTC := time.Date(now.UTC().Year(), now.UTC().Month(), now.UTC().Day()+1, 0, 1, 0, 0, time.UTC)
+	until := nextMidnightUTC
+	if dur > 0 {
+		cand := now.Add(dur)
+		if cand.After(now.Add(10*time.Minute)) && cand.Before(until) {
+			until = cand
+		}
+	}
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	st := pm.getSlotLocked(kHash, model, now)
+	st.rpdCooldownUntil = until
+}
+
+func (pm *geminiPoolManager) markModelNotFound(kHash, model string, dur time.Duration) {
+	if dur <= 0 {
+		dur = 6 * time.Hour
+	}
+	now := time.Now()
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	st := pm.getSlotLocked(kHash, model, now)
+	st.notFoundUntil = now.Add(dur)
+}
+
+func (pm *geminiPoolManager) markAuthDisabledForKey(kHash string, dur time.Duration) {
+	if dur <= 0 {
+		dur = 30 * time.Minute
+	}
+	now := time.Now()
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	for _, mdl := range geminiPriorityModels {
+		st := pm.getSlotLocked(kHash, mdl, now)
+		st.authDisabledUntil = now.Add(dur)
+	}
+}
+
+var geminiRetryDelayRegex = regexp.MustCompile(`"retryDelay"\s*:\s*"([^"]+)"`)
+
+func classifyGemini429(headers http.Header, body []byte) (isDaily bool, cooldown time.Duration) {
+	lower := strings.ToLower(string(body))
+	retryAfter := parseResetDuration(headers.Get("Retry-After"))
+	if retryAfter <= 0 {
+		if m := geminiRetryDelayRegex.FindSubmatch(body); len(m) > 1 {
+			retryAfter = parseResetDuration(string(m[1]))
+		}
+	}
+
+	if strings.Contains(lower, "perday") ||
+		strings.Contains(lower, "per_day") ||
+		strings.Contains(lower, "per day") ||
+		strings.Contains(lower, "requests per day") ||
+		strings.Contains(lower, "tokens per day") ||
+		strings.Contains(lower, "generaterequestsperday") ||
+		strings.Contains(lower, "daily") ||
+		strings.Contains(lower, " rpd") ||
+		strings.Contains(lower, "(rpd)") ||
+		strings.Contains(lower, " tpd") ||
+		strings.Contains(lower, "(tpd)") ||
+		retryAfter >= 5*time.Minute {
+		cd := retryAfter
+		if cd < 30*time.Minute {
+			cd = 2 * time.Hour
+		}
+		return true, cd
+	}
+
+	cd := retryAfter
+	if cd <= 0 {
+		cd = 65 * time.Second
+	} else {
+		cd += 2 * time.Second
+	}
+	return false, cd
+}
+
+// -----------------------------------------------------------------------------
+// GROQ WHISPER AUDIO POOL (whisper-large-v3-turbo & whisper-large-v3 ONLY)
+// Spreads audio transcription across ALL active Groq keys × BOTH Whisper models
+// so hourly/daily audio-second & request limits of every model/key are fully utilized!
+// -----------------------------------------------------------------------------
+
+type groqAudioSlotState struct {
+	rpmCooldownUntil  time.Time
+	rpdCooldownUntil  time.Time
+	authDisabledUntil time.Time
+	audioSecUsedToday int64
+	requestsToday     int64
+	dayUTC            string
+}
+
+type groqAudioCandidateSlot struct {
+	keyIndex    int
+	apiKey      string
+	keyHash     string
+	model       string
+	audioSecDay int64
+	rpmUntil    time.Time
+}
+
+type groqAudioPoolManager struct {
+	mu     sync.Mutex
+	slots  map[string]*groqAudioSlotState
+	cursor uint64
+}
+
+var groqAudioPool = &groqAudioPoolManager{
+	slots: make(map[string]*groqAudioSlotState),
+}
+
+func (pm *groqAudioPoolManager) getSlotLocked(kHash, model string, now time.Time) *groqAudioSlotState {
+	day := now.UTC().Format("2006-01-02")
+	id := kHash + "|" + model
+	st, ok := pm.slots[id]
+	if !ok || st == nil {
+		st = &groqAudioSlotState{dayUTC: day}
+		pm.slots[id] = st
+		return st
+	}
+	if st.dayUTC != day {
+		st.dayUTC = day
+		st.audioSecUsedToday = 0
+		st.requestsToday = 0
+		st.rpdCooldownUntil = time.Time{}
+	}
+	return st
+}
+
+func (pm *groqAudioPoolManager) buildCandidates(groqKeys []string) (ready []groqAudioCandidateSlot, rpmDelayed []groqAudioCandidateSlot) {
+	now := time.Now()
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
+	total := len(groqKeys) * len(groqAudioModels)
+	if total == 0 {
+		return nil, nil
+	}
+
+	matrix := make([]groqAudioCandidateSlot, 0, total)
+	for _, model := range groqAudioModels {
+		for kIdx, key := range groqKeys {
+			matrix = append(matrix, groqAudioCandidateSlot{
+				keyIndex: kIdx,
+				apiKey:   key,
+				keyHash:  shortKeyHash(key),
+				model:    model,
+			})
+		}
+	}
+
+	start := int(pm.cursor % uint64(total))
+	pm.cursor++
+
+	rotated := make([]groqAudioCandidateSlot, 0, total)
+	rotated = append(rotated, matrix[start:]...)
+	rotated = append(rotated, matrix[:start]...)
+
+	for _, slot := range rotated {
+		st := pm.getSlotLocked(slot.keyHash, slot.model, now)
+		if now.Before(st.authDisabledUntil) || now.Before(st.rpdCooldownUntil) {
+			continue
+		}
+		slot.audioSecDay = st.audioSecUsedToday
+		slot.rpmUntil = st.rpmCooldownUntil
+		if now.Before(st.rpmCooldownUntil) {
+			rpmDelayed = append(rpmDelayed, slot)
+		} else {
+			ready = append(ready, slot)
+		}
+	}
+
+	// Balance daily audio seconds evenly across BOTH whisper-large-v3-turbo & whisper-large-v3 × all Groq keys
+	sort.SliceStable(ready, func(i, j int) bool {
+		return (ready[i].audioSecDay / 120) < (ready[j].audioSecDay / 120)
+	})
+	sort.SliceStable(rpmDelayed, func(i, j int) bool {
+		return rpmDelayed[i].rpmUntil.Before(rpmDelayed[j].rpmUntil)
+	})
+
+	return ready, rpmDelayed
+}
+
+func (pm *groqAudioPoolManager) recordSuccess(kHash, model string, audioSec int64) {
+	if audioSec <= 0 {
+		audioSec = 10
+	}
+	now := time.Now()
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	st := pm.getSlotLocked(kHash, model, now)
+	st.audioSecUsedToday += audioSec
+	st.requestsToday++
+	st.rpmCooldownUntil = time.Time{}
+}
+
+func (pm *groqAudioPoolManager) markRPMCooldown(kHash, model string, dur time.Duration) {
+	if dur <= 0 {
+		dur = 65 * time.Second
+	}
+	now := time.Now()
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	st := pm.getSlotLocked(kHash, model, now)
+	st.rpmCooldownUntil = now.Add(dur)
+}
+
+func (pm *groqAudioPoolManager) markRPDExhausted(kHash, model string, dur time.Duration) {
+	now := time.Now()
+	nextMidnightUTC := time.Date(now.UTC().Year(), now.UTC().Month(), now.UTC().Day()+1, 0, 1, 0, 0, time.UTC)
+	until := nextMidnightUTC
+	if dur > 0 {
+		cand := now.Add(dur)
+		if cand.After(now.Add(10*time.Minute)) && cand.Before(until) {
+			until = cand
+		}
+	}
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	st := pm.getSlotLocked(kHash, model, now)
+	st.rpdCooldownUntil = until
+}
+
+func (pm *groqAudioPoolManager) markAuthDisabledForKey(kHash string, dur time.Duration) {
+	if dur <= 0 {
+		dur = 30 * time.Minute
+	}
+	now := time.Now()
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	for _, mdl := range groqAudioModels {
+		st := pm.getSlotLocked(kHash, mdl, now)
+		st.authDisabledUntil = now.Add(dur)
+	}
+}
+
+// TranscribeVoiceNoteGroqPool transcribes audio STRICTLY using Groq's whisper-large-v3-turbo &
+// whisper-large-v3 across ALL active Groq API keys, automatically switching models/keys on any
+// RPM, hourly audio-seconds, or daily limit so every model's full quota is utilized.
+func TranscribeVoiceNoteGroqPool(username string, audioBytes []byte, durationSec int) string {
+	if len(audioBytes) == 0 {
+		return ""
+	}
+	cfg := GetUserConfigRAM(username)
+	allKeys := collectCandidateAPIKeys(username, cfg)
+	var groqKeys []string
+	for _, k := range allKeys {
+		if strings.HasPrefix(strings.TrimSpace(k), "gsk_") {
+			groqKeys = append(groqKeys, strings.TrimSpace(k))
+		}
+	}
+	if len(groqKeys) == 0 {
+		return ""
+	}
+
+	ready, rpmDelayed := groqAudioPool.buildCandidates(groqKeys)
+	if durationSec <= 0 {
+		durationSec = 10
+	}
+
+	tryAudioSlot := func(slot groqAudioCandidateSlot) (string, bool) {
+		var body bytes.Buffer
+		writer := multipart.NewWriter(&body)
+		part, err := writer.CreateFormFile("file", "voice.ogg")
+		if err != nil {
+			return "", false
+		}
+		if _, err := part.Write(audioBytes); err != nil {
+			return "", false
+		}
+		_ = writer.WriteField("model", slot.model)
+		_ = writer.Close()
+
+		req, err := http.NewRequest("POST", "https://api.groq.com/openai/v1/audio/transcriptions", &body)
+		if err != nil {
+			return "", false
+		}
+		req.Header.Set("Content-Type", writer.FormDataContentType())
+		req.Header.Set("Authorization", "Bearer "+slot.apiKey)
+		req.Header.Set("User-Agent", "VendorWhatsAppBotNode/2.5")
+
+		httpClient := &http.Client{Timeout: 15 * time.Second}
+		resp, err := httpClient.Do(req)
+		if err != nil {
+			groqAudioPool.markRPMCooldown(slot.keyHash, slot.model, 45*time.Second)
+			log.Printf("⚠️ [Groq Audio] Key #%d | model=%s network error (%v) -> switching model/key", slot.keyIndex+1, slot.model, err)
+			return "", false
+		}
+		respBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024))
+		resp.Body.Close()
+
+		if resp.StatusCode == http.StatusOK {
+			var parsed struct {
+				Text string `json:"text"`
+			}
+			if err := json.Unmarshal(respBytes, &parsed); err == nil {
+				txt := strings.TrimSpace(parsed.Text)
+				if txt != "" {
+					groqAudioPool.recordSuccess(slot.keyHash, slot.model, int64(durationSec))
+					return txt, true
+				}
+			}
+			return "", false
+		}
+
+		switch resp.StatusCode {
+		case http.StatusTooManyRequests:
+			isDaily, cd := classifyGroq429(resp.Header, respBytes)
+			if isDaily {
+				groqAudioPool.markRPDExhausted(slot.keyHash, slot.model, cd)
+				log.Printf("🚫 [Groq Audio Daily Limit] Key #%d | model=%s (cooldown %v) -> switching model/key", slot.keyIndex+1, slot.model, cd.Round(time.Minute))
+			} else {
+				groqAudioPool.markRPMCooldown(slot.keyHash, slot.model, cd)
+				log.Printf("⚡ [Groq Audio Rate Limit] Key #%d | model=%s (cooldown %v) -> switching model/key immediately", slot.keyIndex+1, slot.model, cd.Round(time.Second))
+			}
+		case http.StatusUnauthorized, http.StatusForbidden:
+			groqAudioPool.markAuthDisabledForKey(slot.keyHash, 30*time.Minute)
+			log.Printf("🔑 [Groq Audio Auth Error %d] Key #%d disabled 30m -> switching key", resp.StatusCode, slot.keyIndex+1)
+		default:
+			groqAudioPool.markRPMCooldown(slot.keyHash, slot.model, 45*time.Second)
+			log.Printf("⚠️ [Groq Audio HTTP %d] Key #%d | model=%s -> switching model/key", resp.StatusCode, slot.keyIndex+1, slot.model)
+		}
+		return "", false
+	}
+
+	for _, slot := range ready {
+		if txt, ok := tryAudioSlot(slot); ok {
+			return txt
+		}
+	}
+
+	if len(rpmDelayed) > 0 {
+		best := rpmDelayed[0]
+		wait := time.Until(best.rpmUntil)
+		if wait > 0 && wait <= 3*time.Second {
+			time.Sleep(wait)
+		}
+		if txt, ok := tryAudioSlot(best); ok {
+			return txt
+		}
+	}
+	return ""
 }
 
 // -----------------------------------------------------------------------------
@@ -540,9 +1083,9 @@ func GetUserConfigRAM(_ string) *UserConfigRAM {
 		if !isGroqModelAllowed(model) {
 			model = groqAllowedModels[0]
 		}
-	} else if strings.EqualFold(provider, "gemini") || strings.EqualFold(provider, "google") || strings.EqualFold(provider, "gemma") {
+	} else if strings.EqualFold(provider, "gemini") {
 		if !isGeminiModelAllowed(model) {
-			model = geminiAllowedModels[0]
+			model = geminiPriorityModels[0]
 		}
 	} else if model == "" {
 		model = groqAllowedModels[0]
@@ -622,13 +1165,10 @@ func collectCandidateAPIKeys(username string, cfg *UserConfigRAM) []string {
 		return keys
 	}
 
-	// Preserve deterministic order for Groq & Gemini pools (they manage their own key × model rotation matrices);
+	// Preserve deterministic order for GroqPool & GeminiPool (both run their own per-key rotation);
 	// for other providers, rotate start index per request.
-	if cfg != nil {
-		p := strings.ToLower(strings.TrimSpace(cfg.Provider))
-		if p == "" || p == "groq" || p == "gemini" || p == "google" || p == "gemma" {
-			return keys
-		}
+	if cfg != nil && (strings.EqualFold(strings.TrimSpace(cfg.Provider), "groq") || strings.EqualFold(strings.TrimSpace(cfg.Provider), "gemini")) {
+		return keys
 	}
 
 	keyRotationLock.Lock()
@@ -642,52 +1182,79 @@ func collectCandidateAPIKeys(username string, cfg *UserConfigRAM) []string {
 	return rotated
 }
 
-// callAIWithKeyFallback implements the 3-mode AI scheduling engine:
-//  1. Dual Mode (Groq + Gemini both configured): Alternates ("bari-bari") between Groq (3 models)
-//     and Gemini (4 models) across all active keys with instant cross-provider failover on TPM/RPM/TPD/429.
-//  2. Groq-Only Mode: Preserves strict 3-model Groq TPD/TPM pool (qwen3.8-27b, gpt-oss-20b, gpt-oss-120b).
-//  3. Gemini-Only Mode: Strictly uses 4 models (gemma-4-31b-it, gemma-4-26b-a4b-it, gemini-3.1-flash-lite, gemini-3.5-flash-lite).
+// callAIWithKeyFallback routes:
+//   - Groq keys through the strict 3-model × multi-key TPD/TPM pool
+//   - Gemini keys through the strict 4-model priority ladder (gemini-3.5-flash-lite -> gemini-3.1-flash-lite -> gemma-4-26b-a4b-it -> gemma-4-31b-it) × multi-key RPM/RPD pool
+//   - Other providers (OpenAI / DeepSeek / OpenRouter) on standard key failover
 func callAIWithKeyFallback(username string, cfg *UserConfigRAM, sysPrompt string, history []ChatMessage, jsonMode bool) (string, error) {
-	groqKeys, geminiKeys, otherKeys := ClassifyConfiguredAIKeys(username, cfg)
-	if len(groqKeys) == 0 && len(geminiKeys) == 0 && len(otherKeys) == 0 {
+	keys := collectCandidateAPIKeys(username, cfg)
+	if len(keys) == 0 {
 		return "", fmt.Errorf("no AI API key configured in vendor AI settings or environment")
 	}
 
-	var lastErr error
-
-	// Case 1: Dual Mode (BOTH Groq & Gemini keys configured -> alternating rotation across all keys × models)
-	if len(groqKeys) > 0 && len(geminiKeys) > 0 {
-		res, err := callDualGroqGeminiPoolWithHistory(groqKeys, geminiKeys, cfg.Temperature, sysPrompt, history, jsonMode)
-		if err == nil && strings.TrimSpace(res) != "" {
-			return res, nil
-		}
-		lastErr = err
-		if len(otherKeys) > 0 {
-			log.Printf("🔄 [AI Fallback] All Groq + Gemini slots unavailable (%v) — falling back to backup key...", err)
-		}
-	} else if len(groqKeys) > 0 {
-		// Case 2: Groq-Only Mode (exact existing 3-model Groq TPD/TPM architecture)
-		res, err := callGroqPoolWithHistory(groqKeys, cfg.Temperature, sysPrompt, history, jsonMode)
-		if err == nil && strings.TrimSpace(res) != "" {
-			return res, nil
-		}
-		lastErr = err
-		if len(otherKeys) > 0 {
-			log.Printf("🔄 [AI Fallback] All Groq slots unavailable (%v) — falling back to backup key...", err)
-		}
-	} else if len(geminiKeys) > 0 {
-		// Case 3: Gemini-Only Mode (strictly 4 allowed Gemini/Gemma models across all active Gemini keys)
-		res, err := callGeminiPoolWithHistory(geminiKeys, cfg.Temperature, sysPrompt, history, jsonMode)
-		if err == nil && strings.TrimSpace(res) != "" {
-			return res, nil
-		}
-		lastErr = err
-		if len(otherKeys) > 0 {
-			log.Printf("🔄 [AI Fallback] All Gemini slots unavailable (%v) — falling back to backup key...", err)
+	var groqKeys []string
+	var geminiKeys []string
+	var otherKeys []string
+	for _, k := range keys {
+		if isGroqProvider(cfg.Provider, k) {
+			groqKeys = append(groqKeys, k)
+		} else if isGeminiProvider(cfg.Provider, k) {
+			geminiKeys = append(geminiKeys, k)
+		} else {
+			otherKeys = append(otherKeys, k)
 		}
 	}
 
-	// Backup Non-Groq/Non-Gemini Providers (OpenAI / DeepSeek / OpenRouter)
+	preferGemini := strings.EqualFold(strings.TrimSpace(cfg.Provider), "gemini") || strings.HasPrefix(strings.TrimSpace(cfg.APIKey), "AIzaSy")
+	var lastErr error
+
+	runGemini := func() (string, bool) {
+		if len(geminiKeys) == 0 {
+			return "", false
+		}
+		res, err := callGeminiPoolWithHistory(geminiKeys, cfg.Temperature, sysPrompt, history, jsonMode)
+		if err == nil && strings.TrimSpace(res) != "" {
+			return res, true
+		}
+		lastErr = err
+		return "", false
+	}
+
+	runGroq := func() (string, bool) {
+		if len(groqKeys) == 0 {
+			return "", false
+		}
+		res, err := callGroqPoolWithHistory(groqKeys, cfg.Temperature, sysPrompt, history, jsonMode)
+		if err == nil && strings.TrimSpace(res) != "" {
+			return res, true
+		}
+		lastErr = err
+		return "", false
+	}
+
+	if preferGemini {
+		if res, ok := runGemini(); ok {
+			return res, nil
+		}
+		if len(groqKeys) > 0 {
+			log.Printf("🔄 [AI Fallback] All Gemini priority models/keys unavailable (%v) — falling back to Groq pool...", lastErr)
+			if res, ok := runGroq(); ok {
+				return res, nil
+			}
+		}
+	} else {
+		if res, ok := runGroq(); ok {
+			return res, nil
+		}
+		if len(geminiKeys) > 0 {
+			log.Printf("🔄 [AI Fallback] All Groq key×model slots unavailable (%v) — falling back to Gemini priority pool...", lastErr)
+			if res, ok := runGemini(); ok {
+				return res, nil
+			}
+		}
+	}
+
+	// Remaining non-Groq / non-Gemini providers (OpenAI / DeepSeek / OpenRouter)
 	for idx, key := range otherKeys {
 		res, err := callNonGroqModelWithHistory(cfg.Provider, cfg.Model, cfg.Temperature, key, sysPrompt, history, jsonMode)
 		if err == nil && strings.TrimSpace(res) != "" {
@@ -1349,10 +1916,9 @@ func GenerateOctopusAIReply(username, customerPhone, incomingText string, cfg *U
 		return nil, fmt.Errorf("no AI API key configured in vendor AI settings or environment")
 	}
 
-	cleanQueryForRouting := stripVoiceNoteMarkers(incomingText)
 	fullHistory := getSlidingWindowRAM(username, cleanPhone)
-	if len(fullHistory) == 0 || stripVoiceNoteMarkers(fullHistory[len(fullHistory)-1].Content) != compactText(cleanQueryForRouting, 400) {
-		fullHistory = updateSlidingWindowRAM(username, cleanPhone, "user", cleanQueryForRouting)
+	if len(fullHistory) == 0 || fullHistory[len(fullHistory)-1].Content != compactText(incomingText, 400) {
+		fullHistory = updateSlidingWindowRAM(username, cleanPhone, "user", incomingText)
 	}
 
 	// Strictly limit LLM sliding window to MaxLLMHistoryMessages (6 total messages)
@@ -1410,14 +1976,6 @@ func GenerateOctopusAIReply(username, customerPhone, incomingText string, cfg *U
 	}
 	ruleParts = append(ruleParts, "Pay:"+payMode)
 
-	// Optional Gemini Decision 1 Smart Router (active ONLY when Gemini key(s) are configured — 0 output tokens!)
-	// Saves 50-70% tokens by skipping catalog on non-shopping turns and pre-routing vague Hinglish categories.
-	_, geminiKeys, _ := ClassifyConfiguredAIKeys(username, cfg)
-	var routeDec DecisionRouteResult
-	if len(geminiKeys) > 0 {
-		routeDec = RunGeminiDecisionSmartRoute(geminiKeys, cleanQueryForRouting, len(cartProductIDs) > 0)
-	}
-
 	// Static prefix first (prompt-cache friendly!), dynamic per-customer state + smart RAG at the end!
 	var promptBuilder strings.Builder
 	promptBuilder.WriteString(fmt.Sprintf(octopusSystemPromptJSON, bName, bType, policies, lang))
@@ -1425,27 +1983,8 @@ func GenerateOctopusAIReply(username, customerPhone, incomingText string, cfg *U
 		promptBuilder.WriteString("\nVENDOR NOTE: " + extra)
 	}
 	promptBuilder.WriteString("\nSTORE: " + strings.Join(ruleParts, " | "))
-	promptBuilder.WriteString("\n\n" + BuildOctopusContext(username, cleanPhone, cleanQueryForRouting))
-
-	if routeDec.UsedDecisionAPI && routeDec.NeedsEscalation {
-		promptBuilder.WriteString("\nROUTER_HINT: Customer needs human/owner help — include escalate_to_human action and reply with empathy.")
-	}
-
-	if routeDec.UsedDecisionAPI && routeDec.SkipCatalog {
-		// Huge token savings: skip full catalog on non-shopping turns (address, payment status, complaint, chitchat)
-		promptBuilder.WriteString("\n\nINV: (Catalog omitted by smart router — non-shopping turn. Use search_catalog only if user asks for a new product.)")
-	} else {
-		invBlock := GetSmartCompactInventory(cleanQueryForRouting, llmHistory, cartProductIDs)
-		promptBuilder.WriteString("\n\n" + invBlock)
-		if routeDec.UsedDecisionAPI && routeDec.MatchedCategory != "" &&
-			!strings.Contains(invBlock, "MULTI_ITEM_MATCH") &&
-			!strings.Contains(invBlock, "checkout mode") &&
-			(strings.Contains(invBlock, "HINT: 0 direct keyword hits") || !strings.Contains(strings.ToLower(invBlock), "|"+strings.ToLower(routeDec.MatchedCategory)+"|")) {
-			// Pre-inject exact matched category from RAM on Pass 1 -> saves an entire 2nd LLM round-trip!
-			catBlock := ExecuteSearchCatalogHand(nil, []string{routeDec.MatchedCategory})
-			promptBuilder.WriteString("\n\n" + catBlock)
-		}
-	}
+	promptBuilder.WriteString("\n\n" + BuildOctopusContext(username, cleanPhone, incomingText))
+	promptBuilder.WriteString("\n\n" + GetSmartCompactInventory(incomingText, llmHistory, cartProductIDs))
 
 	aiResponse, err := callAIWithKeyFallback(username, cfg, promptBuilder.String(), llmHistory, true)
 	if err != nil || aiResponse == "" {
@@ -1456,9 +1995,6 @@ func GenerateOctopusAIReply(username, customerPhone, incomingText string, cfg *U
 	parsed, errParse := ParseOctopusAIResponse(aiResponse)
 	if errParse != nil || parsed == nil {
 		return &OctopusAIResponse{AIReplyText: SafeAIFallbackReply, Actions: []AIActionItem{}, ExecuteHand: "chat_only"}, nil
-	}
-	if routeDec.UsedDecisionAPI && routeDec.NeedsQuoteReply {
-		parsed.QuoteReply = true
 	}
 
 	// Layer 4: On-Demand `search_catalog` Hand interception (STRICTLY max 1 follow-up pass — never loops!)
@@ -1491,9 +2027,6 @@ func GenerateOctopusAIReply(username, customerPhone, incomingText string, cfg *U
 		aiResponse2, err2 := callAIWithKeyFallback(username, cfg, followUpPrompt, llmHistory, true)
 		if err2 == nil && strings.TrimSpace(aiResponse2) != "" {
 			if parsed2, errP2 := ParseOctopusAIResponse(aiResponse2); errP2 == nil && parsed2 != nil {
-				if routeDec.UsedDecisionAPI && routeDec.NeedsQuoteReply {
-					parsed2.QuoteReply = true
-				}
 				filtered := make([]AIActionItem, 0, len(parsed2.Actions))
 				for _, act := range parsed2.Actions {
 					if act.Hand != "search_catalog" {
@@ -1548,7 +2081,7 @@ func AsyncCentralSync(username, customerPhone, incomingText, aiReplyText string)
 	}()
 }
 
-// CallAIModelWithHistory calls Groq (strictly 3-model TPD/TPM rotation), Gemini (strictly 4-model pool), OpenAI, DeepSeek, or OpenRouter.
+// CallAIModelWithHistory calls Groq (strictly 3-model TPD/TPM rotation), Gemini (4-model priority pool), OpenAI, DeepSeek, or OpenRouter.
 func CallAIModelWithHistory(provider, model string, temperature float64, rawApiKey, sysPrompt string, history []ChatMessage) (string, error) {
 	apiKey := strings.TrimSpace(rawApiKey)
 	if apiKey == "" {
@@ -1746,7 +2279,7 @@ func callNonGroqModelWithHistory(provider, model string, temperature float64, ap
 		prov = "openrouter"
 	} else if strings.HasPrefix(apiKey, "sk-") && prov != "deepseek" {
 		prov = "openai"
-	} else if strings.HasPrefix(apiKey, "AIza") {
+	} else if strings.HasPrefix(apiKey, "AIzaSy") {
 		prov = "gemini"
 	}
 
@@ -1755,8 +2288,8 @@ func callNonGroqModelWithHistory(provider, model string, temperature float64, ap
 		cleanModel = ""
 	}
 
-	if prov == "gemini" || prov == "google" || prov == "gemma" {
-		return callGeminiPoolWithHistory([]string{apiKey}, temperature, sysPrompt, history, jsonMode)
+	if prov == "gemini" {
+		return callGeminiAPIWithHistory(apiKey, cleanModel, temperature, sysPrompt, history, jsonMode)
 	}
 	return callOpenAIFormatWithHistory(prov, cleanModel, temperature, apiKey, sysPrompt, history, jsonMode)
 }
@@ -1838,8 +2371,202 @@ func callOpenAIFormatWithHistory(provider, model string, temperature float64, ap
 	return "", fmt.Errorf("empty AI reply received")
 }
 
-// callGeminiAPIWithHistory delegates strictly to the 4-model Gemini/Gemma pool
-// (gemma-4-31b-it, gemma-4-26b-a4b-it, gemini-3.1-flash-lite, gemini-3.5-flash-lite).
 func callGeminiAPIWithHistory(apiKey, _ string, temperature float64, sysPrompt string, history []ChatMessage, jsonMode bool) (string, error) {
 	return callGeminiPoolWithHistory([]string{apiKey}, temperature, sysPrompt, history, jsonMode)
+}
+
+// callGeminiPoolWithHistory calls Gemini API keys using STRICT model priority order:
+//   1st: gemini-3.5-flash-lite
+//   2nd: gemini-3.1-flash-lite
+//   3rd: gemma-4-26b-a4b-it (Gemma 4 26B)
+//   4th: gemma-4-31b-it     (Gemma 4 31B)
+// Automatically tracks RPM/RPD/404/auth limits per (key × model) so every model & every key's limits are fully utilized!
+func callGeminiPoolWithHistory(geminiKeys []string, temperature float64, sysPrompt string, history []ChatMessage, jsonMode bool) (string, error) {
+	if len(geminiKeys) == 0 {
+		return "", fmt.Errorf("no Gemini API keys available")
+	}
+
+	ready, rpmDelayed := geminiPool.buildCandidates(geminiKeys)
+	var lastErr error
+
+	trySlot := func(slot geminiCandidateSlot) (string, bool, error) {
+		text, tokens, status, headers, body, err := callGeminiSingleModel(slot.apiKey, slot.model, temperature, sysPrompt, history, jsonMode)
+		if err == nil && strings.TrimSpace(text) != "" {
+			geminiPool.recordSuccess(slot.keyHash, slot.model, tokens)
+			return text, true, nil
+		}
+
+		switch status {
+		case http.StatusTooManyRequests:
+			isDaily, cd := classifyGemini429(headers, body)
+			if isDaily {
+				geminiPool.markRPDExhausted(slot.keyHash, slot.model, cd)
+				log.Printf("🚫 [Gemini Daily Limit] Priority #%d (%s) | Key #%d exhausted (cooldown %v) -> switching to next priority/key", slot.priority+1, slot.model, slot.keyIndex+1, cd.Round(time.Minute))
+			} else {
+				geminiPool.markRPMCooldown(slot.keyHash, slot.model, cd)
+				log.Printf("⚡ [Gemini RPM/TPM Limit] Priority #%d (%s) | Key #%d (cooldown %v) -> switching immediately", slot.priority+1, slot.model, slot.keyIndex+1, cd.Round(time.Second))
+			}
+		case http.StatusNotFound:
+			geminiPool.markModelNotFound(slot.keyHash, slot.model, 6*time.Hour)
+			log.Printf("⚠️ [Gemini 404] Priority #%d (%s) unavailable -> cooling down 6h & falling back to next priority model", slot.priority+1, slot.model)
+		case http.StatusUnauthorized, http.StatusForbidden:
+			geminiPool.markAuthDisabledForKey(slot.keyHash, 30*time.Minute)
+			log.Printf("🔑 [Gemini Auth Error %d] Key #%d disabled 30m -> switching to next key", status, slot.keyIndex+1)
+		default:
+			geminiPool.markRPMCooldown(slot.keyHash, slot.model, 45*time.Second)
+			log.Printf("⚠️ [Gemini Error] Priority #%d (%s) | Key #%d (%v) -> switching to next priority/key", slot.priority+1, slot.model, slot.keyIndex+1, err)
+		}
+		return "", false, err
+	}
+
+	for _, slot := range ready {
+		if text, ok, err := trySlot(slot); ok {
+			return text, nil
+		} else {
+			lastErr = err
+		}
+	}
+
+	// If every active slot was temporarily on short RPM cooldown (not RPD-exhausted),
+	// try the soonest-expiring slot (waiting up to 3s if cooldown is almost done).
+	if len(rpmDelayed) > 0 {
+		best := rpmDelayed[0]
+		wait := time.Until(best.rpmUntil)
+		if wait > 0 && wait <= 3*time.Second {
+			time.Sleep(wait)
+		}
+		if text, ok, err := trySlot(best); ok {
+			return text, nil
+		} else {
+			lastErr = err
+		}
+	}
+
+	if lastErr != nil {
+		return "", lastErr
+	}
+	return "", fmt.Errorf("all Gemini priority models (gemini-3.5-flash-lite, gemini-3.1-flash-lite, gemma-4-26b-a4b-it, gemma-4-31b-it) are currently rate-limited or exhausted")
+}
+
+func buildGeminiContents(sysPrompt string, history []ChatMessage, foldSystemIntoUser bool) []map[string]interface{} {
+	type msgPair struct {
+		role string
+		text string
+	}
+	var merged []msgPair
+	for _, m := range history {
+		txt := strings.TrimSpace(m.Content)
+		if txt == "" {
+			continue
+		}
+		role := "user"
+		if m.Role == "assistant" || m.Role == "outgoing" || m.Role == "outgoing_ai" || m.Role == "model" {
+			role = "model"
+		}
+		if len(merged) > 0 && merged[len(merged)-1].role == role {
+			merged[len(merged)-1].text += "\n" + txt
+		} else {
+			merged = append(merged, msgPair{role: role, text: txt})
+		}
+	}
+	if len(merged) == 0 {
+		merged = []msgPair{{role: "user", text: "Hello"}}
+	}
+	if foldSystemIntoUser && strings.TrimSpace(sysPrompt) != "" {
+		prefix := "[SYSTEM INSTRUCTIONS]\n" + strings.TrimSpace(sysPrompt) + "\n\n[CONVERSATION]\n"
+		if merged[0].role == "user" {
+			merged[0].text = prefix + merged[0].text
+		} else {
+			merged = append([]msgPair{{role: "user", text: prefix + "Please follow the system instructions."}}, merged...)
+		}
+	}
+
+	contents := make([]map[string]interface{}, 0, len(merged))
+	for _, item := range merged {
+		contents = append(contents, map[string]interface{}{
+			"role":  item.role,
+			"parts": []map[string]string{{"text": item.text}},
+		})
+	}
+	return contents
+}
+
+func callGeminiSingleModel(apiKey, model string, temperature float64, sysPrompt string, history []ChatMessage, jsonMode bool) (string, int64, int, http.Header, []byte, error) {
+	isGemma := strings.HasPrefix(strings.ToLower(strings.TrimSpace(model)), "gemma-")
+	endpoint := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s", model, apiKey)
+
+	doRequest := func(compatMode bool) (string, int64, int, http.Header, []byte, error) {
+		foldSystem := isGemma || compatMode
+		contents := buildGeminiContents(sysPrompt, history, foldSystem)
+
+		genCfg := map[string]interface{}{
+			"temperature":     temperature,
+			"maxOutputTokens": 600,
+		}
+		if jsonMode && !isGemma && !compatMode {
+			genCfg["response_mime_type"] = "application/json"
+		}
+
+		payload := map[string]interface{}{
+			"contents":         contents,
+			"generationConfig": genCfg,
+		}
+		if !foldSystem && strings.TrimSpace(sysPrompt) != "" {
+			payload["system_instruction"] = map[string]interface{}{
+				"parts": []map[string]string{{"text": sysPrompt}},
+			}
+		}
+
+		bodyBytes, _ := json.Marshal(payload)
+		req, err := http.NewRequest("POST", endpoint, bytes.NewBuffer(bodyBytes))
+		if err != nil {
+			return "", 0, 0, nil, nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("User-Agent", "VendorWhatsAppBotNode/2.5")
+
+		client := &http.Client{Timeout: 18 * time.Second}
+		resp, err := client.Do(req)
+		if err != nil {
+			return "", 0, 0, nil, nil, err
+		}
+		respBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4*1024*1024))
+		resp.Body.Close()
+
+		if resp.StatusCode == http.StatusOK {
+			var result struct {
+				Candidates []struct {
+					Content struct {
+						Parts []struct {
+							Text string `json:"text"`
+						} `json:"parts"`
+					} `json:"content"`
+				} `json:"candidates"`
+				UsageMetadata struct {
+					TotalTokenCount int64 `json:"totalTokenCount"`
+				} `json:"usageMetadata"`
+			}
+			if err := json.Unmarshal(respBytes, &result); err == nil && len(result.Candidates) > 0 {
+				var outParts []string
+				for _, p := range result.Candidates[0].Content.Parts {
+					if strings.TrimSpace(p.Text) != "" {
+						outParts = append(outParts, p.Text)
+					}
+				}
+				content := stripThinkBlocks(strings.Join(outParts, "\n"))
+				if content != "" {
+					return content, result.UsageMetadata.TotalTokenCount, resp.StatusCode, resp.Header, respBytes, nil
+				}
+			}
+			return "", result.UsageMetadata.TotalTokenCount, resp.StatusCode, resp.Header, respBytes, fmt.Errorf("empty content from gemini model %s", model)
+		}
+		return "", 0, resp.StatusCode, resp.Header, respBytes, fmt.Errorf("gemini status %d for model %s", resp.StatusCode, model)
+	}
+
+	text, tokens, status, headers, body, err := doRequest(false)
+	// If a Gemini/Gemma model rejects system_instruction or response_mime_type with HTTP 400, retry once in compat mode
+	if err != nil && status == http.StatusBadRequest && !isGemma {
+		return doRequest(true)
+	}
+	return text, tokens, status, headers, body, err
 }

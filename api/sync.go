@@ -84,10 +84,7 @@ func BotOverviewHandler(w http.ResponseWriter, r *http.Request) {
 	subValid, subReason := vendor.IsSubscriptionValid()
 
 	bannerCached, bannerBytesSize, bannerCachedURL, bannerCachedUpdatedAt := ramstore.GlobalBannerCache.Stats()
-	aiCfgRAM := whatsapp.GetUserConfigRAM(vendor.Username)
-	groqKeys, geminiKeys, _ := whatsapp.ClassifyConfiguredAIKeys(vendor.Username, aiCfgRAM)
-	routingMode := whatsapp.GetActiveAIRoutingMode(len(groqKeys), len(geminiKeys))
-	voiceRoutingMode, voiceModels := whatsapp.GetActiveVoiceRoutingInfo(len(groqKeys), len(geminiKeys))
+	geminiPriority, groqText, groqAudio := whatsapp.GetModelPoolConfig()
 
 	respondJSON(w, 200, map[string]interface{}{
 		"status": "success",
@@ -120,13 +117,9 @@ func BotOverviewHandler(w http.ResponseWriter, r *http.Request) {
 			"backup_api_key_count":   len(ai.BackupAPIKeys),
 			"api_key_masked":         maskedKey,
 			"system_prompt":          ai.SystemPrompt,
-			"routing_mode":           routingMode,
-			"groq_key_count":         len(groqKeys),
-			"gemini_key_count":       len(geminiKeys),
-			"decision_router_active": len(geminiKeys) > 0,
-			"decision_router_model":  whatsapp.GeminiDecisionModel,
-			"voice_routing_mode":     voiceRoutingMode,
-			"voice_models":           voiceModels,
+			"gemini_priority_models": geminiPriority,
+			"groq_text_models":       groqText,
+			"groq_audio_models":      groqAudio,
 		},
 		"payment": map[string]interface{}{
 			"enabled":                  pay.Enabled || pay.PaytmMID != "" || pay.MerchantVPA != "" || pay.UPIID != "" || pay.Gateway != "",

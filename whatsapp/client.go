@@ -629,7 +629,11 @@ func extractIncomingAudioMessage(msg *waE2E.Message) *waE2E.AudioMessage {
 	return nil
 }
 
-// Voice note transcription is handled by the Octopus Voice Hand (`ExecuteVoiceNoteHand` in voice_router.go).
+// transcribeVoiceNoteGroq transcribes a customer WhatsApp voice note strictly using
+// Groq's Whisper pool (whisper-large-v3-turbo & whisper-large-v3) across all active Groq keys.
+func transcribeVoiceNoteGroq(username string, audioBytes []byte, durationSec int) string {
+	return TranscribeVoiceNoteGroqPool(username, audioBytes, durationSec)
+}
 
 func extractMessageText(msg *waE2E.Message) string {
 	if msg == nil {
@@ -917,29 +921,21 @@ func processSingleCustomerTurn(username string, client *whatsmeow.Client, msgID 
 	_ = client.MarkRead(ctxRead, []types.MessageID{msgID}, msgTime, chatJID, senderJID)
 	cancelRead()
 
-	cfg := GetUserConfigRAM(username)
-
-	// Transcribe voice note via Octopus Voice Hand (Gemini Live 2-model | Groq Whisper 2-model | Dual Rotation)
-	aiInputText := text
-	var voiceHandResult *VoiceNoteHandResult
+	// Transcribe voice note only after turn lock & 1s delay
 	if audMsg != nil {
 		audioBytes, dlErr := client.Download(context.Background(), audMsg)
 		transcript := ""
 		if dlErr == nil && len(audioBytes) > 0 {
-			vh := ExecuteVoiceNoteHand(username, cfg, audioBytes, audMsg.GetMimetype(), audMsg.GetSeconds())
-			voiceHandResult = &vh
-			transcript = strings.TrimSpace(vh.Transcript)
+			transcript = transcribeVoiceNoteGroq(username, audioBytes, int(audMsg.GetSeconds()))
 		}
 		if transcript != "" {
-			text = fmt.Sprintf("🎙️ [Voice Note]: %s", transcript)
-			aiInputText = transcript
+			text = fmt.Sprintf("[Customer Voice Note]: %s", transcript)
 		} else {
-			text = fmt.Sprintf("🎙️ [Voice Note %ds — audio unclear]", audMsg.GetSeconds())
-			aiInputText = fmt.Sprintf("Customer sent a %ds voice note that was unclear or silent. Politely ask them to type the product name or send a clearer voice note.", audMsg.GetSeconds())
+			text = fmt.Sprintf("[Customer sent a %ds Voice Note. Politely ask them to type the product name or order detail if anything is unclear.]", audMsg.GetSeconds())
 		}
 	}
 
-	if strings.TrimSpace(aiInputText) == "" {
+	if strings.TrimSpace(text) == "" {
 		return
 	}
 
@@ -949,7 +945,7 @@ func processSingleCustomerTurn(username string, client *whatsmeow.Client, msgID 
 	// Persist incoming customer message immediately into RAM (last 10 msgs/customer) BEFORE SSE push
 	SaveCustomerChatAndPrune(username, phone, "customer", text)
 	PushToLiveChat(username, phone, text, "incoming")
-	go ExtractAndPersistCustomerDetails(username, phone, aiInputText)
+	go ExtractAndPersistCustomerDetails(username, phone, text)
 
 	// Central Admin Feature Gating & Subscription Validity Check
 	if allowed, reason := ramstore.Global.CanAutoReply(); !allowed {
@@ -985,6 +981,8 @@ func processSingleCustomerTurn(username string, client *whatsmeow.Client, msgID 
 		return
 	}
 
+	cfg := GetUserConfigRAM(username)
+
 	// Natural typing indicator loop (Anti-Ban human-like pacing)
 	stopTyping := make(chan struct{})
 	go func() {
@@ -1002,7 +1000,7 @@ func processSingleCustomerTurn(username string, client *whatsmeow.Client, msgID 
 		}
 	}()
 
-	octResp, err := GenerateOctopusAIReply(username, phone, aiInputText, cfg)
+	octResp, err := GenerateOctopusAIReply(username, phone, text, cfg)
 	// Slight natural human typing pause (450ms) before stopping typing & delivering message
 	time.Sleep(450 * time.Millisecond)
 	close(stopTyping)
@@ -1010,15 +1008,6 @@ func processSingleCustomerTurn(username string, client *whatsmeow.Client, msgID 
 	if err != nil || octResp == nil {
 		log.Printf("⚠️ [Octopus AI] Error for +%s: %v", phone, err)
 		return
-	}
-	if voiceHandResult != nil && voiceHandResult.Transcript != "" {
-		octResp.Actions = append([]AIActionItem{{
-			Hand: "voice_note_transcribe",
-			Payload: &AIActionPayload{
-				Query:    voiceHandResult.Transcript,
-				Category: voiceHandResult.Provider + ":" + voiceHandResult.Model,
-			},
-		}}, octResp.Actions...)
 	}
 
 	// Execute Octopus Actions (cart variants/stock, QR, PDF, magic links, owner escalation)
