@@ -785,26 +785,30 @@ func handleWhatsAppEvents(username string, client *whatsmeow.Client, evt interfa
 		phoneToJID[senderPhone] = v.Info.Chat
 		lidCacheLock.Unlock()
 
-		// Ensure customer exists in RAM & sync to Central ONLY if brand-new or profile details changed
-		if saved, changed := ramstore.Global.UpsertCustomerWithChangeCheck(&ramstore.Customer{
-			WANumber: senderPhone,
-			JID:      v.Info.Chat.String(),
-			FullName: strings.TrimSpace(v.Info.PushName),
-			Source:   "whatsapp",
-		}); changed && saved != nil {
-			central.Client.PushCustomerAsync(saved)
-		}
+		isAdminMode := ramstore.Global.IsAdminVendorManagerMode()
 
-		// 1. Handle GPS Location Pin (read after 1s delay)
-		if lat, lng, isLoc := extractLocationCoords(v.Message); isLoc {
-			go func(id types.MessageID, ts time.Time, chat, sender types.JID, phone string, la, ln float64) {
-				time.Sleep(MessageReadDelay)
-				ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
-				_ = client.MarkRead(ctx, []types.MessageID{id}, ts, chat, sender)
-				cancel()
-				handleIncomingLocationPin(username, client, phone, la, ln)
-			}(v.Info.ID, v.Info.Timestamp, v.Info.Chat, v.Info.Sender, senderPhone, lat, lng)
-			return
+		if !isAdminMode {
+			// Ensure customer exists in RAM & sync to Central ONLY if brand-new or profile details changed
+			if saved, changed := ramstore.Global.UpsertCustomerWithChangeCheck(&ramstore.Customer{
+				WANumber: senderPhone,
+				JID:      v.Info.Chat.String(),
+				FullName: strings.TrimSpace(v.Info.PushName),
+				Source:   "whatsapp",
+			}); changed && saved != nil {
+				central.Client.PushCustomerAsync(saved)
+			}
+
+			// 1. Handle GPS Location Pin (read after 1s delay) — vendor_store delivery distance mode only
+			if lat, lng, isLoc := extractLocationCoords(v.Message); isLoc {
+				go func(id types.MessageID, ts time.Time, chat, sender types.JID, phone string, la, ln float64) {
+					time.Sleep(MessageReadDelay)
+					ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+					_ = client.MarkRead(ctx, []types.MessageID{id}, ts, chat, sender)
+					cancel()
+					handleIncomingLocationPin(username, client, phone, la, ln)
+				}(v.Info.ID, v.Info.Timestamp, v.Info.Chat, v.Info.Sender, senderPhone, lat, lng)
+				return
+			}
 		}
 
 		incomingText := extractMessageText(v.Message)
@@ -815,12 +819,20 @@ func handleWhatsAppEvents(username string, client *whatsmeow.Client, evt interfa
 			return
 		}
 
-		// 3. Handle General Customer Image (NO payment screenshot / UTR scanning — Central Brain handles 100% of payment verification)
+		// 3. Handle Incoming Image
 		if imgMsg := extractIncomingImageMessage(v.Message); imgMsg != nil {
-			if incomingText == "" {
-				incomingText = "[Customer shared an image — politely ask which product or detail they need help with; note that online payments are verified automatically by our Central payment system]"
+			if isAdminMode {
+				if incomingText == "" {
+					incomingText = "[Vendor shared an image — politely ask how WaMart Vendor Support can help with their store, plan, or bot setup]"
+				} else {
+					incomingText = fmt.Sprintf("[Vendor shared an image with caption]: %s", incomingText)
+				}
 			} else {
-				incomingText = fmt.Sprintf("[Customer shared an image with caption]: %s", incomingText)
+				if incomingText == "" {
+					incomingText = "[Customer shared an image — politely ask which product or detail they need help with; note that online payments are verified automatically by our Central payment system]"
+				} else {
+					incomingText = fmt.Sprintf("[Customer shared an image with caption]: %s", incomingText)
+				}
 			}
 		}
 
@@ -936,6 +948,13 @@ func processSingleCustomerTurn(username string, client *whatsmeow.Client, msgID 
 	}
 
 	if strings.TrimSpace(text) == "" {
+		return
+	}
+
+	// DUAL-MODE ROUTER: In admin_vendor_manager mode, disable all customer shopping/cart/catalog flows
+	// completely and route exclusively to Vendor Management Mode.
+	if ramstore.Global.IsAdminVendorManagerMode() {
+		HandleAdminVendorMessage(username, client, msgID, msgTime, chatJID, senderJID, rawMsg, phone, text)
 		return
 	}
 

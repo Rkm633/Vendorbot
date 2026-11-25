@@ -411,6 +411,9 @@ func DecodeAIConfig(raw json.RawMessage) (*AIConfig, error) {
 	if r, ok := firstRaw(m, "system_prompt", "prompt", "instructions"); ok {
 		a.SystemPrompt = ParseFlexString(r)
 	}
+	if r, ok := firstRaw(m, "store_policies", "policies", "policy"); ok {
+		a.StorePolicies = ParseFlexString(r)
+	}
 	if r, ok := firstRaw(m, "auto_reply", "ai_auto_reply", "enabled"); ok {
 		a.AutoReply = ParseFlexBool(r, true)
 	}
@@ -430,11 +433,16 @@ func DecodeBannerTemplate(raw json.RawMessage) BannerTemplate {
 	if err := json.Unmarshal(raw, &m); err != nil {
 		return tpl
 	}
+	hasExplicitEnabled := false
 	if r, ok := firstRaw(m, "enabled", "is_enabled", "active"); ok {
 		tpl.Enabled = ParseFlexBool(r, false)
+		hasExplicitEnabled = true
 	}
-	if r, ok := firstRaw(m, "banner_url", "url", "image_url"); ok {
+	if r, ok := firstRaw(m, "banner_url", "universal_qr_banner_url", "qr_banner_url", "url", "image_url"); ok {
 		tpl.BannerURL = ParseFlexString(r)
+	}
+	if !hasExplicitEnabled && strings.TrimSpace(tpl.BannerURL) != "" {
+		tpl.Enabled = true
 	}
 	if r, ok := firstRaw(m, "banner_width", "width"); ok {
 		if v := ParseFlexInt(r); v > 0 {
@@ -565,8 +573,27 @@ func DecodePaymentConfig(raw json.RawMessage) (*PaymentConfig, error) {
 			p.VerifyPollTimeoutMS = v
 		}
 	}
+	bannerExplicitlyDisabled := false
 	if r, ok := firstRaw(m, "banner_template"); ok {
+		p.BannerSpecified = true
 		p.BannerTemplate = DecodeBannerTemplate(r)
+		var btMap map[string]json.RawMessage
+		if json.Unmarshal(r, &btMap) == nil {
+			if enRaw, hasEn := firstRaw(btMap, "enabled", "is_enabled", "active"); hasEn && !ParseFlexBool(enRaw, true) {
+				bannerExplicitlyDisabled = true
+			}
+		}
+	}
+	if strings.TrimSpace(p.BannerTemplate.BannerURL) == "" {
+		if r, ok := firstRaw(m, "universal_qr_banner_url", "qr_banner_url", "banner_url"); ok {
+			p.BannerSpecified = true
+			if u := ParseFlexString(r); u != "" {
+				p.BannerTemplate.BannerURL = u
+				if !bannerExplicitlyDisabled {
+					p.BannerTemplate.Enabled = true
+				}
+			}
+		}
 	}
 	if r, ok := firstRaw(m, "gateway", "provider", "payment_gateway"); ok {
 		p.Gateway = ParseFlexString(r)
@@ -1160,12 +1187,25 @@ func DecodeBootstrapPayload(body []byte) (*BootstrapData, []string, error) {
 	result := &BootstrapData{}
 	var warnings []string
 
+	// 0. Bot Mode (top-level bot_mode, with optional fallback inside vendor object)
+	if raw, ok := firstRaw(sectionMap, "bot_mode"); ok {
+		result.BotMode = NormalizeBotMode(ParseFlexString(raw))
+	}
+
 	// 1. Vendor / Business
 	if raw, ok := firstRaw(sectionMap, "vendor", "business", "store"); ok {
 		if v, err := DecodeVendorProfile(raw); err != nil {
 			warnings = append(warnings, err.Error())
 		} else {
 			result.Vendor = v
+		}
+		if result.BotMode == "" {
+			var vm map[string]json.RawMessage
+			if json.Unmarshal(raw, &vm) == nil {
+				if bmRaw, ok2 := firstRaw(vm, "bot_mode"); ok2 {
+					result.BotMode = NormalizeBotMode(ParseFlexString(bmRaw))
+				}
+			}
 		}
 	}
 
@@ -1178,12 +1218,33 @@ func DecodeBootstrapPayload(body []byte) (*BootstrapData, []string, error) {
 		}
 	}
 
-	// 3. Payment Config
+	// 3. Payment Config (with top-level banner fallback if payment block omits it)
 	if raw, ok := firstRaw(sectionMap, "payment", "payment_config", "payment_settings"); ok {
 		if p, err := DecodePaymentConfig(raw); err != nil {
 			warnings = append(warnings, err.Error())
 		} else {
 			result.Payment = p
+		}
+	}
+	if topBanner, ok := firstRaw(sectionMap, "banner_template"); ok {
+		if result.Payment == nil {
+			def := DefaultPaymentConfig()
+			result.Payment = &def
+		}
+		if strings.TrimSpace(result.Payment.BannerTemplate.BannerURL) == "" {
+			result.Payment.BannerTemplate = DecodeBannerTemplate(topBanner)
+		}
+	}
+	if topURL, ok := firstRaw(sectionMap, "universal_qr_banner_url", "qr_banner_url"); ok {
+		if u := ParseFlexString(topURL); u != "" {
+			if result.Payment == nil {
+				def := DefaultPaymentConfig()
+				result.Payment = &def
+			}
+			if strings.TrimSpace(result.Payment.BannerTemplate.BannerURL) == "" {
+				result.Payment.BannerTemplate.BannerURL = u
+				result.Payment.BannerTemplate.Enabled = true
+			}
 		}
 	}
 
@@ -1222,6 +1283,17 @@ func DecodeBootstrapPayload(body []byte) (*BootstrapData, []string, error) {
 		} else {
 			result.WhatsAppSession = ws
 		}
+	}
+
+	// 9. Vendor Management (Admin Vendor Manager Mode)
+	if raw, ok := firstRaw(sectionMap, "vendor_management"); ok {
+		vm, w, err := DecodeVendorManagement(raw)
+		if err != nil {
+			warnings = append(warnings, err.Error())
+		} else {
+			result.VendorManagement = vm
+		}
+		warnings = append(warnings, w...)
 	}
 
 	return result, warnings, nil

@@ -76,8 +76,105 @@ interface AIConfig {
   model: string;
   temperature: number;
   system_prompt: string;
+  store_policies: string;
   auto_reply: boolean;
   import_catalog: boolean;
+}
+
+type BotMode = 'vendor_store' | 'admin_vendor_manager';
+
+interface VendorManagementSettings {
+  auto_renewal_reminders: boolean;
+  renewal_reminder_days: number[];
+  auto_onboarding_welcome: boolean;
+  whatsapp_plan_renewal_qr: boolean;
+  vendor_self_service_commands: boolean;
+  mall_approval_alerts: boolean;
+  support_escalation_phone: string;
+  welcome_template: string;
+  renewal_template: string;
+}
+
+interface OwnerPaymentGateway {
+  upi_vpa: string;
+  paytm_mid: string;
+  payee_name: string;
+}
+
+interface SubscriptionPlan {
+  id: string;
+  name: string;
+  monthly_price: number;
+  yearly_price: number;
+  validity_days: number;
+}
+
+interface ManagedVendor {
+  username: string;
+  store_name: string;
+  owner_phone: string;
+  plan_id: string;
+  plan_name: string;
+  plan_valid_until: string;
+  days_remaining: number;
+  is_plan_expired: boolean;
+  upi_id: string;
+  bot_connected: boolean;
+  bot_public_url: string;
+  store_url: string;
+}
+
+interface VendorManagementState {
+  settings: VendorManagementSettings;
+  owner_payment_gateway: OwnerPaymentGateway;
+  subscription_plans: SubscriptionPlan[];
+  managed_vendors: ManagedVendor[];
+}
+
+function normalizeBotMode(raw: unknown): BotMode {
+  const s = String(raw || '').trim().toLowerCase();
+  if (s === 'admin_vendor_manager' || s === 'admin-vendor-manager' || s === 'vendor_manager' || s === 'admin') {
+    return 'admin_vendor_manager';
+  }
+  return 'vendor_store';
+}
+
+function defaultVendorManagementState(): VendorManagementState {
+  return {
+    settings: {
+      auto_renewal_reminders: false,
+      renewal_reminder_days: [7, 3, 1],
+      auto_onboarding_welcome: false,
+      whatsapp_plan_renewal_qr: true,
+      vendor_self_service_commands: true,
+      mall_approval_alerts: false,
+      support_escalation_phone: '',
+      welcome_template: '',
+      renewal_template: '',
+    },
+    owner_payment_gateway: {
+      upi_vpa: '',
+      paytm_mid: '',
+      payee_name: 'WaMart',
+    },
+    subscription_plans: [],
+    managed_vendors: [],
+  };
+}
+
+function phoneLookupKeys(raw: string): string[] {
+  const digits = String(raw || '').replace(/\D/g, '');
+  if (!digits) return [];
+  const keys = new Set<string>();
+  keys.add(digits);
+  if (digits.length >= 10) {
+    const last10 = digits.slice(-10);
+    keys.add(last10);
+    keys.add('91' + last10);
+  }
+  const norm = normalizePhone(raw);
+  if (norm) keys.add(norm);
+  return Array.from(keys);
 }
 
 const DEFAULT_PAYTM_STATUS_URL = 'https://securegw.paytm.in/order/status';
@@ -809,6 +906,10 @@ const ramStore = {
     admin_pause_reason: '',
   } as VendorProfile,
 
+  botMode: normalizeBotMode(process.env.BOT_MODE) as BotMode,
+  vendorManagement: defaultVendorManagementState() as VendorManagementState,
+  managedVendorsByPhone: new Map<string, ManagedVendor>(),
+
   ai: {
     provider: '',
     api_key: process.env.GROQ_API_KEY || process.env.GEMINI_API_KEY || process.env.OPENAI_API_KEY || '',
@@ -817,6 +918,7 @@ const ramStore = {
     model: '',
     temperature: 0.7,
     system_prompt: '',
+    store_policies: '',
     auto_reply: true,
     import_catalog: true,
   } as AIConfig,
@@ -1210,9 +1312,120 @@ function applyAISection(a: Record<string, any>): void {
     system_prompt: firstDefined(a, 'system_prompt', 'prompt', 'instructions') !== undefined
       ? parseFlexString(firstDefined(a, 'system_prompt', 'prompt', 'instructions'))
       : curr.system_prompt,
+    store_policies: firstDefined(a, 'store_policies', 'policies') !== undefined
+      ? parseFlexString(firstDefined(a, 'store_policies', 'policies'))
+      : curr.store_policies,
     auto_reply: parseFlexBool(firstDefined(a, 'auto_reply', 'ai_auto_reply', 'enabled'), curr.auto_reply),
     import_catalog: parseFlexBool(firstDefined(a, 'import_catalog', 'import_catalog_details'), curr.import_catalog),
   };
+}
+
+function applyVendorManagementSection(vmRaw: Record<string, any>): void {
+  const prev = ramStore.vendorManagement;
+  const next: VendorManagementState = {
+    settings: { ...prev.settings },
+    owner_payment_gateway: { ...prev.owner_payment_gateway },
+    subscription_plans: [...prev.subscription_plans],
+    managed_vendors: [...prev.managed_vendors],
+  };
+
+  const sRaw = firstDefined(vmRaw, 'settings');
+  if (isPlainObject(sRaw)) {
+    const daysRaw = firstDefined(sRaw, 'renewal_reminder_days');
+    let days = next.settings.renewal_reminder_days;
+    if (Array.isArray(daysRaw)) {
+      days = daysRaw
+        .map((n) => Math.round(parseFlexNumber(n, 0)))
+        .filter((n) => n >= 0);
+    } else if (typeof daysRaw === 'string' && daysRaw.trim()) {
+      days = daysRaw
+        .split(',')
+        .map((part) => Math.round(parseFlexNumber(part.trim(), -1)))
+        .filter((n) => n >= 0);
+    }
+    next.settings = {
+      auto_renewal_reminders: parseFlexBool(firstDefined(sRaw, 'auto_renewal_reminders'), next.settings.auto_renewal_reminders),
+      renewal_reminder_days: days,
+      auto_onboarding_welcome: parseFlexBool(firstDefined(sRaw, 'auto_onboarding_welcome'), next.settings.auto_onboarding_welcome),
+      whatsapp_plan_renewal_qr: parseFlexBool(firstDefined(sRaw, 'whatsapp_plan_renewal_qr'), next.settings.whatsapp_plan_renewal_qr),
+      vendor_self_service_commands: parseFlexBool(firstDefined(sRaw, 'vendor_self_service_commands'), next.settings.vendor_self_service_commands),
+      mall_approval_alerts: parseFlexBool(firstDefined(sRaw, 'mall_approval_alerts'), next.settings.mall_approval_alerts),
+      support_escalation_phone: firstDefined(sRaw, 'support_escalation_phone') !== undefined
+        ? parseFlexString(firstDefined(sRaw, 'support_escalation_phone'))
+        : next.settings.support_escalation_phone,
+      welcome_template: firstDefined(sRaw, 'welcome_template') !== undefined
+        ? parseFlexString(firstDefined(sRaw, 'welcome_template'))
+        : next.settings.welcome_template,
+      renewal_template: firstDefined(sRaw, 'renewal_template') !== undefined
+        ? parseFlexString(firstDefined(sRaw, 'renewal_template'))
+        : next.settings.renewal_template,
+    };
+  }
+
+  const gwRaw = firstDefined(vmRaw, 'owner_payment_gateway', 'payment_gateway');
+  if (isPlainObject(gwRaw)) {
+    next.owner_payment_gateway = {
+      upi_vpa: firstDefined(gwRaw, 'upi_vpa', 'upi_id', 'vpa', 'merchant_vpa') !== undefined
+        ? parseFlexString(firstDefined(gwRaw, 'upi_vpa', 'upi_id', 'vpa', 'merchant_vpa'))
+        : next.owner_payment_gateway.upi_vpa,
+      paytm_mid: firstDefined(gwRaw, 'paytm_mid', 'mid', 'merchant_id') !== undefined
+        ? parseFlexString(firstDefined(gwRaw, 'paytm_mid', 'mid', 'merchant_id'))
+        : next.owner_payment_gateway.paytm_mid,
+      payee_name: firstDefined(gwRaw, 'payee_name', 'merchant_name') !== undefined
+        ? parseFlexString(firstDefined(gwRaw, 'payee_name', 'merchant_name'))
+        : next.owner_payment_gateway.payee_name || 'WaMart',
+    };
+  }
+
+  const plansRaw = firstDefined(vmRaw, 'subscription_plans', 'plans');
+  if (Array.isArray(plansRaw)) {
+    next.subscription_plans = plansRaw
+      .filter((p) => isPlainObject(p))
+      .map((p: Record<string, any>) => ({
+        id: parseFlexString(firstDefined(p, 'id', 'plan_id')),
+        name: parseFlexString(firstDefined(p, 'name', 'plan_name')),
+        monthly_price: parseFlexNumber(firstDefined(p, 'monthly_price', 'price'), 0),
+        yearly_price: parseFlexNumber(firstDefined(p, 'yearly_price'), 0),
+        validity_days: Math.round(parseFlexNumber(firstDefined(p, 'validity_days', 'duration_days'), 30)),
+      }))
+      .filter((p) => Boolean(p.id || p.name));
+  }
+
+  const vendorsRaw = firstDefined(vmRaw, 'managed_vendors', 'vendors');
+  if (Array.isArray(vendorsRaw)) {
+    next.managed_vendors = vendorsRaw
+      .filter((v) => isPlainObject(v))
+      .map((v: Record<string, any>) => ({
+        username: parseFlexString(firstDefined(v, 'username')),
+        store_name: parseFlexString(firstDefined(v, 'store_name', 'business_name', 'name')),
+        owner_phone: parseFlexString(firstDefined(v, 'owner_phone', 'phone', 'notification_phone')),
+        plan_id: parseFlexString(firstDefined(v, 'plan_id')),
+        plan_name: parseFlexString(firstDefined(v, 'plan_name')),
+        plan_valid_until: parseFlexString(firstDefined(v, 'plan_valid_until', 'subscription_valid_until')),
+        days_remaining: Math.round(parseFlexNumber(firstDefined(v, 'days_remaining'), 0)),
+        is_plan_expired: parseFlexBool(firstDefined(v, 'is_plan_expired'), false),
+        upi_id: parseFlexString(firstDefined(v, 'upi_id', 'merchant_vpa')),
+        bot_connected: parseFlexBool(firstDefined(v, 'bot_connected'), false),
+        bot_public_url: parseFlexString(firstDefined(v, 'bot_public_url')),
+        store_url: parseFlexString(firstDefined(v, 'store_url')),
+      }));
+  }
+
+  ramStore.vendorManagement = next;
+  ramStore.managedVendorsByPhone.clear();
+  for (const mv of next.managed_vendors) {
+    for (const key of phoneLookupKeys(mv.owner_phone)) {
+      ramStore.managedVendorsByPhone.set(key, mv);
+    }
+  }
+}
+
+function lookupManagedVendorByPhone(phone: string): ManagedVendor | undefined {
+  for (const key of phoneLookupKeys(phone)) {
+    const found = ramStore.managedVendorsByPhone.get(key);
+    if (found) return found;
+  }
+  return undefined;
 }
 
 // Ultra-Low-RAM Blank Banner Raw Compressed Buffer Cache (~150-300 KB max, NEVER decoded RGBA bitmap)
@@ -1375,15 +1588,17 @@ function applyPaymentSection(p: Record<string, any>): void {
   const parsedTimeout = pollTimeoutRaw !== undefined ? Math.round(parseFlexNumber(pollTimeoutRaw, curr.verify_poll_timeout_ms || DEFAULT_VERIFY_POLL_TIMEOUT_MS)) : (curr.verify_poll_timeout_ms || DEFAULT_VERIFY_POLL_TIMEOUT_MS);
   const verifyPollTimeoutMs = parsedTimeout > 0 ? parsedTimeout : DEFAULT_VERIFY_POLL_TIMEOUT_MS;
 
-  // Parse payment.banner_template (preserving explicit 0 values for offset/padding)
+  // Parse payment.banner_template + universal_qr_banner_url / qr_banner_url fallbacks (preserving explicit 0 values for offset/padding)
   const currTpl = curr.banner_template || defaultBannerTemplate();
   let bannerTemplate: BannerTemplate = { ...currTpl };
   const rawTpl = firstDefined(p, 'banner_template');
-  if (rawTpl === null) {
+  const fallbackBannerUrl = parseFlexString(firstDefined(p, 'universal_qr_banner_url', 'qr_banner_url', 'banner_url')).trim();
+  if (rawTpl === null && !fallbackBannerUrl) {
     bannerTemplate = defaultBannerTemplate();
   } else if (isPlainObject(rawTpl)) {
     const tEnabled = parseFlexBoolOpt(firstDefined(rawTpl, 'enabled'));
-    const tUrlRaw = firstDefined(rawTpl, 'banner_url', 'url');
+    const tUrlRaw = firstDefined(rawTpl, 'banner_url', 'universal_qr_banner_url', 'qr_banner_url', 'url');
+    const nextBannerUrl = tUrlRaw !== undefined ? parseFlexString(tUrlRaw) : (fallbackBannerUrl || currTpl.banner_url);
     const tW = parseOptionalInt(firstDefined(rawTpl, 'banner_width', 'width'));
     const tH = parseOptionalInt(firstDefined(rawTpl, 'banner_height', 'height'));
     const tSize = parseOptionalInt(firstDefined(rawTpl, 'qr_size'));
@@ -1393,8 +1608,8 @@ function applyPaymentSection(p: Record<string, any>): void {
     const tUpdRaw = firstDefined(rawTpl, 'updated_at');
 
     bannerTemplate = {
-      enabled: tEnabled !== undefined ? tEnabled : currTpl.enabled,
-      banner_url: tUrlRaw !== undefined ? parseFlexString(tUrlRaw) : currTpl.banner_url,
+      enabled: tEnabled !== undefined ? tEnabled : (nextBannerUrl ? true : currTpl.enabled),
+      banner_url: nextBannerUrl,
       banner_width: tW !== undefined ? tW : currTpl.banner_width,
       banner_height: tH !== undefined ? tH : currTpl.banner_height,
       qr_size: tSize !== undefined && tSize > 0 ? tSize : (currTpl.qr_size || DEFAULT_BANNER_QR_SIZE),
@@ -1402,6 +1617,12 @@ function applyPaymentSection(p: Record<string, any>): void {
       qr_offset_y: tOffY !== undefined ? tOffY : currTpl.qr_offset_y,
       qr_padding: tPad !== undefined && tPad >= 0 ? tPad : currTpl.qr_padding,
       updated_at: tUpdRaw !== undefined ? parseFlexString(tUpdRaw) : currTpl.updated_at,
+    };
+  } else if (fallbackBannerUrl) {
+    bannerTemplate = {
+      ...currTpl,
+      enabled: true,
+      banner_url: fallbackBannerUrl,
     };
   }
 
@@ -1445,6 +1666,13 @@ function hydrateRAM(payload: any): { warnings: string[] } {
     ? { ...payload, ...payload.data }
     : payload;
 
+  // 0. Bot Mode (vendor_store vs admin_vendor_manager)
+  const vRawForMode = firstDefined(data, 'vendor', 'business', 'store');
+  const rawMode = firstDefined(data, 'bot_mode') ?? (isPlainObject(vRawForMode) ? firstDefined(vRawForMode, 'bot_mode') : undefined);
+  if (rawMode !== undefined && String(rawMode).trim()) {
+    ramStore.botMode = normalizeBotMode(rawMode);
+  }
+
   // 1. Vendor / Business
   const vRaw = firstDefined(data, 'vendor', 'business', 'store');
   if (vRaw !== undefined) {
@@ -1467,14 +1695,30 @@ function hydrateRAM(payload: any): { warnings: string[] } {
     }
   }
 
-  // 3. Payment Config
+  // 3. Payment Config (also supports top-level universal_qr_banner_url / qr_banner_url fallbacks)
   const payRaw = firstDefined(data, 'payment', 'payment_config', 'payment_settings');
-  if (payRaw !== undefined) {
+  const topBannerFallback = parseFlexString(firstDefined(data, 'universal_qr_banner_url', 'qr_banner_url')).trim();
+  if (payRaw !== undefined || topBannerFallback) {
     try {
-      if (!isPlainObject(payRaw)) throw new Error('payment section is not a JSON object');
-      applyPaymentSection(payRaw);
+      if (payRaw !== undefined && !isPlainObject(payRaw)) throw new Error('payment section is not a JSON object');
+      const mergedPay = isPlainObject(payRaw) ? { ...payRaw } : {};
+      if (topBannerFallback && !mergedPay.universal_qr_banner_url) {
+        mergedPay.universal_qr_banner_url = topBannerFallback;
+      }
+      applyPaymentSection(mergedPay);
     } catch (err: any) {
       warnings.push(`payment: ${err?.message || String(err)}`);
+    }
+  }
+
+  // 3b. Vendor Management State (Admin Vendor Manager mode)
+  const vmRaw = firstDefined(data, 'vendor_management');
+  if (vmRaw !== undefined) {
+    try {
+      if (!isPlainObject(vmRaw)) throw new Error('vendor_management section is not a JSON object');
+      applyVendorManagementSection(vmRaw);
+    } catch (err: any) {
+      warnings.push(`vendor_management: ${err?.message || String(err)}`);
     }
   }
 
@@ -1609,6 +1853,8 @@ function getStats() {
     conversations: ramStore.chats.size,
     leads: ramStore.leads.length,
     media_cache_entries: mediaThumbCache.size,
+    managed_vendors: ramStore.vendorManagement.managed_vendors.length,
+    subscription_plans: ramStore.vendorManagement.subscription_plans.length,
   };
 }
 
@@ -1700,7 +1946,8 @@ async function bootstrapFromCentral(): Promise<{ ok: boolean; error?: string }> 
   try {
     const bootstrapPayload = {
       bot_public_url: botPublicURL,
-      node_version: '2.4-qr-banner-payment-polling',
+      bot_mode: ramStore.botMode,
+      node_version: '2.5-dual-mode-vendor-manager',
       capabilities: [
         'auto_public_url',
         'zero_downtime_redeploy',
@@ -1715,6 +1962,7 @@ async function bootstrapFromCentral(): Promise<{ ok: boolean; error?: string }> 
         'central_controlled_checkout',
         'branded_banner_qr_only',
         'payment_verify_polling',
+        'dual_mode_admin_vendor_manager',
       ],
       timestamp: new Date().toISOString(),
     };
@@ -2538,15 +2786,44 @@ const RAG_STOP_WORDS = new Set([
   'haan', 'han', 'yes', 'nahi', 'hello', 'namaste', 'confirm', 'address', 'delivery',
 ]);
 
-function formatCompactProductLine(p: Product): string {
-  const cat = (p.category || 'General').trim();
+class ProductAliasMap {
+  private realToAlias = new Map<string, string>();
+  private aliasToReal = new Map<string, string>();
+  private nextNum = 1;
+
+  register(realID: string): string {
+    const clean = String(realID || '').trim();
+    if (!clean) return '';
+    const existing = this.realToAlias.get(clean);
+    if (existing) return existing;
+    const num = this.nextNum++;
+    const alias = `P${num}`;
+    this.realToAlias.set(clean, alias);
+    this.aliasToReal.set(alias.toLowerCase(), clean);
+    this.aliasToReal.set(String(num), clean);
+    return alias;
+  }
+
+  resolve(idOrAlias: string): string {
+    const raw = String(idOrAlias || '').trim();
+    if (!raw) return raw;
+    const key = raw.replace(/^#/, '').toLowerCase();
+    return this.aliasToReal.get(key) || raw;
+  }
+
+  count(): number {
+    return this.realToAlias.size;
+  }
+}
+
+function formatCompactProductLine(p: Product, aliases?: ProductAliasMap): string {
+  const idLabel = aliases ? aliases.register(p.id) : p.id;
   const unit = p.unit_type && p.unit_type !== 'custom' && p.unit_type !== 'piece' ? `/${p.unit_type}` : '';
   const vars = (p.variants || [])
     .filter((v) => isVariantInStock(v))
     .map((v) => `${v.name}=${formatRupeeCompact(effectivePrice(p, v))}`);
   const varStr = vars.length > 0 ? `|v:${vars.join(',')}` : '';
-  const imgStr = p.thumb_url || p.image_url || (p.images && p.images.length > 0) ? '|img' : '';
-  return `${p.id}|${p.name}|${cat}|₹${formatRupeeCompact(effectivePrice(p))}${unit}${varStr}${imgStr}`;
+  return `${idLabel}|${p.name}|₹${formatRupeeCompact(effectivePrice(p))}${unit}${varStr}`;
 }
 
 // =============================================================================
@@ -2875,11 +3152,39 @@ function isPureCheckoutOrProfileMessage(msg: string, hasCart: boolean): boolean 
   return toks.every((t) => /^\d+$/.test(t) || CHECKOUT_ONLY_WORDS.has(t) || FILLER_ORDER_WORDS.has(t) || RAG_STOP_WORDS.has(t));
 }
 
+const EXPLICIT_MENU_WORDS = new Set([
+  'menu', 'list', 'catalog', 'catalogue', 'all', 'sab', 'sabhi', 'saare', 'sare',
+  'dikhao', 'items', 'products', 'available', 'options', 'kya',
+]);
+
+function isExplicitFullMenuRequest(msg: string): boolean {
+  const low = msg.toLowerCase();
+  if (low.includes('kya kya') || low.includes('all item') || low.includes('sab dikha') || low.includes('full menu')) {
+    return true;
+  }
+  const toks = tokenizeClean(low);
+  let hits = 0;
+  for (const t of toks) {
+    if (t === 'menu' || t === 'catalog' || t === 'catalogue' || t === 'list') return true;
+    if (EXPLICIT_MENU_WORDS.has(t)) hits++;
+  }
+  return hits >= 2;
+}
+
+function hasDirectProductMatch(inStockProducts: Product[], query: string): boolean {
+  if (inStockProducts.length === 0) return false;
+  const { tokens, unitHint } = extractSearchTokensAndHint(query);
+  if (tokens.length === 0) return false;
+  const indexed = buildIndexedProducts(inStockProducts);
+  return indexed.some((ip) => scoreIndexedProduct(ip, query, tokens, unitHint) >= 6);
+}
+
 function buildSmartCompactInventory(
   inStockProducts: Product[],
   query: string,
   history: Array<{ role: string; content: string }>,
-  cartProductIDs: Set<string>
+  cartProductIDs: Set<string>,
+  aliases?: ProductAliasMap
 ): string {
   if (inStockProducts.length === 0) return 'INV: No in-stock items loaded yet.';
 
@@ -2894,13 +3199,15 @@ function buildSmartCompactInventory(
     .map(([c, list]) => `${c}(${list.length})`)
     .join(', ');
 
-  if (inStockProducts.length <= 18) {
-    return `CATS: ${catSummary}\nINV(id|name|cat|price|vars):\n${inStockProducts.map(formatCompactProductLine).join('\n')}`;
-  }
-
   const cartProds = inStockProducts.filter((p) => cartProductIDs.has(p.id));
   if (isPureCheckoutOrProfileMessage(query, cartProds.length > 0)) {
-    return `CATS: ${catSummary}\nINV(checkout mode — cart items only):\n${cartProds.map(formatCompactProductLine).join('\n')}`;
+    return `CATS: ${catSummary}\nINV(checkout mode — cart items only):\n${cartProds.map((p) => formatCompactProductLine(p, aliases)).join('\n')}`;
+  }
+
+  // Small catalog (<= 15 items): dump ALL compactly ONLY when customer explicitly asks for menu/all items;
+  // otherwise let precision matching below send ONLY the 1-6 relevant items!
+  if (inStockProducts.length <= 15 && isExplicitFullMenuRequest(query)) {
+    return `CATS: ${catSummary}\nINV(id|name|₹price|vars):\n${inStockProducts.map((p) => formatCompactProductLine(p, aliases)).join('\n')}`;
   }
 
   const indexed = buildIndexedProducts(inStockProducts);
@@ -2928,7 +3235,7 @@ function buildSmartCompactInventory(
       const top = scored[0];
       const isClear = top.score >= 12 && (scored.length === 1 || top.score >= scored[1].score + 6);
       if (isClear) {
-        clearLines.push(`• ${chunk} => ${formatCompactProductLine(top.ip.p)}`);
+        clearLines.push(`• ${chunk} => ${formatCompactProductLine(top.ip.p, aliases)}`);
         if (!includedIds.has(top.ip.p.id)) {
           includedIds.add(top.ip.p.id);
           totalLines++;
@@ -2938,7 +3245,7 @@ function buildSmartCompactInventory(
         const opts: string[] = [];
         for (let k = 0; k < limit; k++) {
           if (totalLines >= 42 && !includedIds.has(scored[k].ip.p.id)) break;
-          opts.push(formatCompactProductLine(scored[k].ip.p));
+          opts.push(formatCompactProductLine(scored[k].ip.p, aliases));
           if (!includedIds.has(scored[k].ip.p.id)) {
             includedIds.add(scored[k].ip.p.id);
             totalLines++;
@@ -2953,7 +3260,7 @@ function buildSmartCompactInventory(
       if (clearLines.length > 0) parts.push(`CLEAR_MATCH(ready to add):\n${clearLines.join('\n')}`);
       if (optionLines.length > 0) parts.push(`VARIETY_OPTIONS(ask/pick best):\n${optionLines.join('\n')}`);
       if (unmatched.length > 0) parts.push(`UNMATCHED(use search_catalog if indirect need, else inform): ${unmatched.join(', ')}`);
-      const extraCart = cartProds.filter((cp) => !includedIds.has(cp.id)).map(formatCompactProductLine);
+      const extraCart = cartProds.filter((cp) => !includedIds.has(cp.id)).map((p) => formatCompactProductLine(p, aliases));
       if (extraCart.length > 0) parts.push(`IN_CART_REF:\n${extraCart.join('\n')}`);
       return parts.join('\n');
     }
@@ -2980,15 +3287,16 @@ function buildSmartCompactInventory(
       : [];
 
   for (const item of scored) {
-    if (selected.length >= 14) break;
+    if (selected.length >= 10) break;
     selectedIds.add(item.ip.p.id);
     selected.push(item.ip.p);
   }
 
-  if (selected.length < 6) {
+  if (selected.length === 0 || (scored.length === 0 && isExplicitFullMenuRequest(query))) {
+    const maxShow = isExplicitFullMenuRequest(query) ? 10 : 5;
     const cats = Array.from(catBuckets.values());
     let round = 0;
-    while (selected.length < 8) {
+    while (selected.length < maxShow) {
       let added = false;
       for (const bucket of cats) {
         if (round < bucket.length) {
@@ -2997,7 +3305,7 @@ function buildSmartCompactInventory(
             selectedIds.add(p.id);
             selected.push(p);
             added = true;
-            if (selected.length >= 8) break;
+            if (selected.length >= maxShow) break;
           }
         }
       }
@@ -3008,12 +3316,12 @@ function buildSmartCompactInventory(
 
   const hint =
     scored.length === 0 && tokens.length > 0
-      ? '\nHINT: 0 direct keyword hits. If customer described a need/use-case, call search_catalog hand with product keywords or categories from CATS.'
+      ? '\nHINT: 0 direct hits. If indirect need, call search_catalog with keywords/CATS.'
       : '';
-  return `CATS: ${catSummary}\nINV(showing ${selected.length}/${inStockProducts.length} relevant; id|name|cat|price|vars):\n${selected.map(formatCompactProductLine).join('\n')}${hint}`;
+  return `CATS: ${catSummary}\nINV(${selected.length}/${inStockProducts.length}; id|name|₹price|vars):\n${selected.map((p) => formatCompactProductLine(p, aliases)).join('\n')}${hint}`;
 }
 
-function executeSearchCatalogHand(inStockProducts: Product[], queries: string[], categories: string[]): string {
+function executeSearchCatalogHand(inStockProducts: Product[], queries: string[], categories: string[], aliases?: ProductAliasMap): string {
   if (inStockProducts.length === 0) return 'SEARCH_RESULTS: No in-stock products available.';
   const indexed = buildIndexedProducts(inStockProducts);
   const cleanCats = categories.map((c) => c.toLowerCase().trim()).filter(Boolean);
@@ -3030,12 +3338,132 @@ function executeSearchCatalogHand(inStockProducts: Product[], queries: string[],
     })
     .filter((x) => x.score > 0)
     .sort((a, b) => b.score - a.score)
-    .slice(0, 15);
+    .slice(0, 12);
 
   if (results.length === 0) {
-    return `SEARCH_RESULTS(0 matches): None of those exact items are currently in stock. Politely inform customer and suggest available categories from CATS.`;
+    return `SEARCH_RESULTS(0 matches): Not in stock. Politely inform & suggest CATS.`;
   }
-  return `SEARCH_RESULTS(${results.length} in-stock matches; id|name|cat|price|vars):\n${results.map((r) => formatCompactProductLine(r.p)).join('\n')}`;
+  return `SEARCH_RESULTS(${results.length}; id|name|₹price|vars):\n${results.map((r) => formatCompactProductLine(r.p, aliases)).join('\n')}`;
+}
+
+// =============================================================================
+// MICRO-CAPSULE ADAPTIVE CONTEXT ENGINE (MCACE v3 — Mirrors Go micro_capsule.go)
+// =============================================================================
+
+type TurnCapsule = 'GREETING' | 'CHITCHAT_INFO' | 'PAYMENT_PENDING' | 'CHECKOUT' | 'SHOPPING';
+
+const PURE_GREETING_WORDS = new Set([
+  'hi', 'hii', 'hiii', 'hiiii', 'hey', 'heyy', 'hello', 'helo', 'hlo', 'hlw', 'hola', 'yo',
+  'namaste', 'namaskar', 'namastey', 'pranam', 'pranaam', 'ram', 'radhe', 'jai', 'shri',
+  'salam', 'salaam', 'assalam', 'assalamu', 'alaikum', 'walaikum', 'sat', 'akal',
+  'good', 'morning', 'afternoon', 'evening', 'night', 'gm', 'gn',
+  'ji', 'sir', 'madam', 'mam', 'maam', 'bhai', 'bhaiya', 'bro', 'didi', 'boss', 'friend', 'dear',
+  'shop', 'store', 'kaise', 'kese', 'ho', 'hai', 'hain', 'aap', 'tum', 'kya', 'haal', 'hal', 'chal', 'chaal',
+  'start', 'test', 'how', 'are', 'you', 'there', 'anyone', 'koi',
+]);
+
+const PURE_ACK_WORDS = new Set([
+  'ok', 'okay', 'okk', 'okkk', 'k', 'kk', 'ji', 'haan', 'han', 'ha', 'yes', 'yep', 'yup',
+  'hmm', 'hm', 'hmmm', 'thik', 'theek', 'thk', 'sahi', 'achha', 'accha', 'acha', 'nice', 'great',
+  'good', 'cool', 'awesome', 'super', 'perfect', 'fine', 'done', 'sure',
+  'thanks', 'thank', 'thankyou', 'ty', 'thx', 'tq', 'dhanyawad', 'dhanyavaad', 'shukriya', 'welcome',
+  'bye', 'byee', 'alvida', 'later', 'baad', 'me', 'mein', 'sir', 'bhai', 'bhaiya', 'bro', 'hai',
+]);
+
+const STORE_INFO_KEYWORDS = new Set([
+  'timing', 'timings', 'time', 'hours', 'open', 'close', 'closed', 'khula', 'khulta', 'khulti', 'band', 'kab',
+  'delivery', 'charge', 'charges', 'fee', 'free', 'radius', 'minimum', 'min', 'policy', 'return', 'refund', 'exchange',
+  'website', 'site', 'link', 'url', 'mall', 'app', 'location', 'address', 'kahan', 'kaha', 'where', 'dukaan', 'dukan',
+  'owner', 'malik', 'manager', 'human', 'agent', 'call', 'contact', 'number', 'support', 'help', 'complaint', 'shikayat',
+  'damaged', 'kharab', 'wrong', 'galat', 'cod', 'cash', 'upi', 'online',
+]);
+
+const SHOPPING_FORCE_WORDS = new Set([
+  'menu', 'list', 'catalog', 'catalogue', 'item', 'items', 'product', 'products', 'saman', 'saaman',
+  'rate', 'rates', 'price', 'prices', 'kitna', 'kitne', 'bhav', 'daam', 'dam',
+  'photo', 'photos', 'pic', 'pics', 'image', 'images', 'dikhao', 'dikha',
+  'chahiye', 'chaiye', 'bhejo', 'bhej', 'dena', 'dedo', 'lana', 'kharidna', 'buy', 'order', 'cart', 'add', 'remove', 'hatao',
+  'available', 'stock', 'milega', 'milta', 'variety', 'brand', 'brands', 'pack', 'packet', 'kg', 'gm', 'litre',
+  'guest', 'mehmaan', 'mehman', 'party', 'snacks', 'nashta', 'breakfast', 'khansi', 'cough', 'dard', 'bukhar', 'fever', 'pooja', 'puja',
+]);
+
+const capsuleTelemetry = {
+  totalTurns: 0,
+  totalEstInTok: 0,
+  perCapsule: {} as Record<string, number>,
+};
+
+function classifyTurnCapsule(query: string, currentState: string, hasCart: boolean, hasProdMatch: boolean): TurnCapsule {
+  const toks = tokenizeClean(query);
+  if (hasProdMatch) return 'SHOPPING';
+  const hasShopWord = toks.some((t) => SHOPPING_FORCE_WORDS.has(t));
+  const hasDigit = toks.some((t) => /\d/.test(t));
+
+  if (currentState === 'PAYMENT_PENDING' && !hasShopWord) return 'PAYMENT_PENDING';
+  if (toks.length > 0 && toks.length <= 5 && !hasDigit && !hasShopWord && toks.every((t) => PURE_GREETING_WORDS.has(t))) {
+    return 'GREETING';
+  }
+  if (toks.length === 0 && query.trim() !== '' && !hasCart) return 'GREETING';
+  if (hasCart && isPureCheckoutOrProfileMessage(query, true)) return 'CHECKOUT';
+  if (toks.length > 0 && toks.length <= 4 && !hasDigit && !hasShopWord && toks.every((t) => PURE_ACK_WORDS.has(t))) {
+    return hasCart ? 'CHECKOUT' : 'CHITCHAT_INFO';
+  }
+  if (!hasShopWord && !hasCart && toks.length > 0 && toks.length <= 12 && toks.some((t) => STORE_INFO_KEYWORDS.has(t))) {
+    return 'CHITCHAT_INFO';
+  }
+  return 'SHOPPING';
+}
+
+function stripDecorForPastTurn(s: string): string {
+  return s
+    .replace(/\r/g, '')
+    .split('\n')
+    .map((ln) => ln.trim().replace(/^[>•\-*\s]+/, ''))
+    .filter(Boolean)
+    .join(' | ')
+    .replace(/[*_~]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function buildGreetingHighlightsTS(products: Product[]): { catsLine: string; topSample: string } {
+  if (products.length === 0) return { catsLine: '', topSample: '' };
+  const catCounts = new Map<string, number>();
+  const catFirst = new Map<string, Product>();
+  for (const p of products) {
+    const c = (p.category || 'General').trim();
+    if (!catCounts.has(c)) catFirst.set(c, p);
+    catCounts.set(c, (catCounts.get(c) || 0) + 1);
+  }
+  const catEntries = Array.from(catCounts.entries());
+  const catsLine =
+    catEntries.length > 10
+      ? `${catEntries.slice(0, 10).map(([c, n]) => `${c}(${n})`).join(', ')}, +${catEntries.length - 10} more`
+      : catEntries.map(([c, n]) => `${c}(${n})`).join(', ');
+  const picks: string[] = [];
+  for (const p of catFirst.values()) {
+    if (picks.length >= 3) break;
+    picks.push(`${p.name.trim()} ₹${formatRupeeCompact(effectivePrice(p))}`);
+  }
+  for (const p of products) {
+    if (picks.length >= 3) break;
+    const entry = `${p.name.trim()} ₹${formatRupeeCompact(effectivePrice(p))}`;
+    if (!picks.includes(entry)) picks.push(entry);
+  }
+  return { catsLine, topSample: picks.join(' | ') };
+}
+
+function resolveActionAliases(actions: Array<{ hand: string; payload?: any }>, aliases: ProductAliasMap) {
+  if (!aliases || aliases.count() === 0) return;
+  for (const act of actions) {
+    if (act.payload && Array.isArray(act.payload.cart_items)) {
+      for (const item of act.payload.cart_items) {
+        if (item && typeof item.id === 'string') {
+          item.id = aliases.resolve(item.id);
+        }
+      }
+    }
+  }
 }
 
 async function callGroqPool(
@@ -3474,56 +3902,104 @@ async function runOctopusAI(
   const currentCart = ramStore.activeCarts.get(cleanPhone) || [];
   const cust = ramStore.customers.get(cleanPhone);
 
-  // 3. Compact 6-Message Sliding Window + Smart Single-Pass RAG + Groq 3-Model TPD/TPM Pool
+  // 3. Micro-Capsule Adaptive Context Engine (MCACE v3) + Multi-Key Model Pools
   if (candidateKeys.length > 0) {
-    const rawHistory = (ramStore.chats.get(cleanPhone) || []).slice(-(MAX_LLM_HISTORY_MESSAGES - 1));
-    const llmHistory: Array<{ role: string; content: string }> = rawHistory.map((m) => {
-      const role = m.role === 'assistant' || m.direction.startsWith('outgoing') ? 'assistant' : 'user';
-      return { role, content: compactStr(m.text, role === 'assistant' ? 160 : 200) };
-    });
+    const allChat = ramStore.chats.get(cleanPhone) || [];
+    const hasCart = currentCart.length > 0;
+    const currentState = hasCart ? 'CART_ACTIVE' : 'BROWSING';
+    const hasProdMatch = hasDirectProductMatch(inStockProducts, query);
+    const capsule = classifyTurnCapsule(query, currentState, hasCart, hasProdMatch);
+    const maxHist =
+      capsule === 'GREETING' ? 1 : capsule === 'CHITCHAT_INFO' ? 2 : capsule === 'PAYMENT_PENDING' ? 3 : capsule === 'CHECKOUT' ? 4 : hasCart ? MAX_LLM_HISTORY_MESSAGES : 4;
+
+    const rawHistory = allChat.slice(-(Math.max(1, maxHist) - 1));
+    const llmHistory: Array<{ role: string; content: string }> =
+      maxHist === 1
+        ? []
+        : rawHistory.map((m) => {
+            const role = m.role === 'assistant' || m.direction.startsWith('outgoing') ? 'assistant' : 'user';
+            const content = role === 'assistant' ? compactStr(stripDecorForPastTurn(m.text), 90) : compactStr(m.text, 120);
+            return { role, content };
+          });
     if (llmHistory.length === 0 || llmHistory[llmHistory.length - 1].content !== compactStr(query, 500)) {
       llmHistory.push({ role: 'user', content: compactStr(query, 500) });
     }
-    const finalHistory = llmHistory.slice(-MAX_LLM_HISTORY_MESSAGES);
+    const finalHistory = llmHistory.slice(-maxHist);
 
-    const cartProductIDs = new Set(currentCart.map((c) => c.product_id));
-    const inventoryBlock = buildSmartCompactInventory(inStockProducts, query, finalHistory, cartProductIDs);
+    const aliases = new ProductAliasMap();
+    const isFirstTurn = allChat.length <= 1;
+    const firstTip = isFirstTurn ? '\nFirst chat: warmly ask them to type their full request in one message.' : '';
+    const vendorNote = ramStore.ai.system_prompt ? `\nNOTE: ${compactStr(ramStore.ai.system_prompt, 180)}` : '';
+    const bName = ramStore.vendor.business_name || 'Vendor Store';
+    const bType = ramStore.vendor.business_type || 'Retail Store';
+    const lang = ramStore.vendor.language || 'Hinglish';
+    const payMode = ramStore.vendor.allow_cod ? 'COD+ONLINE' : 'ONLINE_ONLY';
+    const storeLine = `Hrs:${ramStore.vendor.operating_hours}|ETA:${ramStore.vendor.estimated_delivery_time}|Min₹${formatRupeeCompact(ramStore.vendor.min_order_amount)}|Pay:${payMode}`;
+
     const cartTotal = currentCart.reduce((sum, it) => sum + it.line_total, 0);
-    const cartLine =
-      currentCart.length > 0
-        ? `CART(₹${formatRupeeCompact(cartTotal)}): ${currentCart
-            .map((c) => `${c.product_id} ${c.product_name}${c.selected_variant ? `[${c.selected_variant}]` : ''} x${c.qty}=₹${formatRupeeCompact(c.line_total)}`)
-            .join('; ')}`
-        : 'CART:empty';
+    const cartLine = hasCart
+      ? `CART(₹${formatRupeeCompact(cartTotal)}): ${currentCart
+          .map((c) => `${aliases.register(c.product_id)} ${c.product_name}${c.selected_variant ? `[${c.selected_variant}]` : ''} x${c.qty}=₹${formatRupeeCompact(c.line_total)}`)
+          .join('; ')}`
+      : 'CART:empty';
     const profParts: string[] = [];
     if (cust?.full_name) profParts.push(`Name=${cust.full_name}`);
-    if (cust?.delivery_address) profParts.push(`Addr=${compactStr(cust.delivery_address, 120)}`);
+    if (cust?.delivery_address) profParts.push(`Addr=${compactStr(cust.delivery_address, 110)}`);
     if (cust?.contact_phone) profParts.push(`Ph=${cust.contact_phone}`);
-    profParts.push(`WA=${cleanPhone}`);
+    const custLine = profParts.length > 0 ? `\nCUST:${profParts.join('|')}` : '';
 
-    const payMode = ramStore.vendor.allow_cod ? 'COD+ONLINE' : 'ONLINE ONLY';
-    const systemPrompt = `You are the warm, lively, human-like WhatsApp shop assistant for "${ramStore.vendor.business_name}" (${ramStore.vendor.business_type}).
-Policy: ${compactStr(ramStore.vendor.store_policies || 'Standard delivery & returns.', 180)}
-Reply strictly in: ${ramStore.vendor.language || 'Hinglish'}.
+    let basePrompt = '';
+    let invBlock = '';
 
-OUTPUT ONLY RAW JSON:
-{"ai_reply_text":"...","quote_reply":false,"actions":[{"hand":"...","payload":{}}]}
+    if (capsule === 'GREETING') {
+      const { catsLine, topSample } = buildGreetingHighlightsTS(inStockProducts);
+      basePrompt = `Warm, lively WhatsApp shopkeeper for "${bName}" (${bType}). Reply in ${lang}.
+OUTPUT RAW JSON ONLY: {"ai_reply_text":"...","quote_reply":false,"actions":[]}
+Style: natural human shopkeeper tone, *bold* store/items/*₹prices*, friendly emojis (✨🛍️🙏💛), crisp bullets. Welcome warmly, highlight categories & popular picks, and offer photos/help.${firstTip}${vendorNote}${cust?.full_name ? `\nCUST: ${cust.full_name}` : ''}${hasCart ? `\nCART: ${currentCart.length} items (₹${formatRupeeCompact(cartTotal)})` : ''}${catsLine ? `\nCATS: ${catsLine}` : ''}${topSample ? `\nTOP: ${topSample}` : ''}`;
+    } else if (capsule === 'CHITCHAT_INFO') {
+      const { catsLine } = buildGreetingHighlightsTS(inStockProducts);
+      const policies = compactStr(ramStore.vendor.store_policies || '', 140);
+      basePrompt = `Warm WhatsApp shopkeeper for "${bName}" (${bType}). Reply in ${lang}.
+OUTPUT RAW JSON ONLY: {"ai_reply_text":"...","quote_reply":false,"actions":[]}
+Style: friendly human tone, *bold* key info, natural emojis. quote_reply:true only for specific questions/complaints.
+HANDS(optional): generate_store_link:{} | escalate_to_human:{}
+Never ask UTR/screenshots; online payments verify automatically.${firstTip}${policies ? `\nPOLICY: ${policies}` : ''}${vendorNote}
+STORE: ${storeLine}${cust?.full_name ? `\nCUST: ${cust.full_name}` : ''}${catsLine ? `\nCATS: ${catsLine}` : ''}`;
+    } else if (capsule === 'CHECKOUT') {
+      basePrompt = `Warm WhatsApp shopkeeper for "${bName}". Reply in ${lang}.
+OUTPUT RAW JSON ONLY: {"ai_reply_text":"...","quote_reply":false,"actions":[]}
+Style: crisp human tone, *bold* items/*₹totals*, bullets, emojis. Quote (> ) only for total/payment box.
+HANDS(only needed):
+• extract_profile:{"profile":{"name":"","address":"","contact":""}}
+• submit_order:{"payment_mode":"COD"|"ONLINE"} (ONLY when cart+address+mode ready)
+• clear_cart:{} | cancel_order:{} | escalate_to_human:{}
+RULES: Before submit_order show *Order Summary* (items, total, address) & ask *Online* 💳 or *COD* 💵 (if allowed). Never ask UTR/screenshots.${vendorNote}
+STORE: ${storeLine}
+STATE:${currentState} | ${cartLine}${custLine}`;
+    } else {
+      const cartProductIDs = new Set(currentCart.map((c) => c.product_id));
+      const checkoutHands = hasCart ? '\n• submit_order:{"payment_mode":"COD"|"ONLINE"} | clear_cart:{} | cancel_order:{}' : '';
+      const checkoutRule = hasCart ? ' Before submit_order show *Order Summary* & ask Online/COD.' : '';
+      basePrompt = `Warm, lively WhatsApp shopkeeper for "${bName}" (${bType}). Reply in ${lang}.
+OUTPUT RAW JSON ONLY: {"ai_reply_text":"...","quote_reply":false,"actions":[]}
+Style: natural human tone, *bold* items/*₹prices*/variants, emojis (✨🛍️🔥💰🙌), "• " bullets. Quote (> ) only for highlight boxes. quote_reply:true only for direct question/price/item/complaint.
+HANDS(only needed; [] for chat):
+• search_catalog:{"queries":["kw"],"categories":["Cat"]} (ONLY if user's need/item missing from INV; use CATS)
+• send_catalog_images:{"category":"item|cat|all"} (when photos asked)
+• update_cart:{"cart_items":[{"id":"P1","variant":"","qty":1}]} (use EXACT short ID P1/P2 from INV/CLEAR_MATCH; add CLEAR_MATCH immediately, ask brand/size for VARIETY_OPTIONS)
+• extract_profile:{"profile":{"name":"","address":"","contact":""}} | generate_store_link:{} | escalate_to_human:{}${checkoutHands}
+RULES: Quote/add ONLY in-stock items from INV/CLEAR_MATCH/VARIETY_OPTIONS/SEARCH_RESULTS. Never ask UTR/screenshots.${checkoutRule}${firstTip}${vendorNote}
+STORE: ${storeLine}
+STATE:${currentState} | ${cartLine}${custLine}`;
+      invBlock = buildSmartCompactInventory(inStockProducts, query, finalHistory, cartProductIDs, aliases);
+    }
 
-TONE & WHATSAPP STYLE:
-• Sound like a friendly, warm, enthusiastic real shopkeeper — never robotic.
-• Use *bold* generously for *item names*, *₹prices*, *totals*, *variants*, and key actions.
-• Use expressive emojis naturally (✨🛍️🔥😋💰📦🙌💛) and clean "• " bullets.
-• Use WhatsApp blockquote (> ) ONLY sparingly for highlight boxes (> 🧾 *Total* / > 💳 *Payment*), never on every line.
-• Set "quote_reply":true ONLY when directly answering a specific question/price/item/complaint; false for normal greetings/chat flow.
-
-HANDS: search_catalog ({"queries":[...],"categories":[...]} — ONLY if customer describes indirect need or item not in INV), send_catalog_images, update_cart (add CLEAR_MATCH immediately; ask for VARIETY_OPTIONS), extract_profile, submit_order (payment_mode: COD|ONLINE), generate_store_link, clear_cart, cancel_order, escalate_to_human.
-RULES: NEVER suggest out-of-stock items. Only quote IDs/prices in INV/CLEAR_MATCH/VARIETY_OPTIONS/SEARCH_RESULTS. NEVER ask for UTR/screenshots or mark orders Paid locally — Central Brain verifies online payment & sends confirmation + PDF receipt. On a customer's FIRST message, politely request them to write their full message together in one message (not in small pieces).
-${ramStore.ai.system_prompt ? `VENDOR NOTE: ${compactStr(ramStore.ai.system_prompt, 280)}\n` : ''}STORE: Hrs:${ramStore.vendor.operating_hours} | ETA:${ramStore.vendor.estimated_delivery_time} | MinOrd:₹${formatRupeeCompact(ramStore.vendor.min_order_amount)} | Pay:${payMode}
-
-STATE:${currentCart.length > 0 ? 'CART_ACTIVE' : 'BROWSING'} | ${cartLine}
-CUST:${profParts.join(' | ')}
-
-${inventoryBlock}`;
+    const systemPrompt = invBlock ? `${basePrompt}\n\n${invBlock}` : basePrompt;
+    const estInTok = Math.ceil((systemPrompt.length + finalHistory.reduce((s, h) => s + h.content.length + 12, 0)) / 3.6);
+    capsuleTelemetry.totalTurns += 1;
+    capsuleTelemetry.totalEstInTok += estInTok;
+    capsuleTelemetry.perCapsule[capsule] = (capsuleTelemetry.perCapsule[capsule] || 0) + 1;
+    console.log(`🧠 [Micro-Capsule] +${cleanPhone} | capsule=${capsule} | ~${estInTok} est_in_tok | hist=${finalHistory.length} | aliases=${aliases.count()}`);
 
     const groqKeys = candidateKeys.filter((k) => isGroqProvider(provider, k));
     const geminiKeys = candidateKeys.filter((k) => isGeminiProvider(provider, k));
@@ -3638,6 +4114,7 @@ ${inventoryBlock}`;
 
     const firstPass = await invokeLLMOnce(systemPrompt);
     if (firstPass) {
+      resolveActionAliases(firstPass.actions, aliases);
       // Layer 4: On-Demand `search_catalog` Hand interception (STRICTLY max 1 follow-up pass!)
       const searchActions = firstPass.actions.filter((a) =>
         ['search_catalog', 'find_products', 'browse_category', 'lookup_catalog', 'search_products'].includes(
@@ -3655,11 +4132,13 @@ ${inventoryBlock}`;
           if (typeof p.category === 'string' && p.category.trim()) categories.push(p.category.trim());
         }
         if (queries.length > 0 || categories.length > 0) {
-          const lookupBlock = executeSearchCatalogHand(inStockProducts, queries, categories);
+          const lookupBlock = executeSearchCatalogHand(inStockProducts, queries, categories, aliases);
+          // Smart Pass-2 Swap: replace Pass-1 INV cleanly with SEARCH_RESULTS
           const secondPass = await invokeLLMOnce(
-            `${systemPrompt}\n\n${lookupBlock}\n\nFINAL PASS: Now answer the customer warmly using SEARCH_RESULTS above. Do NOT call search_catalog again.`
+            `${basePrompt}\n\n${lookupBlock}\n\nFINAL PASS: Answer warmly using SEARCH_RESULTS above (use exact P1/P2 IDs). Do NOT call search_catalog again.`
           );
           if (secondPass) {
+            resolveActionAliases(secondPass.actions, aliases);
             secondPass.actions = secondPass.actions.filter(
               (a) => !['search_catalog', 'find_products', 'browse_category', 'lookup_catalog', 'search_products'].includes(String(a.hand || '').toLowerCase())
             );
@@ -3821,6 +4300,7 @@ app.get('/api/health', (_req: Request, res: Response) => {
   res.json({
     status: 'ok',
     mode: 'stateless-ram-bot',
+    bot_mode: ramStore.botMode,
     database: 'none',
     sync_mode: 'event-driven-zero-polling',
     chat_sync: 'ram-only-max-10',
@@ -3851,12 +4331,19 @@ app.get('/api/bot/overview', (_req: Request, res: Response) => {
 
   res.json({
     status: 'success',
+    bot_mode: ramStore.botMode,
     sync: {
       ...ramStore.sync,
       bot_public_url: botPublicURL,
       retry_buffer_depth: retryBuffer.length,
     },
     vendor: ramStore.vendor,
+    vendor_management: {
+      settings: ramStore.vendorManagement.settings,
+      owner_payment_gateway: ramStore.vendorManagement.owner_payment_gateway,
+      subscription_plans_count: ramStore.vendorManagement.subscription_plans.length,
+      managed_vendors_count: ramStore.vendorManagement.managed_vendors.length,
+    },
     governance: {
       can_auto_reply: gate.allowed,
       auto_reply_pause_reason: gate.reason,
@@ -3884,9 +4371,16 @@ app.get('/api/bot/overview', (_req: Request, res: Response) => {
       backup_api_key_count: ramStore.ai.backup_api_keys.length,
       api_key_masked: maskedKey,
       system_prompt: ramStore.ai.system_prompt,
+      store_policies: ramStore.ai.store_policies,
       gemini_priority_models: [...GEMINI_PRIORITY_MODELS],
       groq_text_models: [...GROQ_ALLOWED_MODELS],
       groq_audio_models: [...GROQ_AUDIO_MODELS],
+      capsule_stats: {
+        architecture: 'micro_capsule_v3',
+        total_turns: capsuleTelemetry.totalTurns,
+        avg_est_in_tok: capsuleTelemetry.totalTurns > 0 ? Math.round(capsuleTelemetry.totalEstInTok / capsuleTelemetry.totalTurns) : 0,
+        capsule_dispatch: { ...capsuleTelemetry.perCapsule },
+      },
     },
     payment: {
       enabled:
@@ -4030,6 +4524,10 @@ app.post('/api/sync/vendor', verifyCentralWebhookAuth, (req: Request, res: Respo
   const warnings: string[] = [];
 
   const vRaw = firstDefined(data, 'vendor', 'business', 'store');
+  const rawMode = firstDefined(data, 'bot_mode') ?? (isPlainObject(vRaw) ? firstDefined(vRaw, 'bot_mode') : undefined);
+  if (rawMode !== undefined && String(rawMode).trim()) {
+    ramStore.botMode = normalizeBotMode(rawMode);
+  }
   if (vRaw !== undefined) {
     if (isPlainObject(vRaw)) applyVendorSection(vRaw);
     else warnings.push('vendor section is not a JSON object');
@@ -4040,13 +4538,30 @@ app.post('/api/sync/vendor', verifyCentralWebhookAuth, (req: Request, res: Respo
     else warnings.push('ai section is not a JSON object');
   }
   const payRaw = firstDefined(data, 'payment', 'payment_config', 'payment_settings');
-  if (payRaw !== undefined) {
-    if (isPlainObject(payRaw)) applyPaymentSection(payRaw);
-    else warnings.push('payment section is not a JSON object');
+  const topBannerFallback = parseFlexString(firstDefined(data, 'universal_qr_banner_url', 'qr_banner_url')).trim();
+  if (payRaw !== undefined || topBannerFallback) {
+    if (payRaw !== undefined && !isPlainObject(payRaw)) {
+      warnings.push('payment section is not a JSON object');
+    } else {
+      const mergedPay = isPlainObject(payRaw) ? { ...payRaw } : {};
+      if (topBannerFallback && !mergedPay.universal_qr_banner_url) {
+        mergedPay.universal_qr_banner_url = topBannerFallback;
+      }
+      applyPaymentSection(mergedPay);
+    }
+  }
+  const vmRaw = firstDefined(data, 'vendor_management');
+  if (vmRaw !== undefined) {
+    if (isPlainObject(vmRaw)) applyVendorManagementSection(vmRaw);
+    else warnings.push('vendor_management section is not a JSON object');
   }
 
   markInbound('vendor');
-  const resp: Record<string, any> = { status: 'success', message: 'Vendor, AI & Payment configuration synced to RAM' };
+  const resp: Record<string, any> = {
+    status: 'success',
+    bot_mode: ramStore.botMode,
+    message: 'Vendor, AI, Payment & Vendor Management configuration synced to RAM',
+  };
   if (warnings.length > 0) resp.warnings = warnings;
   res.json(resp);
 });
@@ -4239,16 +4754,18 @@ app.post('/api/sync/send-message', verifyCentralWebhookAuth, (req: Request, res:
     res.status(400).json({ status: 'error', message: 'Invalid JSON body: expected a JSON object' });
     return;
   }
-  const phone = parseFlexString(req.body.phone);
-  const message = parseFlexString(req.body.message);
-  if (!phone || !message) {
-    res.status(400).json({ status: 'error', message: 'phone and message are required' });
+  const phone = normalizePhone(parseFlexString(req.body.phone));
+  const message = parseFlexString(req.body.message).trim();
+  const imageUrl = parseFlexString(req.body.image_url).trim();
+  if (!phone || (!message && !imageUrl)) {
+    res.status(400).json({ status: 'error', message: 'phone and message (or image_url) are required' });
     return;
   }
-  appendChatRAM(phone, 'assistant', 'outgoing_ai', message);
-  pushLiveEvent(phone, message, 'outgoing_ai');
+  const previewText = imageUrl ? (message ? `${message}\n🖼️ ${imageUrl}` : `🖼️ ${imageUrl}`) : message;
+  appendChatRAM(phone, 'assistant', 'outgoing_ai', previewText);
+  pushLiveEvent(phone, previewText, 'outgoing_ai');
   markInbound('send_message');
-  res.json({ status: 'success', message: 'Queued for WhatsApp delivery' });
+  res.json({ status: 'success', bot_mode: ramStore.botMode, message: 'Queued for WhatsApp delivery' });
 });
 
 // =============================================================================
@@ -4381,6 +4898,316 @@ function replyHasSingleMsgTip(text: string): boolean {
   );
 }
 
+const pendingAdminPlanPickers = new Map<string, { plans: SubscriptionPlan[]; expiresAt: number }>();
+
+function buildPlanRenewalUPIString(upiVpa: string, payeeName: string, orderId: string, amount: number): string {
+  const vpa = (upiVpa || '').trim();
+  if (!vpa) return '';
+  const pn = encodeURIComponent((payeeName || '').trim() || 'WaMart');
+  const tr = encodeURIComponent(orderId.trim());
+  return `upi://pay?pa=${vpa}&pn=${pn}&am=${amount.toFixed(2)}&cu=INR&tr=${tr}&tn=WaMart+Plan+Renewal`;
+}
+
+function buildAdminVendorSystemPromptPreview(vendor: ManagedVendor | undefined, vm: VendorManagementState): string {
+  const lines: string[] = [];
+  const custom = (ramStore.ai.system_prompt || '').trim();
+  if (custom) {
+    lines.push(custom);
+  } else {
+    lines.push(
+      'You are WaMart Vendor Support Manager — the official WhatsApp support assistant for registered WaMart store owners/vendors.',
+      'Help vendors with subscription plans, renewals, WhatsApp bot setup, UPI payments, WaMart Digital Mall listing, and store configuration.',
+      'NEVER act as a grocery store, NEVER take shopping orders, NEVER discuss shopping carts or customer checkout.',
+      'Keep replies concise, friendly, accurate, and formatted cleanly for WhatsApp.'
+    );
+  }
+  const policies = (ramStore.ai.store_policies || ramStore.vendor.store_policies || '').trim();
+  if (policies) {
+    lines.push('', 'PLATFORM POLICIES:', policies);
+  }
+  if (vm.settings.support_escalation_phone) {
+    lines.push('', `Support Escalation Phone: ${vm.settings.support_escalation_phone}`);
+  }
+  if (vendor) {
+    lines.push(
+      '',
+      'MATCHED VENDOR LIVE CONTEXT:',
+      `- Store Name: ${vendor.store_name || vendor.username}`,
+      `- Username: ${vendor.username}`,
+      `- Owner Phone: ${vendor.owner_phone}`,
+      `- Active Plan: ${vendor.plan_name || 'N/A'} (ID: ${vendor.plan_id || 'N/A'})`,
+      `- Valid Until: ${vendor.plan_valid_until || 'N/A'}`,
+      `- Days Remaining: ${vendor.days_remaining}`,
+      `- Expired: ${vendor.is_plan_expired ? 'Yes' : 'No'}`,
+      `- Bot Connected: ${vendor.bot_connected ? 'Yes' : 'No'}`,
+      `- UPI ID: ${vendor.upi_id || 'Not Configured'}`,
+      `- Store URL: ${vendor.store_url || 'N/A'}`
+    );
+  } else {
+    lines.push('', 'SENDER STATUS: Phone not matched in managed_vendors yet.');
+  }
+  if (vm.subscription_plans.length > 0) {
+    lines.push('', 'AVAILABLE WAMART SUBSCRIPTION PLANS:');
+    for (const p of vm.subscription_plans) {
+      lines.push(
+        `- ${p.name} (id=${p.id}): Monthly ₹${p.monthly_price.toFixed(0)}, Yearly ₹${p.yearly_price.toFixed(0)}, Validity ${p.validity_days || 30} days`
+      );
+    }
+  }
+  if (vm.settings.vendor_self_service_commands) {
+    lines.push('', 'Quick self-service commands available: my plan, renew, store status, mall status, help.');
+  }
+  return lines.join('\n');
+}
+
+async function processAdminVendorTextPreview(
+  phone: string,
+  query: string,
+  overrideProvider?: string,
+  overrideApiKey?: string
+): Promise<{ reply: string; engine: string; keyIdx: number; qrDataUrl?: string; action?: string; payload?: Record<string, any> }> {
+  const vm = ramStore.vendorManagement;
+  const vendor = lookupManagedVendorByPhone(phone);
+  const low = query.trim().toLowerCase().replace(/^\/+/, '').replace(/\s+/g, ' ');
+
+  const generateRenewalReply = async (plan: SubscriptionPlan, billing: 'monthly' | 'yearly') => {
+    const gw = vm.owner_payment_gateway;
+    const amount = billing === 'yearly' && plan.yearly_price > 0 ? plan.yearly_price : plan.monthly_price > 0 ? plan.monthly_price : plan.yearly_price;
+    const validity = billing === 'yearly' ? 365 : plan.validity_days || 30;
+    const orderId = `WMP-${Date.now()}-${Math.floor(100 + Math.random() * 900)}`;
+    const upiStr = buildPlanRenewalUPIString(gw.upi_vpa, gw.payee_name || 'WaMart', orderId, amount);
+    let qrDataUrl = '';
+    try {
+      const { buffer, mimeType } = await generateLocalBannerQRBuffer(upiStr, ramStore.payment.banner_template);
+      qrDataUrl = `data:${mimeType};base64,${buffer.toString('base64')}`;
+    } catch (err: any) {
+      console.warn(`⚠️ [AdminRenewalQR] Preview QR generation warning: ${err?.message || String(err)}`);
+    }
+    const storeLabel = vendor?.store_name || vendor?.username || 'Your Store';
+    const reply = [
+      `🔄 *WaMart Plan Renewal QR*`,
+      ``,
+      `🏪 Store: *${storeLabel}*`,
+      `📦 Plan: *${plan.name}* (${billing === 'yearly' ? 'Yearly' : 'Monthly'} · ${validity} days)`,
+      `💰 Amount: *₹${amount.toFixed(2)}*`,
+      `🧾 Ref ID: \`${orderId}\``,
+      ``,
+      `Scan the QR image using any UPI app (GPay / PhonePe / Paytm) to complete renewal.`,
+      gw.paytm_mid ? `✅ Auto-verification is active — your plan upgrades automatically on payment.` : `📩 Once paid, reply here or share your UTR for instant activation.`,
+    ].join('\n');
+    return {
+      reply,
+      engine: 'admin-vendor-command',
+      keyIdx: -1,
+      qrDataUrl,
+      action: 'plan_renewal_qr',
+      payload: { order_id: orderId, plan_id: plan.id, plan_name: plan.name, amount, billing },
+    };
+  };
+
+  if (vm.settings.vendor_self_service_commands) {
+    // Check pending multi-plan picker selection first
+    const pending = pendingAdminPlanPickers.get(phone);
+    if (pending && Date.now() < pending.expiresAt) {
+      const idxNum = Number(low.replace(/\D/g, ''));
+      const wantsYearly = low.includes('year') || low.includes('annual');
+      let chosen: SubscriptionPlan | undefined;
+      if (idxNum >= 1 && idxNum <= pending.plans.length) {
+        chosen = pending.plans[idxNum - 1];
+      } else {
+        chosen = pending.plans.find((p) => p.name.toLowerCase() === low || p.id.toLowerCase() === low);
+      }
+      if (chosen) {
+        pendingAdminPlanPickers.delete(phone);
+        return generateRenewalReply(chosen, wantsYearly ? 'yearly' : 'monthly');
+      }
+    } else if (pending) {
+      pendingAdminPlanPickers.delete(phone);
+    }
+
+    if (low === 'help' || low === 'menu') {
+      return {
+        reply: [
+          `👋 *WaMart Vendor Support Menu*`,
+          ``,
+          `Reply with any quick command:`,
+          `• *my plan* — View active plan & expiry`,
+          `• *renew* — Renew or upgrade your plan via UPI QR`,
+          `• *store status* — Check store URL, UPI & bot status`,
+          `• *mall status* — Check WaMart Digital Mall eligibility`,
+          ``,
+          `Or simply type any question and our Vendor Support Manager will assist you!`,
+        ].join('\n'),
+        engine: 'admin-vendor-command',
+        keyIdx: -1,
+        action: 'help',
+      };
+    }
+
+    if (low === 'my plan' || low === 'plan') {
+      if (!vendor) {
+        return {
+          reply: `ℹ️ We couldn't find a registered WaMart vendor store linked to this WhatsApp number.${vm.settings.support_escalation_phone ? `\n📞 Support: ${vm.settings.support_escalation_phone}` : ''}`,
+          engine: 'admin-vendor-command',
+          keyIdx: -1,
+          action: 'my_plan',
+        };
+      }
+      const statusText = vendor.is_plan_expired || vendor.days_remaining <= 0 ? '❌ Expired' : '✅ Active';
+      return {
+        reply: [
+          `📋 *Your WaMart Plan Details*`,
+          ``,
+          `🏪 Store: *${vendor.store_name || vendor.username}*`,
+          `📦 Plan: *${vendor.plan_name || 'Standard'}*`,
+          `📅 Valid Until: *${vendor.plan_valid_until || 'N/A'}*`,
+          `⏳ Days Remaining: *${Math.max(0, vendor.days_remaining)} day(s)*`,
+          `🔖 Status: *${statusText}*`,
+          ``,
+          `Reply *renew* anytime to renew or upgrade.`,
+        ].join('\n'),
+        engine: 'admin-vendor-command',
+        keyIdx: -1,
+        action: 'my_plan',
+      };
+    }
+
+    if (low === 'store status' || low === 'status') {
+      if (!vendor) {
+        return {
+          reply: `ℹ️ No WaMart store is mapped to this phone number yet.`,
+          engine: 'admin-vendor-command',
+          keyIdx: -1,
+          action: 'store_status',
+        };
+      }
+      return {
+        reply: [
+          `🏪 *Store Status — ${vendor.store_name || vendor.username}*`,
+          ``,
+          `🌐 Store URL: ${vendor.store_url || 'Not published yet'}`,
+          `💳 UPI VPA: ${vendor.upi_id ? `✅ Configured (${vendor.upi_id})` : '⚠️ Not configured'}`,
+          `🤖 WhatsApp Bot: ${vendor.bot_connected ? '✅ Connected' : '❌ Disconnected'}`,
+          `📦 Plan: *${vendor.plan_name || 'N/A'}* (${vendor.is_plan_expired ? '❌ Expired' : `✅ Active · ${vendor.days_remaining}d left`})`,
+        ].join('\n'),
+        engine: 'admin-vendor-command',
+        keyIdx: -1,
+        action: 'store_status',
+      };
+    }
+
+    if (low === 'mall status') {
+      if (!vendor) {
+        return {
+          reply: `ℹ️ Register your WaMart store first to check WaMart Digital Mall listing eligibility.`,
+          engine: 'admin-vendor-command',
+          keyIdx: -1,
+          action: 'mall_status',
+        };
+      }
+      const eligible = !vendor.is_plan_expired && vendor.days_remaining > 0 && Boolean(vendor.store_url);
+      return {
+        reply: [
+          `🏬 *WaMart Digital Mall Status*`,
+          ``,
+          `🏪 Store: *${vendor.store_name || vendor.username}*`,
+          `📦 Plan: *${vendor.plan_name || 'N/A'}* (${vendor.is_plan_expired ? '❌ Expired' : '✅ Active'})`,
+          `✅ Mall Eligibility: *${eligible ? 'Eligible & Active' : 'Action Required (Active Plan + Store URL needed)'}*`,
+        ].join('\n'),
+        engine: 'admin-vendor-command',
+        keyIdx: -1,
+        action: 'mall_status',
+      };
+    }
+
+    if (low === 'renew' || low === 'upgrade' || low.startsWith('renew ') || low.startsWith('upgrade ')) {
+      if (!vm.settings.whatsapp_plan_renewal_qr || !vm.owner_payment_gateway.upi_vpa) {
+        return {
+          reply: `ℹ️ Instant WhatsApp QR plan renewal is currently disabled. Please renew from your WaMart Vendor Dashboard${vm.settings.support_escalation_phone ? ` or contact ${vm.settings.support_escalation_phone}` : ''}.`,
+          engine: 'admin-vendor-command',
+          keyIdx: -1,
+          action: 'renew_unavailable',
+        };
+      }
+      const paidPlans = vm.subscription_plans.filter((p) => p.monthly_price > 0 || p.yearly_price > 0);
+      if (paidPlans.length === 0) {
+        return {
+          reply: `ℹ️ No paid subscription plans are currently configured.`,
+          engine: 'admin-vendor-command',
+          keyIdx: -1,
+          action: 'renew_no_plans',
+        };
+      }
+      const wantsYearly = low.includes('year') || low.includes('annual');
+      const explicitPlan = paidPlans.find(
+        (p) => low.includes(p.name.toLowerCase()) || (p.id && low.includes(p.id.toLowerCase()))
+      );
+      if (explicitPlan) {
+        return generateRenewalReply(explicitPlan, wantsYearly ? 'yearly' : 'monthly');
+      }
+      if (paidPlans.length === 1) {
+        return generateRenewalReply(paidPlans[0], wantsYearly ? 'yearly' : 'monthly');
+      }
+      pendingAdminPlanPickers.set(phone, { plans: paidPlans, expiresAt: Date.now() + 10 * 60_000 });
+      const listLines = paidPlans.map(
+        (p, idx) =>
+          `${idx + 1}. *${p.name}* — ₹${p.monthly_price.toFixed(0)}/mo${p.yearly_price > 0 ? ` | ₹${p.yearly_price.toFixed(0)}/yr` : ''}`
+      );
+      return {
+        reply: [
+          `🔄 *Choose a WaMart Plan to Renew / Upgrade*`,
+          ``,
+          ...listLines,
+          ``,
+          `Reply with the plan number (e.g. *1* or *1 yearly*) to receive your instant UPI QR banner.`,
+        ].join('\n'),
+        engine: 'admin-vendor-command',
+        keyIdx: -1,
+        action: 'renew_plan_list',
+      };
+    }
+  }
+
+  // Natural-language LLM path with strictly last 10 RAM messages
+  const sysPrompt = buildAdminVendorSystemPromptPreview(vendor, vm);
+  const rawHistory = (ramStore.chats.get(phone) || []).slice(-10);
+  const history = rawHistory.map((m) => ({
+    role: m.role === 'assistant' ? 'assistant' : 'user',
+    content: m.text,
+  }));
+
+  const keys = overrideApiKey ? [String(overrideApiKey).trim(), ...allAIKeys()] : allAIKeys();
+  const groqKeys = keys.filter((k) => k.startsWith('gsk_'));
+  const geminiKeys = keys.filter((k) => k.startsWith('AIza'));
+  const provider = String(overrideProvider || ramStore.ai.provider || '').toLowerCase();
+  const preferGemini = provider.includes('gemini') || provider.includes('google') || (geminiKeys.length > 0 && groqKeys.length === 0);
+
+  if (preferGemini && geminiKeys.length > 0) {
+    const gemRes = await callGeminiPool(geminiKeys, sysPrompt, history, ramStore.ai.temperature || 0.7);
+    if (gemRes?.text) {
+      return { reply: gemRes.text.trim(), engine: `admin-ai:gemini:${gemRes.model}`, keyIdx: gemRes.keyIdx };
+    }
+  }
+  if (groqKeys.length > 0) {
+    const groqRes = await callGroqPool(groqKeys, sysPrompt, history, ramStore.ai.temperature || 0.7);
+    if (groqRes?.text) {
+      return { reply: groqRes.text.trim(), engine: `admin-ai:groq:${groqRes.model}`, keyIdx: groqRes.keyIdx };
+    }
+  }
+  if (!preferGemini && geminiKeys.length > 0) {
+    const gemRes = await callGeminiPool(geminiKeys, sysPrompt, history, ramStore.ai.temperature || 0.7);
+    if (gemRes?.text) {
+      return { reply: gemRes.text.trim(), engine: `admin-ai:gemini:${gemRes.model}`, keyIdx: gemRes.keyIdx };
+    }
+  }
+
+  return {
+    reply: `👋 Hi! I'm the WaMart Vendor Support Manager. Reply *help* to view quick self-service commands (my plan, renew, store status, mall status).`,
+    engine: 'admin-vendor-fallback',
+    keyIdx: -1,
+  };
+}
+
 app.post('/api/ai/test', async (req: Request, res: Response) => {
   const query = String(req.body?.query || '').trim();
   const phone = normalizePhone(req.body?.customer_phone || '');
@@ -4416,6 +5243,30 @@ app.post('/api/ai/test', async (req: Request, res: Response) => {
   try {
     // 1-second deliberate read delay before reading & processing the message
     await new Promise((resolve) => setTimeout(resolve, MESSAGE_READ_DELAY_MS));
+
+    // Dual-mode branch: Admin Vendor Manager disables customer shopping/cart/ordering completely
+    if (ramStore.botMode === 'admin_vendor_manager') {
+      const displayIncoming = mediaType === 'voice_note' ? `🎙️ [Voice Note]: ${query}` : query;
+      appendChatRAM(phone, 'customer', 'incoming', displayIncoming);
+      pushLiveEvent(phone, displayIncoming, 'incoming');
+
+      const adminResult = await processAdminVendorTextPreview(phone, query, req.body?.provider, req.body?.api_key);
+      if (adminResult.reply) {
+        appendChatRAM(phone, 'assistant', 'outgoing_ai', adminResult.reply);
+        pushLiveEvent(phone, adminResult.reply, 'outgoing_ai');
+      }
+      res.json({
+        status: 'success',
+        bot_mode: ramStore.botMode,
+        reply: adminResult.reply,
+        ai_reply_text: adminResult.reply,
+        engine: adminResult.engine,
+        payment_qr_data_url: adminResult.qrDataUrl || undefined,
+        actions: adminResult.action ? [{ hand: adminResult.action, payload: adminResult.payload || {} }] : [],
+        key_used_index: adminResult.keyIdx,
+      });
+      return;
+    }
 
     const { customer: cust, changed: custChanged } = upsertCustomerWithChangeCheckRAM({ wa_number: phone, source: 'whatsapp' });
     if (cust && custChanged) {

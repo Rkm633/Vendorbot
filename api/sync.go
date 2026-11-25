@@ -24,6 +24,7 @@ func HealthHandler(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, 200, map[string]interface{}{
 		"status":                  "ok",
 		"mode":                    "stateless-ram-bot",
+		"bot_mode":                ramstore.Global.GetBotMode(),
 		"database":                "none",
 		"sync_mode":               "event-driven-zero-polling",
 		"chat_sync":               "ram-only-max-10",
@@ -85,11 +86,13 @@ func BotOverviewHandler(w http.ResponseWriter, r *http.Request) {
 
 	bannerCached, bannerBytesSize, bannerCachedURL, bannerCachedUpdatedAt := ramstore.GlobalBannerCache.Stats()
 	geminiPriority, groqText, groqAudio := whatsapp.GetModelPoolConfig()
+	vm := ramstore.Global.GetVendorManagement()
 
 	respondJSON(w, 200, map[string]interface{}{
-		"status": "success",
-		"sync":   syncSt,
-		"vendor": vendor,
+		"status":   "success",
+		"bot_mode": ramstore.Global.GetBotMode(),
+		"sync":     syncSt,
+		"vendor":   vendor,
 		"governance": map[string]interface{}{
 			"can_auto_reply":           canReply,
 			"auto_reply_pause_reason":  pauseReason,
@@ -120,6 +123,7 @@ func BotOverviewHandler(w http.ResponseWriter, r *http.Request) {
 			"gemini_priority_models": geminiPriority,
 			"groq_text_models":       groqText,
 			"groq_audio_models":      groqAudio,
+			"capsule_stats":          whatsapp.GetCapsuleTelemetryStats(),
 		},
 		"payment": map[string]interface{}{
 			"enabled":                  pay.Enabled || pay.PaytmMID != "" || pay.MerchantVPA != "" || pay.UPIID != "" || pay.Gateway != "",
@@ -145,6 +149,17 @@ func BotOverviewHandler(w http.ResponseWriter, r *http.Request) {
 				"url":        bannerCachedURL,
 				"updated_at": bannerCachedUpdatedAt,
 			},
+		},
+		"vendor_management": map[string]interface{}{
+			"settings": vm.Settings,
+			"owner_payment_gateway": map[string]interface{}{
+				"upi_vpa":          vm.OwnerPaymentGateway.UPIVPA,
+				"paytm_mid_set":    strings.TrimSpace(vm.OwnerPaymentGateway.PaytmMID) != "",
+				"payee_name":       vm.OwnerPaymentGateway.PayeeName,
+			},
+			"subscription_plans":   vm.SubscriptionPlans,
+			"managed_vendor_count": len(vm.ManagedVendors),
+			"updated_at":           vm.UpdatedAt,
 		},
 		"whatsapp":            waSt,
 		"media_cache_entries": whatsapp.GetMediaCacheSize(),
@@ -404,6 +419,9 @@ func SyncVendorHandler(w http.ResponseWriter, r *http.Request) {
 		respondJSON(w, 400, map[string]string{"status": "error", "message": "Invalid JSON body: " + err.Error()})
 		return
 	}
+	if decoded.BotMode != "" {
+		ramstore.Global.SetBotMode(decoded.BotMode)
+	}
 	if decoded.Vendor != nil {
 		ramstore.Global.UpdateVendor(*decoded.Vendor)
 	}
@@ -413,10 +431,18 @@ func SyncVendorHandler(w http.ResponseWriter, r *http.Request) {
 	if decoded.Payment != nil {
 		ramstore.Global.SetPayment(*decoded.Payment)
 	}
+	if decoded.VendorManagement != nil {
+		newVendors := ramstore.Global.UpdateVendorManagement(*decoded.VendorManagement)
+		if len(newVendors) > 0 {
+			whatsapp.SendOnboardingWelcomesIfEnabled(newVendors)
+		}
+	}
 	markInboundReceived("vendor")
 	resp := map[string]interface{}{
-		"status":  "success",
-		"message": "Vendor configuration synced to RAM",
+		"status":   "success",
+		"bot_mode": ramstore.Global.GetBotMode(),
+		"message":  "Vendor configuration synced to RAM",
+		"stats":    ramstore.Global.Stats(),
 	}
 	if len(warnings) > 0 {
 		resp["warnings"] = warnings
@@ -752,15 +778,23 @@ func SyncSendMessageHandler(w http.ResponseWriter, r *http.Request) {
 		respondJSON(w, 400, map[string]string{"status": "error", "message": "Invalid JSON body: " + err.Error()})
 		return
 	}
+	if strings.TrimSpace(req.Phone) == "" {
+		respondJSON(w, 400, map[string]string{"status": "error", "message": "phone is required"})
+		return
+	}
+	if strings.TrimSpace(req.Message) == "" && strings.TrimSpace(req.ImageURL) == "" {
+		respondJSON(w, 400, map[string]string{"status": "error", "message": "message or image_url is required"})
+		return
+	}
 	client := whatsapp.GetAnyLoggedInClient()
 	if client == nil {
-		respondJSON(w, 503, map[string]string{"status": "error", "message": "Vendor WhatsApp is not connected"})
+		respondJSON(w, 503, map[string]string{"status": "error", "message": "WhatsApp device is not connected"})
 		return
 	}
 
 	var err error
-	if req.ImageURL != "" {
-		err = whatsapp.SendImageFromURL(client, req.Phone, req.ImageURL, req.Message)
+	if strings.TrimSpace(req.ImageURL) != "" {
+		err = whatsapp.SendImageFromURL(client, req.Phone, strings.TrimSpace(req.ImageURL), req.Message)
 	} else {
 		err = whatsapp.SendMessage(client, req.Phone, req.Message)
 	}
@@ -770,9 +804,20 @@ func SyncSendMessageHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	vendorUser := ramstore.Global.GetVendor().Username
-	whatsapp.PushToLiveChat(vendorUser, req.Phone, req.Message, "outgoing_ai")
-	go whatsapp.SaveCustomerChatAndPrune(vendorUser, req.Phone, "assistant", req.Message)
+	if strings.TrimSpace(vendorUser) == "" {
+		vendorUser = ramstore.Global.GetBotMode()
+	}
+	logMsg := strings.TrimSpace(req.Message)
+	if logMsg == "" && strings.TrimSpace(req.ImageURL) != "" {
+		logMsg = "[Image sent]"
+	}
+	whatsapp.PushToLiveChat(vendorUser, req.Phone, logMsg, "outgoing_ai")
+	go whatsapp.SaveCustomerChatAndPrune(vendorUser, req.Phone, "assistant", logMsg)
 	markInboundReceived("send_message")
 
-	respondJSON(w, 200, map[string]string{"status": "success", "message": "Delivered via vendor WhatsApp"})
+	respondJSON(w, 200, map[string]interface{}{
+		"status":   "success",
+		"bot_mode": ramstore.Global.GetBotMode(),
+		"message":  "Delivered via WhatsApp",
+	})
 }

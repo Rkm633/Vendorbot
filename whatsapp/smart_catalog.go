@@ -621,11 +621,63 @@ func stripVoiceNoteMarkers(s string) string {
 	return strings.TrimSpace(voiceMarkerRegex.ReplaceAllString(strings.TrimSpace(s), ""))
 }
 
-// BuildSmartCatalogContext builds a token-optimal, 500-product-ready catalog context using:
+var explicitMenuWords = map[string]bool{
+	"menu": true, "list": true, "catalog": true, "catalogue": true, "all": true,
+	"sab": true, "sabhi": true, "saare": true, "sare": true, "dikhao": true,
+	"items": true, "products": true, "available": true, "options": true, "kya": true,
+}
+
+// IsExplicitFullMenuRequest returns true when the customer explicitly asks to see the full menu/catalog.
+func IsExplicitFullMenuRequest(userMsg string) bool {
+	low := strings.ToLower(stripVoiceNoteMarkers(userMsg))
+	if strings.Contains(low, "kya kya") || strings.Contains(low, "all item") || strings.Contains(low, "sab dikha") || strings.Contains(low, "full menu") {
+		return true
+	}
+	toks := tokenizeClean(low)
+	hits := 0
+	for _, t := range toks {
+		if t == "menu" || t == "catalog" || t == "catalogue" || t == "list" {
+			return true
+		}
+		if explicitMenuWords[t] {
+			hits++
+		}
+	}
+	return hits >= 2
+}
+
+// HasDirectProductMatch runs a fast (<0.3ms) RAM check to detect whether the customer's message
+// directly mentions any in-stock product, brand, category, or Hinglish commerce synonym.
+func HasDirectProductMatch(userMsg string) bool {
+	clean := stripVoiceNoteMarkers(userMsg)
+	toks, unitHint := extractSearchTokensAndHint(clean)
+	if len(toks) == 0 {
+		return false
+	}
+	products := ramstore.Global.ListProducts(true)
+	if len(products) == 0 {
+		return false
+	}
+	indexed := buildIndexedProducts(products)
+	for _, ip := range indexed {
+		if scoreIndexedProduct(ip, clean, toks, unitHint) >= 6 {
+			return true
+		}
+	}
+	return false
+}
+
+// BuildSmartCatalogContext builds a token-optimal, 500-product-ready catalog context (legacy non-aliased wrapper).
+func BuildSmartCatalogContext(userMsg string, history []ChatMessage, cartProductIDs map[string]bool) string {
+	return BuildSmartCatalogContextAliased(userMsg, history, cartProductIDs, nil)
+}
+
+// BuildSmartCatalogContextAliased builds an ultra-compact catalog context using:
 //   - Layer 1: Hinglish/Hindi/English synonyms + phonetic + fuzzy matching
 //   - Layer 2: Multi-item line splitter for 20-25 item orders
-//   - Layer 3: Confidence grouping (CLEAR_MATCH / OPTIONS / UNMATCHED) + Checkout inventory skip
-func BuildSmartCatalogContext(userMsg string, history []ChatMessage, cartProductIDs map[string]bool) string {
+//   - Layer 3: Confidence grouping (CLEAR_MATCH / OPTIONS / UNMATCHED) + Precision Small-Catalog Mode
+//   - Ephemeral P1/P2 Short-ID Aliasing (replaces 24-36 char UUIDs with 1-token codes!)
+func BuildSmartCatalogContextAliased(userMsg string, history []ChatMessage, cartProductIDs map[string]bool, aliases *ProductAliasMap) string {
 	userMsg = stripVoiceNoteMarkers(userMsg)
 	cleanHistory := make([]ChatMessage, 0, len(history))
 	for _, h := range history {
@@ -661,15 +713,6 @@ func BuildSmartCatalogContext(userMsg string, history []ChatMessage, cartProduct
 	var sb strings.Builder
 	sb.WriteString("CATS: " + strings.Join(catSummary, ", ") + "\n")
 
-	// Small catalog (<= 18 items): send all compactly (~250 tokens)
-	if len(products) <= 18 {
-		sb.WriteString("INV(id|name|cat|price|vars):\n")
-		for _, p := range products {
-			sb.WriteString(formatCompactProductLine(p) + "\n")
-		}
-		return strings.TrimSpace(sb.String())
-	}
-
 	// Collect active cart products (always retained so AI can update/remove cart items accurately)
 	cartProds := make([]ramstore.Product, 0, len(cartProductIDs))
 	if len(cartProductIDs) > 0 {
@@ -685,7 +728,17 @@ func BuildSmartCatalogContext(userMsg string, history []ChatMessage, cartProduct
 	if isPureCheckoutOrProfileMessage(userMsg, len(cartProds) > 0) {
 		sb.WriteString("INV(checkout mode — cart items only):\n")
 		for _, p := range cartProds {
-			sb.WriteString(formatCompactProductLine(p) + "\n")
+			sb.WriteString(formatCompactProductLineAliased(p, aliases) + "\n")
+		}
+		return strings.TrimSpace(sb.String())
+	}
+
+	// Small catalog (<= 15 items): dump ALL compactly ONLY when customer explicitly asks for menu/all items;
+	// otherwise let precision matching below send ONLY the 1-6 relevant items (saves 200-350 tokens!).
+	if len(products) <= 15 && IsExplicitFullMenuRequest(userMsg) {
+		sb.WriteString("INV(id|name|₹price|vars):\n")
+		for _, p := range products {
+			sb.WriteString(formatCompactProductLineAliased(p, aliases) + "\n")
 		}
 		return strings.TrimSpace(sb.String())
 	}
@@ -727,7 +780,7 @@ func BuildSmartCatalogContext(userMsg string, history []ChatMessage, cartProduct
 			top := scored[0]
 			isClearSingle := top.score >= 12 && (len(scored) == 1 || top.score >= scored[1].score+6)
 			if isClearSingle {
-				clearLines = append(clearLines, fmt.Sprintf("%s => %s", chunk, formatCompactProductLine(top.ip.prod)))
+				clearLines = append(clearLines, fmt.Sprintf("%s => %s", chunk, formatCompactProductLineAliased(top.ip.prod, aliases)))
 				if !includedIDs[top.ip.prod.ID] {
 					includedIDs[top.ip.prod.ID] = true
 					totalProductLines++
@@ -745,7 +798,7 @@ func BuildSmartCatalogContext(userMsg string, history []ChatMessage, cartProduct
 					if totalProductLines >= maxMultiItemProducts && !includedIDs[scored[k].ip.prod.ID] {
 						break
 					}
-					opts = append(opts, formatCompactProductLine(scored[k].ip.prod))
+					opts = append(opts, formatCompactProductLineAliased(scored[k].ip.prod, aliases))
 					if !includedIDs[scored[k].ip.prod.ID] {
 						includedIDs[scored[k].ip.prod.ID] = true
 						totalProductLines++
@@ -779,7 +832,7 @@ func BuildSmartCatalogContext(userMsg string, history []ChatMessage, cartProduct
 			var extraCart []string
 			for _, cp := range cartProds {
 				if !includedIDs[cp.ID] {
-					extraCart = append(extraCart, formatCompactProductLine(cp))
+					extraCart = append(extraCart, formatCompactProductLineAliased(cp, aliases))
 				}
 			}
 			if len(extraCart) > 0 {
@@ -828,7 +881,7 @@ func BuildSmartCatalogContext(userMsg string, history []ChatMessage, cartProduct
 		})
 	}
 
-	const maxSingleQueryItems = 14
+	const maxSingleQueryItems = 10
 	for _, sp := range scored {
 		if len(selected) >= maxSingleQueryItems {
 			break
@@ -837,10 +890,13 @@ func BuildSmartCatalogContext(userMsg string, history []ChatMessage, cartProduct
 		selected = append(selected, sp.ip.prod)
 	}
 
-	// If zero/very few matches (e.g. greeting, "menu dikhao", or indirect need like "guest aa rahe hain"),
-	// include a compact diverse sample across categories + hint for on-demand `search_catalog` hand!
-	if len(selected) < 6 {
-		maxShow := 8
+	// If zero direct keyword hits (e.g. menu ask or indirect need like "guest aa rahe hain"),
+	// include a lean diverse sample (max 5 items, or up to 10 on explicit menu ask) + search_catalog hint!
+	if len(selected) == 0 || (len(scored) == 0 && IsExplicitFullMenuRequest(userMsg)) {
+		maxShow := 5
+		if IsExplicitFullMenuRequest(userMsg) {
+			maxShow = 10
+		}
 		round := 0
 		for len(selected) < maxShow {
 			addedAny := false
@@ -865,19 +921,24 @@ func BuildSmartCatalogContext(userMsg string, history []ChatMessage, cartProduct
 		}
 	}
 
-	sb.WriteString(fmt.Sprintf("INV(showing %d/%d relevant in-stock; id|name|cat|price|vars):\n", len(selected), len(products)))
+	sb.WriteString(fmt.Sprintf("INV(%d/%d; id|name|₹price|vars):\n", len(selected), len(products)))
 	for _, p := range selected {
-		sb.WriteString(formatCompactProductLine(p) + "\n")
+		sb.WriteString(formatCompactProductLineAliased(p, aliases) + "\n")
 	}
 	if len(scored) == 0 && len(tokens) > 0 {
-		sb.WriteString("HINT: 0 direct keyword hits. If customer described a need/use-case, call search_catalog hand with product keywords or categories from CATS.")
+		sb.WriteString("HINT: 0 direct hits. If indirect need, call search_catalog with keywords/CATS.")
 	}
 	return strings.TrimSpace(sb.String())
 }
 
-// ExecuteSearchCatalogHand executes Layer 4's on-demand `search_catalog` hand strictly in local RAM (0 tokens, <2ms),
-// returning up to 15 compact matching in-stock items for the AI's 2nd-pass final reply.
+// ExecuteSearchCatalogHand runs Layer 4 on-demand search (legacy non-aliased wrapper).
 func ExecuteSearchCatalogHand(queries []string, categories []string) string {
+	return ExecuteSearchCatalogHandAliased(queries, categories, nil)
+}
+
+// ExecuteSearchCatalogHandAliased executes Layer 4's on-demand `search_catalog` hand strictly in local RAM (0 tokens, <2ms),
+// returning up to 12 compact aliased matching in-stock items for Pass 2.
+func ExecuteSearchCatalogHandAliased(queries []string, categories []string, aliases *ProductAliasMap) string {
 	products := ramstore.Global.ListProducts(true)
 	if len(products) == 0 {
 		return "SEARCH_RESULTS: No in-stock products available."
@@ -920,19 +981,19 @@ func ExecuteSearchCatalogHand(queries []string, categories []string) string {
 		return results[i].score > results[j].score
 	})
 
-	const maxLookupItems = 15
+	const maxLookupItems = 12
 	if len(results) > maxLookupItems {
 		results = results[:maxLookupItems]
 	}
 
 	if len(results) == 0 {
-		return fmt.Sprintf("SEARCH_RESULTS(0 matches for queries=%v categories=%v): None of those exact items are currently in stock. Politely tell the customer and suggest available categories from CATS.", queries, categories)
+		return fmt.Sprintf("SEARCH_RESULTS(0 matches for %v/%v): Not in stock. Politely inform & suggest CATS.", queries, categories)
 	}
 
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("SEARCH_RESULTS(%d in-stock matches; id|name|cat|price|vars):\n", len(results)))
+	sb.WriteString(fmt.Sprintf("SEARCH_RESULTS(%d; id|name|₹price|vars):\n", len(results)))
 	for _, r := range results {
-		sb.WriteString(formatCompactProductLine(r.prod) + "\n")
+		sb.WriteString(formatCompactProductLineAliased(r.prod, aliases) + "\n")
 	}
 	return strings.TrimSpace(sb.String())
 }

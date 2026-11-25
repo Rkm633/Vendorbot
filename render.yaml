@@ -20,3 +20,5 @@ services:
         sync: false
       - key: VENDOR_API_KEY
         sync: false
+      - key: BOT_MODE
+        value: "vendor_store"

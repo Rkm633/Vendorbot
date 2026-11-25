@@ -74,6 +74,26 @@ type PaymentConfirmedEvent struct {
 	CustomerPhone string  `json:"customer_phone"`
 }
 
+// PlanRenewalConfirmedEvent notifies Central Brain after Paytm verifies TXN_SUCCESS for a vendor's plan renewal in admin_vendor_manager mode.
+type PlanRenewalConfirmedEvent struct {
+	Event          string  `json:"event"`
+	Type           string  `json:"type"`
+	OrderID        string  `json:"order_id"`
+	TxnID          string  `json:"txn_id"`
+	Amount         float64 `json:"amount"`
+	PaytmStatus    string  `json:"paytm_status"`
+	Username       string  `json:"username"`
+	VendorUsername string  `json:"vendor_username"`
+	StoreName      string  `json:"store_name"`
+	OwnerPhone     string  `json:"owner_phone"`
+	CustomerPhone  string  `json:"customer_phone"`
+	PlanID         string  `json:"plan_id"`
+	PlanName       string  `json:"plan_name"`
+	BillingCycle   string  `json:"billing_cycle"`
+	ValidityDays   int     `json:"validity_days"`
+	Timestamp      string  `json:"timestamp"`
+}
+
 // VerifyPaymentRequest is sent every 3 seconds to Central Brain's verify endpoint during an active ONLINE/UPI order.
 type VerifyPaymentRequest struct {
 	OrderID  string `json:"order_id"`
@@ -510,7 +530,8 @@ func (c *SyncClient) Bootstrap() (*BootstrapWhatsAppSession, error) {
 
 	reqBody := map[string]interface{}{
 		"bot_public_url": c.GetBotPublicURL(),
-		"node_version":   "2.3-zero-polling-zero-chat-sync",
+		"bot_mode":       ramstore.Global.GetBotMode(),
+		"node_version":   "2.6-dual-mode-zero-polling",
 		"timestamp":      time.Now().UTC().Format(time.RFC3339),
 	}
 
@@ -569,9 +590,9 @@ func (c *SyncClient) Bootstrap() (*BootstrapWhatsAppSession, error) {
 	go c.ReplayRetryBuffer()
 
 	stats := ramstore.Global.Stats()
-	log.Printf("✅ [Central Brain Node Synced] Products: %d | Customers: %d | Active Carts: %d | Orders: %d | WA Session: %v | Warnings: %d",
-		stats["products"], stats["customers"], stats["active_carts"], stats["orders"],
-		waSession != nil && waSession.HasSession, len(warnings))
+	log.Printf("✅ [Central Brain Node Synced] Mode: %s | Products: %d | Customers: %d | Active Carts: %d | Orders: %d | Managed Vendors: %d | Plans: %d | WA Session: %v | Warnings: %d",
+		ramstore.Global.GetBotMode(), stats["products"], stats["customers"], stats["active_carts"], stats["orders"],
+		stats["managed_vendors"], stats["subscription_plans"], waSession != nil && waSession.HasSession, len(warnings))
 
 	return waSession, nil
 }
@@ -949,6 +970,80 @@ func (c *SyncClient) PushPaymentConfirmedWithRetry(endpoint string, evt PaymentC
 		})
 		c.updateQueueMetrics()
 	}
+	return lastErr
+}
+
+// PushPlanRenewalConfirmedWithRetry notifies Central Brain when a vendor's WhatsApp plan renewal UPI payment
+// succeeds locally via Paytm verification so Central Brain upgrades the vendor's subscription automatically.
+func (c *SyncClient) PushPlanRenewalConfirmedWithRetry(evt PlanRenewalConfirmedEvent) error {
+	if !c.IsConfigured() {
+		return fmt.Errorf("central brain node is not configured")
+	}
+	if strings.TrimSpace(evt.Event) == "" {
+		evt.Event = "plan.renewal.confirmed"
+	}
+	if strings.TrimSpace(evt.Type) == "" {
+		evt.Type = "plan_renewal"
+	}
+	if strings.TrimSpace(evt.PaytmStatus) == "" {
+		evt.PaytmStatus = "TXN_SUCCESS"
+	}
+	if strings.TrimSpace(evt.Timestamp) == "" {
+		evt.Timestamp = time.Now().UTC().Format(time.RFC3339)
+	}
+	evt.OwnerPhone = ramstore.NormalizePhone(evt.OwnerPhone)
+	if evt.CustomerPhone == "" {
+		evt.CustomerPhone = evt.OwnerPhone
+	}
+	if evt.VendorUsername == "" {
+		evt.VendorUsername = evt.Username
+	}
+	if evt.Username == "" {
+		evt.Username = evt.VendorUsername
+	}
+
+	confirmFallback := strings.TrimSpace(ramstore.Global.GetPayment().PaymentConfirmEndpoint)
+	if confirmFallback == "" || strings.HasPrefix(confirmFallback, "http") {
+		confirmFallback = ramstore.DefaultPaymentConfirmEndpoint
+	}
+	endpoints := []string{"/api/vendor-bot/events/plan-renewal-confirmed", confirmFallback}
+
+	var lastErr error
+	backoff := 1 * time.Second
+	for attempt := 1; attempt <= 3; attempt++ {
+		for _, ep := range endpoints {
+			_, statusCode, err := c.doRequest("POST", ep, evt)
+			if err == nil {
+				ramstore.Global.UpdateSyncStatus(func(st *ramstore.SyncStatus) {
+					st.OutboundPushed++
+					st.LastSyncAt = time.Now()
+					st.Connected = true
+					st.LastError = ""
+				})
+				log.Printf("✅ [Central Plan Renewal Sync] Upgraded @%s to %s (order=%s, txn=%s) via %s", evt.Username, evt.PlanName, evt.OrderID, evt.TxnID, ep)
+				return nil
+			}
+			lastErr = err
+			// Only try fallback endpoint if the dedicated renewal route is not present (404/405)
+			if statusCode != 404 && statusCode != 405 {
+				break
+			}
+		}
+		log.Printf("⚠️ [Central Plan Renewal Sync Attempt %d/3] Order #%s failed: %v", attempt, evt.OrderID, lastErr)
+		if attempt < 3 {
+			time.Sleep(backoff)
+			backoff *= 2
+		}
+	}
+
+	c.storeInRetryBuffer(outboundJob{
+		Method:    "POST",
+		Path:      endpoints[0],
+		Payload:   evt,
+		CreatedAt: time.Now(),
+		Attempts:  3,
+	})
+	c.updateQueueMetrics()
 	return lastErr
 }
 

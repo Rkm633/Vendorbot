@@ -95,8 +95,9 @@ func main() {
 		})
 	}
 
-	// 4. Start local WhatsApp WebSocket keep-alive monitor (zero Central Node polling/heartbeat)
+	// 4. Start local WhatsApp WebSocket keep-alive monitor & lightweight daily admin renewal reminder scheduler
 	whatsapp.StartKeepAliveMonitor()
+	whatsapp.StartAdminRenewalReminderScheduler()
 
 	// 5. Register HTTP Routes
 	mux := http.NewServeMux()
@@ -192,7 +193,7 @@ func main() {
 		log.Println("👋 Zero-downtime graceful shutdown complete.")
 	}()
 
-	log.Printf("✅ Stateless Vendor Bot Node listening on port %s (Public URL: %s)", port, ramstore.Global.GetSyncStatus().BotPublicURL)
+	log.Printf("✅ Stateless Bot Node listening on port %s (Mode: %s | Public URL: %s)", port, ramstore.Global.GetBotMode(), ramstore.Global.GetSyncStatus().BotPublicURL)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("server error: %v", err)
 	}

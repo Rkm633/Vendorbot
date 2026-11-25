@@ -100,6 +100,7 @@ type AIConfig struct {
 	Model         string   `json:"model"`
 	Temperature   float64  `json:"temperature"`
 	SystemPrompt  string   `json:"system_prompt"`
+	StorePolicies string   `json:"store_policies,omitempty"`
 	AutoReply     bool     `json:"auto_reply"`
 	ImportCatalog bool     `json:"import_catalog"`
 }
@@ -194,6 +195,7 @@ type PaymentConfig struct {
 	VerifyPollIntervalMS   int            `json:"verify_poll_interval_ms"`
 	VerifyPollTimeoutMS    int            `json:"verify_poll_timeout_ms"`
 	BannerTemplate         BannerTemplate `json:"banner_template"`
+	BannerSpecified        bool           `json:"-"`
 }
 
 // DefaultPaymentConfig returns a PaymentConfig initialized with Local Banner QR & Direct Paytm 3s verification defaults.
@@ -583,34 +585,42 @@ type SyncStatus struct {
 // BootstrapData is the one-time startup/manual payload hydrated from Central Brain Node.
 // Customer chat messages are strictly RAM-only and are never fetched from or pushed to Central Node.
 type BootstrapData struct {
-	Vendor          *VendorProfile        `json:"vendor"`
-	AI              *AIConfig             `json:"ai"`
-	Payment         *PaymentConfig        `json:"payment"`
-	Products        []Product             `json:"products"`
-	Customers       []Customer            `json:"customers"`
-	ActiveCarts     map[string][]CartItem `json:"active_carts"` // key: normalized customer phone
-	Orders          []Order               `json:"orders"`
-	WhatsAppSession *WhatsAppSessionState `json:"whatsapp_session"`
+	BotMode          string                 `json:"bot_mode,omitempty"`
+	Vendor           *VendorProfile         `json:"vendor"`
+	AI               *AIConfig              `json:"ai"`
+	Payment          *PaymentConfig         `json:"payment"`
+	Products         []Product              `json:"products"`
+	Customers        []Customer             `json:"customers"`
+	ActiveCarts      map[string][]CartItem  `json:"active_carts"` // key: normalized customer phone
+	Orders           []Order                `json:"orders"`
+	WhatsAppSession  *WhatsAppSessionState  `json:"whatsapp_session"`
+	VendorManagement *VendorManagementState `json:"vendor_management,omitempty"`
 }
 
-// Store is the single-vendor, zero-database RAM store powering 0ms WhatsApp AI replies.
+// Store is the single-vendor / dual-mode, zero-database RAM store powering 0ms WhatsApp AI replies.
 type Store struct {
-	mu           sync.RWMutex
-	vendor       VendorProfile
-	ai           AIConfig
-	payment      PaymentConfig
-	products     map[string]Product
-	productOrder []string
-	customers    map[string]*Customer
-	activeCarts  map[string][]CartItem
-	orders       map[string]*Order
-	orderIDs     []string
-	chats        map[string][]ChatRecord
-	leads        []Lead
-	bulkLogs     []BulkLogItem
-	waSession    WhatsAppSessionState
-	syncStatus   SyncStatus
-	chatSeq      int64
+	mu                          sync.RWMutex
+	botMode                     string
+	vendor                      VendorProfile
+	ai                          AIConfig
+	payment                     PaymentConfig
+	products                    map[string]Product
+	productOrder                []string
+	customers                   map[string]*Customer
+	activeCarts                 map[string][]CartItem
+	orders                      map[string]*Order
+	orderIDs                    []string
+	chats                       map[string][]ChatRecord
+	leads                       []Lead
+	bulkLogs                    []BulkLogItem
+	waSession                   WhatsAppSessionState
+	syncStatus                  SyncStatus
+	chatSeq                     int64
+	vendorManagement            VendorManagementState
+	managedVendorsByPhone       map[string]*ManagedVendor
+	managedVendorsByUsername    map[string]*ManagedVendor
+	knownManagedVendors         map[string]bool
+	initialManagedVendorsSeeded bool
 }
 
 // Global is the singleton RAM store for this vendor bot node.
@@ -619,6 +629,7 @@ var Global = NewStore()
 // NewStore initializes an empty thread-safe RAM store awaiting Central Brain Node hydration.
 func NewStore() *Store {
 	return &Store{
+		botMode: ResolveEnvBotMode(),
 		vendor: VendorProfile{
 			AllowCOD:                true,
 			IsOpen:                  BoolPtr(true),
@@ -632,12 +643,16 @@ func NewStore() *Store {
 			AutoReply:     true,
 			ImportCatalog: true,
 		},
-		payment: DefaultPaymentConfig(),
-		products:    make(map[string]Product),
-		customers:   make(map[string]*Customer),
-		activeCarts: make(map[string][]CartItem),
-		orders:      make(map[string]*Order),
-		chats:       make(map[string][]ChatRecord),
+		payment:                  DefaultPaymentConfig(),
+		products:                 make(map[string]Product),
+		customers:                make(map[string]*Customer),
+		activeCarts:              make(map[string][]CartItem),
+		orders:                   make(map[string]*Order),
+		chats:                    make(map[string][]ChatRecord),
+		vendorManagement:         DefaultVendorManagementState(),
+		managedVendorsByPhone:    make(map[string]*ManagedVendor),
+		managedVendorsByUsername: make(map[string]*ManagedVendor),
+		knownManagedVendors:      make(map[string]bool),
 		waSession: WhatsAppSessionState{
 			Status:     "Needs_Login",
 			NeedsLogin: true,
@@ -692,6 +707,12 @@ func (s *Store) HydrateFromBootstrap(data *BootstrapData) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if m := NormalizeBotMode(data.BotMode); m != "" {
+		s.botMode = m
+	} else if s.botMode == "" {
+		s.botMode = ResolveEnvBotMode()
+	}
 
 	if data.Vendor != nil {
 		v := *data.Vendor
@@ -849,6 +870,10 @@ func (s *Store) HydrateFromBootstrap(data *BootstrapData) {
 		}
 	}
 
+	if data.VendorManagement != nil {
+		s.applyVendorManagementLocked(*data.VendorManagement, true)
+	}
+
 	now := time.Now()
 	s.syncStatus.Bootstrapped = true
 	s.syncStatus.Connected = true
@@ -859,6 +884,191 @@ func (s *Store) HydrateFromBootstrap(data *BootstrapData) {
 	bannerTpl := s.payment.BannerTemplate
 	// Sync blank banner compressed bytes asynchronously (non-blocking)
 	go GlobalBannerCache.SyncAsync(bannerTpl)
+}
+
+// --- Dual-Mode & Admin Vendor Management State ---
+
+// GetBotMode returns the active bot mode ("vendor_store" or "admin_vendor_manager").
+func (s *Store) GetBotMode() string {
+	s.mu.RLock()
+	m := s.botMode
+	s.mu.RUnlock()
+	if m == "" {
+		return ResolveEnvBotMode()
+	}
+	return m
+}
+
+// SetBotMode updates the active bot mode in RAM when a valid mode string is supplied.
+func (s *Store) SetBotMode(rawMode string) string {
+	m := NormalizeBotMode(rawMode)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if m != "" {
+		s.botMode = m
+	} else if s.botMode == "" {
+		s.botMode = ResolveEnvBotMode()
+	}
+	return s.botMode
+}
+
+// IsAdminVendorManagerMode returns true when the bot is operating in admin_vendor_manager mode.
+func (s *Store) IsAdminVendorManagerMode() bool {
+	return s.GetBotMode() == BotModeAdminVendorManager
+}
+
+func managedVendorIdentityKey(mv ManagedVendor) string {
+	if u := strings.ToLower(strings.TrimSpace(mv.Username)); u != "" {
+		return "u:" + u
+	}
+	if p := NormalizePhone(mv.OwnerPhone); p != "" {
+		return "p:" + p
+	}
+	return ""
+}
+
+func (s *Store) rebuildManagedVendorIndexesLocked() {
+	s.managedVendorsByPhone = make(map[string]*ManagedVendor, len(s.vendorManagement.ManagedVendors)*2)
+	s.managedVendorsByUsername = make(map[string]*ManagedVendor, len(s.vendorManagement.ManagedVendors))
+	for i := range s.vendorManagement.ManagedVendors {
+		mv := &s.vendorManagement.ManagedVendors[i]
+		for _, k := range PhoneLookupKeys(mv.OwnerPhone) {
+			s.managedVendorsByPhone[k] = mv
+		}
+		if u := strings.ToLower(strings.TrimSpace(mv.Username)); u != "" {
+			s.managedVendorsByUsername[u] = mv
+		}
+	}
+}
+
+// applyVendorManagementLocked replaces vendor_management RAM state and rebuilds O(1) phone indexes.
+// Returns newly added vendors ONLY on post-bootstrap live hot-reloads (never on initial bootstrap).
+func (s *Store) applyVendorManagementLocked(vm VendorManagementState, isBootstrap bool) []ManagedVendor {
+	if vm.UpdatedAt.IsZero() {
+		vm.UpdatedAt = time.Now()
+	}
+	if vm.SubscriptionPlans == nil {
+		vm.SubscriptionPlans = []SubscriptionPlan{}
+	}
+	if vm.ManagedVendors == nil {
+		vm.ManagedVendors = []ManagedVendor{}
+	}
+	if s.knownManagedVendors == nil {
+		s.knownManagedVendors = make(map[string]bool)
+	}
+
+	var newlyAdded []ManagedVendor
+	for _, mv := range vm.ManagedVendors {
+		idKey := managedVendorIdentityKey(mv)
+		if idKey == "" {
+			continue
+		}
+		if !s.knownManagedVendors[idKey] {
+			if !isBootstrap && s.initialManagedVendorsSeeded {
+				newlyAdded = append(newlyAdded, mv)
+			}
+			s.knownManagedVendors[idKey] = true
+		}
+	}
+	if isBootstrap || !s.initialManagedVendorsSeeded {
+		s.initialManagedVendorsSeeded = true
+	}
+
+	s.vendorManagement = vm
+	s.rebuildManagedVendorIndexesLocked()
+	return newlyAdded
+}
+
+// UpdateVendorManagement hot-reloads vendor_management state in RAM and rebuilds O(1) phone indexes.
+// Returns any brand-new vendors added since the previous snapshot.
+func (s *Store) UpdateVendorManagement(vm VendorManagementState) []ManagedVendor {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.applyVendorManagementLocked(vm, false)
+}
+
+// GetVendorManagement returns a deep-enough copy of the vendor_management state from RAM.
+func (s *Store) GetVendorManagement() VendorManagementState {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	cp := s.vendorManagement
+	if len(s.vendorManagement.Settings.RenewalReminderDays) > 0 {
+		cp.Settings.RenewalReminderDays = append([]int(nil), s.vendorManagement.Settings.RenewalReminderDays...)
+	}
+	if len(s.vendorManagement.SubscriptionPlans) > 0 {
+		cp.SubscriptionPlans = append([]SubscriptionPlan(nil), s.vendorManagement.SubscriptionPlans...)
+	}
+	if len(s.vendorManagement.ManagedVendors) > 0 {
+		cp.ManagedVendors = append([]ManagedVendor(nil), s.vendorManagement.ManagedVendors...)
+	}
+	return cp
+}
+
+// LookupManagedVendorByPhone performs an O(1) lookup of a managed vendor by normalized 10/12-digit owner_phone.
+func (s *Store) LookupManagedVendorByPhone(phone string) (*ManagedVendor, bool) {
+	keys := PhoneLookupKeys(phone)
+	if len(keys) == 0 {
+		return nil, false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, k := range keys {
+		if mv, ok := s.managedVendorsByPhone[k]; ok && mv != nil {
+			cp := *mv
+			return &cp, true
+		}
+	}
+	return nil, false
+}
+
+// MarkManagedVendorPlanRenewed optimistically updates a managed vendor's plan in RAM right after
+// TXN_SUCCESS so immediate follow-up commands ("my plan", "store status") reflect the upgraded plan.
+func (s *Store) MarkManagedVendorPlanRenewed(phoneOrUsername string, plan SubscriptionPlan, billingCycle string) *ManagedVendor {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var target *ManagedVendor
+	for _, k := range PhoneLookupKeys(phoneOrUsername) {
+		if mv, ok := s.managedVendorsByPhone[k]; ok && mv != nil {
+			target = mv
+			break
+		}
+	}
+	if target == nil {
+		if mv, ok := s.managedVendorsByUsername[strings.ToLower(strings.TrimSpace(phoneOrUsername))]; ok && mv != nil {
+			target = mv
+		}
+	}
+	if target == nil {
+		return nil
+	}
+
+	addDays := plan.ValidityDays
+	if strings.EqualFold(billingCycle, "yearly") {
+		if addDays < 365 {
+			addDays = 365
+		}
+	} else if addDays <= 0 {
+		addDays = 30
+	}
+
+	baseTime := time.Now()
+	if !target.IsPlanExpired && target.DaysRemaining > 0 {
+		baseTime = baseTime.AddDate(0, 0, target.DaysRemaining)
+	}
+	newExpiry := baseTime.AddDate(0, 0, addDays)
+	target.PlanID = plan.ID
+	target.PlanName = plan.Name
+	target.PlanValidUntil = newExpiry.Format("2006-01-02")
+	target.IsPlanExpired = false
+	if target.DaysRemaining > 0 {
+		target.DaysRemaining += addDays
+	} else {
+		target.DaysRemaining = addDays
+	}
+
+	cp := *target
+	return &cp
 }
 
 // --- Vendor, AI, Payment getters & setters ---
@@ -980,6 +1190,9 @@ func (s *Store) SetAI(a AIConfig) {
 		s.ai.Temperature = a.Temperature
 	}
 	s.ai.SystemPrompt = a.SystemPrompt
+	if strings.TrimSpace(a.StorePolicies) != "" {
+		s.ai.StorePolicies = a.StorePolicies
+	}
 	s.ai.AutoReply = a.AutoReply
 	s.ai.ImportCatalog = a.ImportCatalog
 }
@@ -1018,6 +1231,9 @@ func (s *Store) SetPayment(p PaymentConfig) {
 	}
 	if p.VerifyPollTimeoutMS <= 0 {
 		p.VerifyPollTimeoutMS = s.payment.VerifyPollTimeoutMS
+	}
+	if !p.BannerSpecified && strings.TrimSpace(p.BannerTemplate.BannerURL) == "" && !p.BannerTemplate.Enabled {
+		p.BannerTemplate = s.payment.BannerTemplate
 	}
 	p.ApplyDefaults(s.vendor.BusinessName)
 	s.payment = p
@@ -1888,12 +2104,14 @@ func (s *Store) Stats() map[string]int {
 		}
 	}
 	return map[string]int{
-		"products":          len(s.products),
-		"in_stock_products": inStock,
-		"customers":         len(s.customers),
-		"active_carts":      len(s.activeCarts),
-		"orders":            len(s.orders),
-		"conversations":     len(s.chats),
-		"leads":             len(s.leads),
+		"products":           len(s.products),
+		"in_stock_products":  inStock,
+		"customers":          len(s.customers),
+		"active_carts":       len(s.activeCarts),
+		"orders":             len(s.orders),
+		"conversations":      len(s.chats),
+		"leads":              len(s.leads),
+		"managed_vendors":    len(s.vendorManagement.ManagedVendors),
+		"subscription_plans": len(s.vendorManagement.SubscriptionPlans),
 	}
 }

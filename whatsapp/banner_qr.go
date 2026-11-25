@@ -52,6 +52,27 @@ func BuildUPIQRString(upiQRData, upiID, payeeName, orderID string, amount float6
 	)
 }
 
+// BuildPlanRenewalUPIString builds the dynamic UPI intent for Admin Vendor Manager plan renewals:
+// upi://pay?pa=<owner_upi_vpa>&pn=<payee_name>&am=<amount>&cu=INR&tr=<order_id>&tn=WaMart+Plan+Renewal
+func BuildPlanRenewalUPIString(upiVPA, payeeName, orderID string, amount float64) string {
+	vpa := strings.TrimSpace(upiVPA)
+	if vpa == "" {
+		return ""
+	}
+	name := strings.TrimSpace(payeeName)
+	if name == "" {
+		name = "WaMart"
+	}
+	ord := strings.TrimSpace(orderID)
+	return fmt.Sprintf(
+		"upi://pay?pa=%s&pn=%s&am=%.2f&cu=INR&tr=%s&tn=WaMart+Plan+Renewal",
+		vpa,
+		url.QueryEscape(name),
+		amount,
+		url.QueryEscape(ord),
+	)
+}
+
 // GenerateLocalBannerQRBytes renders the UPI QR code locally in memory and composites
 // it onto the cached compressed blank banner (if enabled and cached in RAM).
 // Returns (imageBytes, mimeType, error).

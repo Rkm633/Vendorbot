@@ -153,6 +153,32 @@ func AITestHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	vendorUser := ramstore.Global.GetVendor().Username
+	if ramstore.Global.IsAdminVendorManagerMode() {
+		if strings.TrimSpace(vendorUser) == "" {
+			vendorUser = ramstore.BotModeAdminVendorManager
+		}
+		whatsapp.SaveCustomerChatAndPrune(vendorUser, phone, "customer", req.Query)
+		reply, _, cmdName, err := whatsapp.ProcessAdminVendorText(phone, req.Query, false, nil)
+		if err != nil {
+			respondJSON(w, 200, map[string]interface{}{
+				"status":   "fallback",
+				"bot_mode": ramstore.BotModeAdminVendorManager,
+				"reply":    fmt.Sprintf("AI Key Notice: %s", err.Error()),
+				"actions":  []interface{}{},
+			})
+			return
+		}
+		whatsapp.SaveCustomerChatAndPrune(vendorUser, phone, "assistant", reply)
+		respondJSON(w, 200, map[string]interface{}{
+			"status":   "success",
+			"bot_mode": ramstore.BotModeAdminVendorManager,
+			"command":  cmdName,
+			"reply":    reply,
+			"actions":  []interface{}{},
+		})
+		return
+	}
+
 	octResp, err := whatsapp.GenerateAIReply(vendorUser, phone, req.Query, req.Provider, req.APIKey, req.SystemPrompt)
 	if err != nil || octResp == nil {
 		msg := "Configure an AI API key via Central Brain Node (or GROQ_API_KEY / GEMINI_API_KEY env var) to test live LLM replies."
